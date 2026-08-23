@@ -48,7 +48,9 @@ final class AppModel: ObservableObject {
     func runNow() {
         guard !isRunning else { return }
         Task { [weak self] in
-            await self?.performPoll()
+            // A poll the user asked for: it also retries requests that are backing
+            // off or have exhausted their failure budget.
+            await self?.performPoll(manual: true)
         }
     }
 
@@ -165,7 +167,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func performPoll() async {
+    private func performPoll(manual: Bool = false) async {
         guard !isRunning else { return }
         isRunning = true
         defer {
@@ -181,6 +183,7 @@ final class AppModel: ObservableObject {
         let configuration = settings.configuration
         await engine.poll(
             configuration: configuration,
+            manual: manual,
             onEvent: { [weak self] entry in
                 await MainActor.run {
                     self?.history.append(entry)

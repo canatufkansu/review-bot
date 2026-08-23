@@ -185,13 +185,16 @@ struct ReviewAttempt: Codable, Equatable {
 /// between attempts and to give up after the configured budget.
 final class ReviewAttemptStore {
     /// Attempts are keyed by head commit and request marker, so entries for
-    /// superseded commits are dead weight. Drop them once they are this old.
-    private static let retention: TimeInterval = 30 * 24 * 60 * 60
+    /// superseded commits are dead weight. Dropping them after this long also
+    /// means a request abandoned a month ago gets one more chance rather than
+    /// being pinned as failed forever. Pruned on load and on every write, so the
+    /// file cannot grow without bound.
+    static let retention: TimeInterval = 30 * 24 * 60 * 60
 
     private let paths: StoragePaths
     private var attempts: [String: ReviewAttempt]
 
-    init(paths: StoragePaths) {
+    init(paths: StoragePaths, now: Date = Date()) {
         self.paths = paths
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -200,6 +203,9 @@ final class ReviewAttemptStore {
             attempts = values
         } else {
             attempts = [:]
+        }
+        if attempts.contains(where: { now.timeIntervalSince($0.value.lastAttempt) >= Self.retention }) {
+            save(now: now)
         }
     }
 

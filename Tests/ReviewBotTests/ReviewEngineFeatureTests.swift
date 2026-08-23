@@ -531,6 +531,41 @@ final class ReviewEngineFeatureTests: XCTestCase {
         )
     }
 
+    func testRunNowRetriesARequestThatRanOutOfAttempts() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let statuses = StatusRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.maxFailedAttemptsPerReview = 1
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { value in await statuses.append(value) }
+        )
+        var codexRuns = await runner.codexCount()
+        XCTAssertEqual(codexRuns, 1, "The budget is spent, so a scheduled poll skips the request")
+        let reported = await statuses.snapshot()
+        XCTAssertTrue(
+            reported.contains { $0.contains("paused after repeated failures") },
+            "A skipped request should be visible in the status line, not just the log"
+        )
+
+        // "Run now" is the in-app reset once the underlying breakage is fixed.
+        await engine.poll(
+            configuration: configuration,
+            manual: true,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+        codexRuns = await runner.codexCount()
+        XCTAssertEqual(codexRuns, 2, "A manual run ignores the budget and retries")
+    }
+
     func testASuccessfulReviewClearsTheFailureCount() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(failFirstPost: true)
@@ -596,6 +631,13 @@ private struct FeatureFixture {
             customPrompt: "Check public API compatibility."
         )
     }
+}
+
+private actor StatusRecorder {
+    private var values: [String] = []
+
+    func append(_ value: String) { values.append(value) }
+    func snapshot() -> [String] { values }
 }
 
 private actor EventRecorder {
