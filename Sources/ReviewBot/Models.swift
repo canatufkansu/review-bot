@@ -53,6 +53,44 @@ struct RepositoryConfiguration: Codable, Equatable, Identifiable {
     var enabled = true
 }
 
+/// How many times one review request may fail — a reviewer that errors or returns
+/// no verdict, or a post GitHub rejects — before Review Bot stops retrying it.
+/// Stored as a plain number so `config.json` stays readable, with `0` meaning
+/// "keep retrying"; absent means the config predates the setting and adopts the
+/// bounded default.
+enum FailureBudget: Codable, Equatable {
+    case unlimited
+    case attempts(Int)
+
+    static let `default` = FailureBudget.attempts(5)
+
+    /// The attempt ceiling, or `nil` when retries are unlimited.
+    var limit: Int? {
+        switch self {
+        case .unlimited: return nil
+        case let .attempts(count): return count
+        }
+    }
+
+    init(limit: Int?) {
+        if let limit {
+            self = .attempts(max(1, limit))
+        } else {
+            self = .unlimited
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(Int.self)
+        self = value > 0 ? .attempts(value) : .unlimited
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(limit ?? 0)
+    }
+}
+
 struct ReviewBotConfiguration: Codable, Equatable {
     var repositories: [RepositoryConfiguration]
     var pollIntervalMinutes: Int
@@ -67,12 +105,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
     /// commits and re-requests). Counts reviews that actually posted; `nil` means
     /// unlimited.
     var maxReviewRoundsPerPR: Int?
-    /// How many times one review request may fail (a reviewer that errors or
-    /// returns no verdict, or a post GitHub rejects) before Review Bot stops
-    /// retrying it. Attempts are also spaced out by an exponential backoff, so a
-    /// permanently broken reviewer costs a bounded amount of work instead of
-    /// re-running on every poll forever. `nil` means retry indefinitely.
-    var maxFailedAttemptsPerReview: Int?
+    /// When to stop retrying a review request that keeps failing. Attempts are also
+    /// spaced out by a widening backoff, so a permanently broken reviewer costs a
+    /// bounded amount of work instead of re-running on every poll forever.
+    var failureBudget: FailureBudget
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -99,7 +135,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         decisionPolicy: .default,
         reviewScope: .fullPullRequest,
         maxReviewRoundsPerPR: nil,
-        maxFailedAttemptsPerReview: 5
+        failureBudget: .default
     )
 
     private enum CodingKeys: String, CodingKey {
@@ -113,7 +149,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case decisionPolicy
         case reviewScope
         case maxReviewRoundsPerPR
-        case maxFailedAttemptsPerReview
+        case failureBudget
     }
 
     init(
@@ -127,7 +163,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
         maxReviewRoundsPerPR: Int? = nil,
-        maxFailedAttemptsPerReview: Int? = 5
+        failureBudget: FailureBudget = .default
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -139,7 +175,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
         self.maxReviewRoundsPerPR = maxReviewRoundsPerPR.map { max(1, $0) }
-        self.maxFailedAttemptsPerReview = maxFailedAttemptsPerReview.map { max(1, $0) }
+        self.failureBudget = failureBudget
     }
 
     init(from decoder: Decoder) throws {
@@ -190,38 +226,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
         }
         // Absent from a pre-existing config: adopt the bounded default rather than
         // the historical unbounded retry.
-        if values.contains(.maxFailedAttemptsPerReview) {
-            maxFailedAttemptsPerReview = try values.decodeIfPresent(
-                Int.self,
-                forKey: .maxFailedAttemptsPerReview
-            ).map { max(1, $0) }
-        } else {
-            maxFailedAttemptsPerReview = ReviewBotConfiguration.default.maxFailedAttemptsPerReview
-        }
-    }
-
-    /// Written by hand rather than synthesized because `maxFailedAttemptsPerReview`
-    /// must survive as an explicit `null`: absent means "this config predates the
-    /// setting, adopt the default", while `null` means the user turned the budget
-    /// off. The synthesized encoder omits nil optionals, which conflates the two.
-    /// Keep every property below in sync when adding a field.
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(repositories, forKey: .repositories)
-        try container.encode(pollIntervalMinutes, forKey: .pollIntervalMinutes)
-        try container.encode(isPaused, forKey: .isPaused)
-        try container.encode(claude, forKey: .claude)
-        try container.encode(codex, forKey: .codex)
-        try container.encode(opencode, forKey: .opencode)
-        try container.encode(customPrompt, forKey: .customPrompt)
-        try container.encode(decisionPolicy, forKey: .decisionPolicy)
-        try container.encode(reviewScope, forKey: .reviewScope)
-        try container.encodeIfPresent(maxReviewRoundsPerPR, forKey: .maxReviewRoundsPerPR)
-        if let maxFailedAttemptsPerReview {
-            try container.encode(maxFailedAttemptsPerReview, forKey: .maxFailedAttemptsPerReview)
-        } else {
-            try container.encodeNil(forKey: .maxFailedAttemptsPerReview)
-        }
+        failureBudget = try values.decodeIfPresent(
+            FailureBudget.self,
+            forKey: .failureBudget
+        ) ?? .default
     }
 }
 

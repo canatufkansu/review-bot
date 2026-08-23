@@ -187,8 +187,8 @@ final class ReviewAttemptStore {
     /// Attempts are keyed by head commit and request marker, so entries for
     /// superseded commits are dead weight. Dropping them after this long also
     /// means a request abandoned a month ago gets one more chance rather than
-    /// being pinned as failed forever. Pruned on load and on every write, so the
-    /// file cannot grow without bound.
+    /// being pinned as failed forever. Expired entries are dropped on load and
+    /// on every write, so neither the file nor the map grows without bound.
     static let retention: TimeInterval = 30 * 24 * 60 * 60
 
     private let paths: StoragePaths
@@ -198,15 +198,11 @@ final class ReviewAttemptStore {
         self.paths = paths
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if let data = try? Data(contentsOf: paths.attemptsFile),
-           let values = try? decoder.decode([String: ReviewAttempt].self, from: data) {
-            attempts = values
-        } else {
-            attempts = [:]
-        }
-        if attempts.contains(where: { now.timeIntervalSince($0.value.lastAttempt) >= Self.retention }) {
-            save(now: now)
-        }
+        let stored = (try? Data(contentsOf: paths.attemptsFile))
+            .flatMap { try? decoder.decode([String: ReviewAttempt].self, from: $0) } ?? [:]
+        // Pruned in memory; the next write persists the smaller map, so loading
+        // the store never touches the disk.
+        attempts = Self.live(in: stored, at: now)
     }
 
     func attempt(for key: String) -> ReviewAttempt? {
@@ -228,8 +224,15 @@ final class ReviewAttemptStore {
         save(now: date)
     }
 
+    private static func live(
+        in attempts: [String: ReviewAttempt],
+        at now: Date
+    ) -> [String: ReviewAttempt] {
+        attempts.filter { now.timeIntervalSince($0.value.lastAttempt) < retention }
+    }
+
     private func save(now: Date) {
-        attempts = attempts.filter { now.timeIntervalSince($0.value.lastAttempt) < Self.retention }
+        attempts = Self.live(in: attempts, at: now)
         try? paths.prepare()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]

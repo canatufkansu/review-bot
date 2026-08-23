@@ -27,10 +27,6 @@ actor ReviewEngine {
     private let attempts: ReviewAttemptStore
     private let logger: ActivityLogger
     private let now: @Sendable () -> Date
-    /// Requests skipped this poll because they are backing off or out of attempts.
-    /// Surfaced in the status line, which is otherwise indistinguishable from a
-    /// poll that found nothing to do.
-    private var deferredRequests = 0
 
     private struct PendingPullRequest {
         let summary: PullRequestSummary
@@ -65,7 +61,6 @@ actor ReviewEngine {
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
     ) async {
-        deferredRequests = 0
         let repositories = configuration.repositories.filter(\.enabled)
         guard !repositories.isEmpty else {
             await onStatus("Add and enable a repository to begin")
@@ -93,6 +88,7 @@ actor ReviewEngine {
             let githubUser = userResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
 
             var pendingReviews: [PendingPullRequest] = []
+            var deferredRequests = 0
             for repository in repositories {
                 let discovered = await discoverPendingReviews(
                     repository: repository,
@@ -102,7 +98,8 @@ actor ReviewEngine {
                     onEvent: onEvent,
                     onStatus: onStatus
                 )
-                pendingReviews.append(contentsOf: discovered)
+                pendingReviews.append(contentsOf: discovered.pending)
+                deferredRequests += discovered.deferred
             }
 
             for pendingReview in pendingReviews {
@@ -114,7 +111,12 @@ actor ReviewEngine {
                 )
             }
 
-            await onStatus(watchingStatus(repositoryCount: repositories.count))
+            await onStatus(
+                watchingStatus(
+                    repositoryCount: repositories.count,
+                    deferredRequests: deferredRequests
+                )
+            )
         } catch {
             await logger.append("Poll failed: \(error.localizedDescription)")
             await onStatus(error.localizedDescription)
@@ -139,8 +141,9 @@ actor ReviewEngine {
         manual: Bool,
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
-    ) async -> [PendingPullRequest] {
+    ) async -> (pending: [PendingPullRequest], deferred: Int) {
         let maxRounds = configuration.maxReviewRoundsPerPR
+        var deferred = 0
         do {
             await onStatus("Checking \(repository.name)…")
             let result = try await runner.run(
@@ -190,28 +193,21 @@ actor ReviewEngine {
 
                     // A request that keeps failing is retried on a widening schedule and
                     // eventually abandoned, so a broken reviewer can't re-run the whole
-                    // pipeline on every poll forever.
-                    if !manual, let attempt = attempts.attempt(for: reviewKey) {
-                        if let maxAttempts = configuration.maxFailedAttemptsPerReview,
-                           attempt.failures >= maxAttempts {
-                            await logger.append(
-                                "Skipping \(repository.githubSlug)#\(pullRequest.number): \(attempt.failures) failed attempts at this request, giving up until a new commit, a re-request, or a manual run."
-                            )
-                            deferredRequests += 1
-                            continue
-                        }
-                        let wait = Self.retryDelaySeconds(
-                            failures: attempt.failures,
-                            pollIntervalMinutes: configuration.pollIntervalMinutes
-                        )
-                        let elapsed = now().timeIntervalSince(attempt.lastAttempt)
-                        if elapsed < wait {
-                            await logger.append(
-                                "Backing off \(repository.githubSlug)#\(pullRequest.number): \(attempt.failures) failed attempt\(attempt.failures == 1 ? "" : "s"), retrying in \(Self.minutesDescription(wait - elapsed))."
-                            )
-                            deferredRequests += 1
-                            continue
-                        }
+                    // pipeline on every poll forever. A manual run ignores both.
+                    let retry = manual ? RetryDecision.run : RetryPolicy.decide(
+                        attempt: attempts.attempt(for: reviewKey),
+                        budget: configuration.failureBudget,
+                        pollIntervalMinutes: configuration.pollIntervalMinutes,
+                        now: now()
+                    )
+                    if let deferral = deferralLog(
+                        retry,
+                        repository: repository,
+                        number: pullRequest.number
+                    ) {
+                        await logger.append(deferral)
+                        deferred += 1
+                        continue
                     }
 
                     // Stop re-reviewing a PR once it has hit its configured round cap.
@@ -258,7 +254,7 @@ actor ReviewEngine {
                     )
                 }
             }
-            return pending
+            return (pending, deferred)
         } catch {
             await logger.append("Repository \(repository.githubSlug) failed: \(error.localizedDescription)")
             await onEvent(
@@ -272,7 +268,23 @@ actor ReviewEngine {
                     message: error.localizedDescription
                 )
             )
-            return []
+            return ([], deferred)
+        }
+    }
+
+    /// The log line for a request discovery is skipping, or `nil` when it may run.
+    private func deferralLog(
+        _ decision: RetryDecision,
+        repository: RepositoryConfiguration,
+        number: Int
+    ) -> String? {
+        switch decision {
+        case .run:
+            return nil
+        case let .exhausted(failures):
+            return "Skipping \(repository.githubSlug)#\(number): \(failures) failed attempts at this request, giving up until a new commit, a re-request, or a manual run."
+        case let .backOff(remaining):
+            return "Backing off \(repository.githubSlug)#\(number): retrying in \(RetryPolicy.durationDescription(remaining))."
         }
     }
 
@@ -469,8 +481,11 @@ actor ReviewEngine {
             // Nothing posted, so the dedup key stays unwritten and the next poll retries —
             // but the attempt is counted, which is what bounds and paces that retry.
             let failures = attempts.recordFailure(for: pendingReview.reviewKey, at: now())
-            let message = error.localizedDescription
-                + " " + retryNote(failures: failures, configuration: configuration)
+            let message = error.localizedDescription + " " + RetryPolicy.note(
+                failures: failures,
+                budget: configuration.failureBudget,
+                pollIntervalMinutes: configuration.pollIntervalMinutes
+            )
             await logger.append(
                 "PR \(repository.githubSlug)#\(pullRequest.number) failed: \(message)"
             )
@@ -507,51 +522,11 @@ actor ReviewEngine {
         }
     }
 
-    private func watchingStatus(repositoryCount: Int) -> String {
+    private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
         let watching = "Watching \(repositoryCount) repositor\(repositoryCount == 1 ? "y" : "ies")"
         guard deferredRequests > 0 else { return watching }
         return watching
             + " — \(deferredRequests) request\(deferredRequests == 1 ? "" : "s") paused after repeated failures; Run now retries"
-    }
-
-    /// How long to wait after `failures` consecutive failed attempts before trying the
-    /// same review request again. The first retry is immediate — the poll interval is
-    /// already the natural spacing — and each failure after that doubles the gap added
-    /// on top of it: 0, 1×, 3×, 7×, 15× the poll interval, capped at
-    /// `maximumRetryDelaySeconds`. At the 15-minute default that is an immediate retry,
-    /// then 15m, 45m and 1h45m.
-    static func retryDelaySeconds(failures: Int, pollIntervalMinutes: Int) -> TimeInterval {
-        guard failures > 0 else { return 0 }
-        let interval = TimeInterval(max(1, pollIntervalMinutes) * 60)
-        // 2^30 is far past the cap; clamping the exponent keeps the shift in range.
-        let multiplier = TimeInterval((1 << min(failures - 1, 30)) - 1)
-        return min(interval * multiplier, maximumRetryDelaySeconds)
-    }
-
-    /// Ceiling on the backoff: a request stuck behind an outage still gets a few
-    /// attempts a day rather than drifting into never.
-    static let maximumRetryDelaySeconds: TimeInterval = 4 * 60 * 60
-
-    static func minutesDescription(_ seconds: TimeInterval) -> String {
-        let minutes = max(1, Int((seconds / 60).rounded()))
-        if minutes < 60 { return "\(minutes) minute\(minutes == 1 ? "" : "s")" }
-        return String(format: "%.1f hours", Double(minutes) / 60)
-    }
-
-    /// The trailing sentence on a failure entry: what happens to this request next.
-    private func retryNote(failures: Int, configuration: ReviewBotConfiguration) -> String {
-        let budget = configuration.maxFailedAttemptsPerReview.map { " of \($0)" } ?? ""
-        if let maxAttempts = configuration.maxFailedAttemptsPerReview, failures >= maxAttempts {
-            return "Attempt \(failures)\(budget) — giving up on this request; a new commit or re-request starts over."
-        }
-        let wait = Self.retryDelaySeconds(
-            failures: failures,
-            pollIntervalMinutes: configuration.pollIntervalMinutes
-        )
-        let when = wait > 0
-            ? "retrying in about \(Self.minutesDescription(wait))"
-            : "retrying on the next check"
-        return "Attempt \(failures)\(budget) — \(when)."
     }
 
     private func pullRequestMetadata(

@@ -477,7 +477,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         var configuration = fixture.configuration
         configuration.codex.enabled = true
-        configuration.maxFailedAttemptsPerReview = nil
+        configuration.failureBudget = .unlimited
 
         // Three back-to-back polls: the first retry is immediate, the next one waits.
         for _ in 0..<3 {
@@ -505,7 +505,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let recorder = EventRecorder()
         var configuration = fixture.configuration
         configuration.codex.enabled = true
-        configuration.maxFailedAttemptsPerReview = 2
+        configuration.failureBudget = .attempts(2)
 
         for _ in 0..<4 {
             await engine.poll(
@@ -539,7 +539,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let statuses = StatusRecorder()
         var configuration = fixture.configuration
         configuration.codex.enabled = true
-        configuration.maxFailedAttemptsPerReview = 1
+        configuration.failureBudget = .attempts(1)
 
         await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
         await engine.poll(

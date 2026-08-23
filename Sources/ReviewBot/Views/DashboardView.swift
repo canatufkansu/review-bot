@@ -256,9 +256,38 @@ private struct ReviewersSettingsView: View {
                     Label("Review scope", systemImage: "arrow.left.and.right.text.vertical")
                 }
 
-                ReviewRoundLimitBox(settings: settings)
+                OptionalLimitBox(
+                    title: "Re-review limit",
+                    icon: "arrow.clockwise.circle",
+                    toggleTitle: "Limit re-reviews per pull request",
+                    defaultValue: 3,
+                    range: 1...50,
+                    stepperTitle: { "Review each pull request up to \($0) time\($0 == 1 ? "" : "s")" },
+                    caption: { limit in
+                        limit == nil
+                            ? "Unlimited: every new commit or re-request is reviewed."
+                            : "Counts reviews that were posted. After the limit is reached, further commits and re-requests on that PR are skipped."
+                    },
+                    limit: $settings.configuration.maxReviewRoundsPerPR
+                )
 
-                FailedAttemptLimitBox(settings: settings)
+                OptionalLimitBox(
+                    title: "Failure budget",
+                    icon: "exclamationmark.triangle",
+                    toggleTitle: "Give up after repeated failures",
+                    defaultValue: 5,
+                    range: 1...20,
+                    stepperTitle: { "Try a review request up to \($0) time\($0 == 1 ? "" : "s")" },
+                    caption: { limit in
+                        limit == nil
+                            ? "A request whose reviewers keep failing is retried forever, with a widening delay between attempts."
+                            : "A review that doesn't post — a reviewer errored, returned no verdict, or GitHub rejected the post — is retried with a widening delay, then abandoned. A new commit, a re-request, or Run now starts over."
+                    },
+                    limit: Binding(
+                        get: { settings.configuration.failureBudget.limit },
+                        set: { settings.configuration.failureBudget = FailureBudget(limit: $0) }
+                    )
+                )
 
                 ToolStatusRow(
                     name: "GitHub CLI",
@@ -308,88 +337,49 @@ private struct ReviewersSettingsView: View {
     }
 }
 
-private struct ReviewRoundLimitBox: View {
-    @ObservedObject var settings: SettingsStore
+/// A "limit this, or don't" setting: a toggle that flips an optional count between
+/// off and a default, plus a stepper for the count. Used for the re-review limit and
+/// the failure budget, which differ only in their numbers and their prose.
+private struct OptionalLimitBox: View {
+    let title: String
+    let icon: String
+    let toggleTitle: String
+    let defaultValue: Int
+    let range: ClosedRange<Int>
+    let stepperTitle: (Int) -> String
+    let caption: (Int?) -> String
+    @Binding var limit: Int?
 
     private var isLimited: Binding<Bool> {
         Binding(
-            get: { settings.configuration.maxReviewRoundsPerPR != nil },
-            set: { settings.configuration.maxReviewRoundsPerPR = $0 ? 3 : nil }
+            get: { limit != nil },
+            set: { limit = $0 ? defaultValue : nil }
         )
     }
 
-    private var roundCount: Binding<Int> {
+    private var count: Binding<Int> {
         Binding(
-            get: { settings.configuration.maxReviewRoundsPerPR ?? 3 },
-            set: { settings.configuration.maxReviewRoundsPerPR = max(1, $0) }
+            get: { limit ?? defaultValue },
+            set: { limit = max(range.lowerBound, $0) }
         )
     }
 
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                Toggle("Limit re-reviews per pull request", isOn: isLimited)
+                Toggle(toggleTitle, isOn: isLimited)
 
-                if let rounds = settings.configuration.maxReviewRoundsPerPR {
-                    Stepper(
-                        "Review each pull request up to \(rounds) time\(rounds == 1 ? "" : "s")",
-                        value: roundCount,
-                        in: 1...50
-                    )
+                if let limit {
+                    Stepper(stepperTitle(limit), value: count, in: range)
                 }
 
-                Text(settings.configuration.maxReviewRoundsPerPR == nil
-                    ? "Unlimited: every new commit or re-request is reviewed."
-                    : "Counts reviews that were posted. After the limit is reached, further commits and re-requests on that PR are skipped.")
+                Text(caption(limit))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .padding(8)
         } label: {
-            Label("Re-review limit", systemImage: "arrow.clockwise.circle")
-        }
-    }
-}
-
-private struct FailedAttemptLimitBox: View {
-    @ObservedObject var settings: SettingsStore
-
-    private var isLimited: Binding<Bool> {
-        Binding(
-            get: { settings.configuration.maxFailedAttemptsPerReview != nil },
-            set: { settings.configuration.maxFailedAttemptsPerReview = $0 ? 5 : nil }
-        )
-    }
-
-    private var attemptCount: Binding<Int> {
-        Binding(
-            get: { settings.configuration.maxFailedAttemptsPerReview ?? 5 },
-            set: { settings.configuration.maxFailedAttemptsPerReview = max(1, $0) }
-        )
-    }
-
-    var body: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle("Give up after repeated failures", isOn: isLimited)
-
-                if let attempts = settings.configuration.maxFailedAttemptsPerReview {
-                    Stepper(
-                        "Try a review request up to \(attempts) time\(attempts == 1 ? "" : "s")",
-                        value: attemptCount,
-                        in: 1...20
-                    )
-                }
-
-                Text(settings.configuration.maxFailedAttemptsPerReview == nil
-                    ? "A request whose reviewers keep failing is retried forever (with backoff between attempts)."
-                    : "A review that doesn't post — a reviewer errored, returned no verdict, or GitHub rejected the post — is retried with a widening delay, then abandoned. A new commit or re-request starts over.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(8)
-        } label: {
-            Label("Failure budget", systemImage: "exclamationmark.triangle")
+            Label(title, systemImage: icon)
         }
     }
 }

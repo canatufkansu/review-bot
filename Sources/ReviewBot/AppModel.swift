@@ -48,8 +48,6 @@ final class AppModel: ObservableObject {
     func runNow() {
         guard !isRunning else { return }
         Task { [weak self] in
-            // A poll the user asked for: it also retries requests that are backing
-            // off or have exhausted their failure budget.
             await self?.performPoll(manual: true)
         }
     }
