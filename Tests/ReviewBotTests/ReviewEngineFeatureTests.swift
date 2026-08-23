@@ -469,6 +469,140 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let posts = await runner.postCount()
         XCTAssertEqual(posts, 1, "Below the limit, the PR should still be reviewed")
     }
+
+    func testRepeatedFailuresBackOffInsteadOfRetryingEveryPoll() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.failureBudget = .unlimited
+
+        // Three back-to-back polls: the first retry is immediate, the next one waits.
+        for _ in 0..<3 {
+            await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+        }
+        var codexRuns = await runner.codexCount()
+        XCTAssertEqual(codexRuns, 2, "The second failure should start a backoff window")
+
+        clock.advance(minutes: 14)
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+        codexRuns = await runner.codexCount()
+        XCTAssertEqual(codexRuns, 2, "Still inside the 15-minute window")
+
+        clock.advance(minutes: 2)
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+        codexRuns = await runner.codexCount()
+        XCTAssertEqual(codexRuns, 3, "The window elapsed, so the request is retried")
+    }
+
+    func testFailureBudgetStopsRetryingAndSaysSo() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.failureBudget = .attempts(2)
+
+        for _ in 0..<4 {
+            await engine.poll(
+                configuration: configuration,
+                onEvent: { entry in await recorder.append(entry) },
+                onStatus: { _ in }
+            )
+            clock.advance(minutes: 24 * 60)
+        }
+
+        let codexRuns = await runner.codexCount()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(codexRuns, 2, "The budget is two attempts, however long we keep polling")
+        XCTAssertEqual(events.filter { $0.kind == .failed }.count, 2)
+        XCTAssertTrue(
+            events.contains { $0.kind == .failed && $0.message.contains("giving up") },
+            "The last failure should say the request is abandoned"
+        )
+        XCTAssertEqual(
+            events.filter { $0.kind == .requestDetected }.count,
+            2,
+            "Once abandoned, the request is skipped during discovery"
+        )
+    }
+
+    func testRunNowRetriesARequestThatRanOutOfAttempts() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let statuses = StatusRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.failureBudget = .attempts(1)
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { value in await statuses.append(value) }
+        )
+        var codexRuns = await runner.codexCount()
+        XCTAssertEqual(codexRuns, 1, "The budget is spent, so a scheduled poll skips the request")
+        let reported = await statuses.snapshot()
+        XCTAssertTrue(
+            reported.contains { $0.contains("paused after repeated failures") },
+            "A skipped request should be visible in the status line, not just the log"
+        )
+
+        // "Run now" is the in-app reset once the underlying breakage is fixed.
+        await engine.poll(
+            configuration: configuration,
+            manual: true,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+        codexRuns = await runner.codexCount()
+        XCTAssertEqual(codexRuns, 2, "A manual run ignores the budget and retries")
+    }
+
+    func testASuccessfulReviewClearsTheFailureCount() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failFirstPost: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        for _ in 0..<2 {
+            await engine.poll(configuration: fixture.configuration, onEvent: { _ in }, onStatus: { _ in })
+        }
+
+        let posts = await runner.postCount()
+        XCTAssertEqual(posts, 2, "The rejected post is retried and succeeds")
+        XCTAssertNil(
+            ReviewAttemptStore(paths: fixture.paths)
+                .attempt(for: "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"),
+            "A posted review should forget the earlier failure"
+        )
+    }
+}
+
+/// A clock the tests move by hand, so backoff windows don't depend on wall time.
+private final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date = Date(timeIntervalSince1970: 1_770_000_000)
+
+    var read: @Sendable () -> Date {
+        { [self] in
+            lock.lock()
+            defer { lock.unlock() }
+            return date
+        }
+    }
+
+    func advance(minutes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        date = date.addingTimeInterval(TimeInterval(minutes) * 60)
+    }
 }
 
 private struct FeatureFixture {
@@ -497,6 +631,13 @@ private struct FeatureFixture {
             customPrompt: "Check public API compatibility."
         )
     }
+}
+
+private actor StatusRecorder {
+    private var values: [String] = []
+
+    func append(_ value: String) { values.append(value) }
+    func snapshot() -> [String] { values }
 }
 
 private actor EventRecorder {

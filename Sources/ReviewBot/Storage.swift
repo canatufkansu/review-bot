@@ -20,6 +20,7 @@ struct StoragePaths {
     var historyFile: URL { root.appendingPathComponent("history.json") }
     var reviewedFile: URL { root.appendingPathComponent("reviewed.json") }
     var lastReviewedFile: URL { root.appendingPathComponent("last-reviewed.json") }
+    var attemptsFile: URL { root.appendingPathComponent("attempts.json") }
     var worktreesDirectory: URL { root.appendingPathComponent("worktrees", isDirectory: true) }
     var reviewsDirectory: URL { root.appendingPathComponent("reviews", isDirectory: true) }
     var logsDirectory: URL { root.appendingPathComponent("logs", isDirectory: true) }
@@ -168,6 +169,76 @@ final class ReviewedStateStore {
         let values = keys.sorted()
         guard let data = try? JSONEncoder().encode(values) else { return }
         try? data.write(to: paths.reviewedFile, options: .atomic)
+    }
+}
+
+/// A run of consecutive failed attempts at one review request (one dedup key).
+struct ReviewAttempt: Codable, Equatable {
+    var failures: Int
+    var lastAttempt: Date
+}
+
+/// Counts the failed attempts at each review request. A review that never posts
+/// leaves its dedup key unrecorded so the next poll retries it; without this the
+/// retry is unbounded, and a permanently broken reviewer re-runs the whole
+/// pipeline on every poll forever. `ReviewEngine` uses these counts to back off
+/// between attempts and to give up after the configured budget.
+final class ReviewAttemptStore {
+    /// Attempts are keyed by head commit and request marker, so entries for
+    /// superseded commits are dead weight. Dropping them after this long also
+    /// means a request abandoned a month ago gets one more chance rather than
+    /// being pinned as failed forever. Expired entries are dropped on load and
+    /// on every write, so neither the file nor the map grows without bound.
+    static let retention: TimeInterval = 30 * 24 * 60 * 60
+
+    private let paths: StoragePaths
+    private var attempts: [String: ReviewAttempt]
+
+    init(paths: StoragePaths, now: Date = Date()) {
+        self.paths = paths
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let stored = (try? Data(contentsOf: paths.attemptsFile))
+            .flatMap { try? decoder.decode([String: ReviewAttempt].self, from: $0) } ?? [:]
+        // Pruned in memory; the next write persists the smaller map, so loading
+        // the store never touches the disk.
+        attempts = Self.live(in: stored, at: now)
+    }
+
+    func attempt(for key: String) -> ReviewAttempt? {
+        attempts[key]
+    }
+
+    /// Records one more failure for `key` and returns the new consecutive count.
+    @discardableResult
+    func recordFailure(for key: String, at date: Date) -> Int {
+        let failures = (attempts[key]?.failures ?? 0) + 1
+        attempts[key] = ReviewAttempt(failures: failures, lastAttempt: date)
+        save(now: date)
+        return failures
+    }
+
+    /// Forgets the failures for `key` — called once the review finally posts.
+    func clear(_ key: String, at date: Date) {
+        guard attempts.removeValue(forKey: key) != nil else { return }
+        save(now: date)
+    }
+
+    private static func live(
+        in attempts: [String: ReviewAttempt],
+        at now: Date
+    ) -> [String: ReviewAttempt] {
+        attempts.filter { now.timeIntervalSince($0.value.lastAttempt) < retention }
+    }
+
+    private func save(now: Date) {
+        attempts = Self.live(in: attempts, at: now)
+        try? paths.prepare()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(attempts) else { return }
+        try? data.write(to: paths.attemptsFile, options: .atomic)
     }
 }
 

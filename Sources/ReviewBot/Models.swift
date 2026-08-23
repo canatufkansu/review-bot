@@ -53,6 +53,44 @@ struct RepositoryConfiguration: Codable, Equatable, Identifiable {
     var enabled = true
 }
 
+/// How many times one review request may fail — a reviewer that errors or returns
+/// no verdict, or a post GitHub rejects — before Review Bot stops retrying it.
+/// Stored as a plain number so `config.json` stays readable, with `0` meaning
+/// "keep retrying"; absent means the config predates the setting and adopts the
+/// bounded default.
+enum FailureBudget: Codable, Equatable {
+    case unlimited
+    case attempts(Int)
+
+    static let `default` = FailureBudget.attempts(5)
+
+    /// The attempt ceiling, or `nil` when retries are unlimited.
+    var limit: Int? {
+        switch self {
+        case .unlimited: return nil
+        case let .attempts(count): return count
+        }
+    }
+
+    init(limit: Int?) {
+        if let limit {
+            self = .attempts(max(1, limit))
+        } else {
+            self = .unlimited
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(Int.self)
+        self = value > 0 ? .attempts(value) : .unlimited
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(limit ?? 0)
+    }
+}
+
 struct ReviewBotConfiguration: Codable, Equatable {
     var repositories: [RepositoryConfiguration]
     var pollIntervalMinutes: Int
@@ -64,8 +102,13 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var decisionPolicy: DecisionPolicy
     var reviewScope: ReviewScope
     /// Maximum number of times a single pull request will be reviewed (across new
-    /// commits and re-requests). `nil` means unlimited.
+    /// commits and re-requests). Counts reviews that actually posted; `nil` means
+    /// unlimited.
     var maxReviewRoundsPerPR: Int?
+    /// When to stop retrying a review request that keeps failing. Attempts are also
+    /// spaced out by a widening backoff, so a permanently broken reviewer costs a
+    /// bounded amount of work instead of re-running on every poll forever.
+    var failureBudget: FailureBudget
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -91,7 +134,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         customPrompt: "",
         decisionPolicy: .default,
         reviewScope: .fullPullRequest,
-        maxReviewRoundsPerPR: nil
+        maxReviewRoundsPerPR: nil,
+        failureBudget: .default
     )
 
     private enum CodingKeys: String, CodingKey {
@@ -105,6 +149,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case decisionPolicy
         case reviewScope
         case maxReviewRoundsPerPR
+        case failureBudget
     }
 
     init(
@@ -117,7 +162,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         customPrompt: String,
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
-        maxReviewRoundsPerPR: Int? = nil
+        maxReviewRoundsPerPR: Int? = nil,
+        failureBudget: FailureBudget = .default
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -129,6 +175,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
         self.maxReviewRoundsPerPR = maxReviewRoundsPerPR.map { max(1, $0) }
+        self.failureBudget = failureBudget
     }
 
     init(from decoder: Decoder) throws {
@@ -177,6 +224,12 @@ struct ReviewBotConfiguration: Codable, Equatable {
         } else {
             maxReviewRoundsPerPR = nil
         }
+        // Absent from a pre-existing config: adopt the bounded default rather than
+        // the historical unbounded retry.
+        failureBudget = try values.decodeIfPresent(
+            FailureBudget.self,
+            forKey: .failureBudget
+        ) ?? .default
     }
 }
 

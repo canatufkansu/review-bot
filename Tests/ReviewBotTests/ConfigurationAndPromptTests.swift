@@ -103,6 +103,72 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertNil(reloaded.head(for: "acme/widget#99"))
     }
 
+    func testFailureBudgetDecodesWithABoundedDefault() throws {
+        XCTAssertEqual(ReviewBotConfiguration.default.failureBudget, .attempts(5))
+
+        // A config written before the setting existed adopts the bounded default…
+        let legacy = Data(#"{"pollIntervalMinutes":15}"#.utf8)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ReviewBotConfiguration.self, from: legacy).failureBudget,
+            .attempts(5)
+        )
+
+        // …while zero means the user turned the budget off, and survives a save.
+        let off = Data(#"{"failureBudget":0}"#.utf8)
+        let unlimited = try JSONDecoder().decode(ReviewBotConfiguration.self, from: off)
+        XCTAssertEqual(unlimited.failureBudget, .unlimited)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                ReviewBotConfiguration.self,
+                from: try JSONEncoder().encode(unlimited)
+            ),
+            unlimited
+        )
+
+        XCTAssertEqual(FailureBudget(limit: 0), .attempts(1))
+        XCTAssertEqual(FailureBudget(limit: nil), .unlimited)
+    }
+
+    func testReviewAttemptStoreCountsFailuresAndClearsThem() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReviewBotAttempts-\(UUID().uuidString)", isDirectory: true)
+        let paths = StoragePaths(root: root)
+        try paths.prepare()
+
+        let now = Date()
+        let store = ReviewAttemptStore(paths: paths, now: now)
+        XCTAssertNil(store.attempt(for: "acme/widget#42@head@marker"))
+        XCTAssertEqual(store.recordFailure(for: "acme/widget#42@head@marker", at: now), 1)
+        XCTAssertEqual(store.recordFailure(for: "acme/widget#42@head@marker", at: now), 2)
+
+        // A fresh store reloads the count and the timestamp from disk.
+        let reloaded = ReviewAttemptStore(paths: paths, now: now)
+        let attempt = try XCTUnwrap(reloaded.attempt(for: "acme/widget#42@head@marker"))
+        XCTAssertEqual(attempt.failures, 2)
+        XCTAssertEqual(attempt.lastAttempt.timeIntervalSince1970, now.timeIntervalSince1970, accuracy: 1)
+
+        reloaded.clear("acme/widget#42@head@marker", at: now)
+        XCTAssertNil(ReviewAttemptStore(paths: paths, now: now).attempt(for: "acme/widget#42@head@marker"))
+    }
+
+    func testReviewAttemptStoreDropsEntriesPastRetention() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReviewBotAttempts-\(UUID().uuidString)", isDirectory: true)
+        let paths = StoragePaths(root: root)
+        try paths.prepare()
+
+        let old = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = ReviewAttemptStore(paths: paths, now: old)
+        store.recordFailure(for: "acme/widget#1@head@marker", at: old)
+
+        // Loading past the retention window forgets the stale entry.
+        let reloaded = ReviewAttemptStore(
+            paths: paths,
+            now: old.addingTimeInterval(ReviewAttemptStore.retention + 60)
+        )
+        XCTAssertNil(reloaded.attempt(for: "acme/widget#1@head@marker"))
+    }
+
     func testRepositoryRulesAndCustomizationAreAddedToPrompt() {
         let prompt = DefaultPrompt.combined(
             with: "Run the project's formatter.",

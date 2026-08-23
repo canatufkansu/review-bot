@@ -24,7 +24,9 @@ actor ReviewEngine {
     private let runner: any CommandRunning
     private let reviewedState: ReviewedStateStore
     private let lastReviewed: LastReviewedStore
+    private let attempts: ReviewAttemptStore
     private let logger: ActivityLogger
+    private let now: @Sendable () -> Date
 
     private struct PendingPullRequest {
         let summary: PullRequestSummary
@@ -34,17 +36,28 @@ actor ReviewEngine {
         let reviewKey: String
     }
 
-    init(paths: StoragePaths, runner: any CommandRunning = ProcessRunner()) {
+    init(
+        paths: StoragePaths,
+        runner: any CommandRunning = ProcessRunner(),
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
         self.paths = paths
         self.runner = runner
+        self.now = now
         reviewedState = ReviewedStateStore(paths: paths)
         lastReviewed = LastReviewedStore(paths: paths)
+        attempts = ReviewAttemptStore(paths: paths, now: now())
         logger = ActivityLogger(directory: paths.logsDirectory)
         try? paths.prepare()
     }
 
+    /// - Parameter manual: a poll the user asked for ("Run now"). It ignores the
+    ///   retry backoff and the failure budget, so fixing whatever broke the
+    ///   reviewers — a missing CLI, a bad model name, expired auth — and clicking
+    ///   Run now resumes abandoned requests without editing stored state.
     func poll(
         configuration: ReviewBotConfiguration,
+        manual: Bool = false,
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
     ) async {
@@ -75,15 +88,18 @@ actor ReviewEngine {
             let githubUser = userResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
 
             var pendingReviews: [PendingPullRequest] = []
+            var deferredRequests = 0
             for repository in repositories {
                 let discovered = await discoverPendingReviews(
                     repository: repository,
                     githubUser: githubUser,
-                    maxRounds: configuration.maxReviewRoundsPerPR,
+                    configuration: configuration,
+                    manual: manual,
                     onEvent: onEvent,
                     onStatus: onStatus
                 )
-                pendingReviews.append(contentsOf: discovered)
+                pendingReviews.append(contentsOf: discovered.pending)
+                deferredRequests += discovered.deferred
             }
 
             for pendingReview in pendingReviews {
@@ -95,7 +111,12 @@ actor ReviewEngine {
                 )
             }
 
-            await onStatus("Watching \(repositories.count) repositor\(repositories.count == 1 ? "y" : "ies")")
+            await onStatus(
+                watchingStatus(
+                    repositoryCount: repositories.count,
+                    deferredRequests: deferredRequests
+                )
+            )
         } catch {
             await logger.append("Poll failed: \(error.localizedDescription)")
             await onStatus(error.localizedDescription)
@@ -116,10 +137,13 @@ actor ReviewEngine {
     private func discoverPendingReviews(
         repository: RepositoryConfiguration,
         githubUser: String,
-        maxRounds: Int?,
+        configuration: ReviewBotConfiguration,
+        manual: Bool,
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
-    ) async -> [PendingPullRequest] {
+    ) async -> (pending: [PendingPullRequest], deferred: Int) {
+        let maxRounds = configuration.maxReviewRoundsPerPR
+        var deferred = 0
         do {
             await onStatus("Checking \(repository.name)…")
             let result = try await runner.run(
@@ -167,6 +191,25 @@ actor ReviewEngine {
                     let reviewKey = "\(repository.githubSlug)#\(pullRequest.number)@\(metadata.headRefOid)@\(requestMarker)"
                     guard !reviewedState.contains(reviewKey) else { continue }
 
+                    // A request that keeps failing is retried on a widening schedule and
+                    // eventually abandoned, so a broken reviewer can't re-run the whole
+                    // pipeline on every poll forever. A manual run ignores both.
+                    let retry = manual ? RetryDecision.run : RetryPolicy.decide(
+                        attempt: attempts.attempt(for: reviewKey),
+                        budget: configuration.failureBudget,
+                        pollIntervalMinutes: configuration.pollIntervalMinutes,
+                        now: now()
+                    )
+                    if let deferral = deferralLog(
+                        retry,
+                        repository: repository,
+                        number: pullRequest.number
+                    ) {
+                        await logger.append(deferral)
+                        deferred += 1
+                        continue
+                    }
+
                     // Stop re-reviewing a PR once it has hit its configured round cap.
                     if let maxRounds {
                         let prPrefix = "\(repository.githubSlug)#\(pullRequest.number)@"
@@ -211,7 +254,7 @@ actor ReviewEngine {
                     )
                 }
             }
-            return pending
+            return (pending, deferred)
         } catch {
             await logger.append("Repository \(repository.githubSlug) failed: \(error.localizedDescription)")
             await onEvent(
@@ -225,7 +268,23 @@ actor ReviewEngine {
                     message: error.localizedDescription
                 )
             )
-            return []
+            return ([], deferred)
+        }
+    }
+
+    /// The log line for a request discovery is skipping, or `nil` when it may run.
+    private func deferralLog(
+        _ decision: RetryDecision,
+        repository: RepositoryConfiguration,
+        number: Int
+    ) -> String? {
+        switch decision {
+        case .run:
+            return nil
+        case let .exhausted(failures):
+            return "Skipping \(repository.githubSlug)#\(number): \(failures) failed attempts at this request, giving up until a new commit, a re-request, or a manual run."
+        case let .backOff(remaining):
+            return "Backing off \(repository.githubSlug)#\(number): retrying in \(RetryPolicy.durationDescription(remaining))."
         }
     }
 
@@ -332,7 +391,7 @@ actor ReviewEngine {
                         return "\(result.reviewer.rawValue) returned no verdict"
                     }.joined(separator: "; ")
                 throw ReviewEngineError.reviewIncomplete(
-                    "Review not posted, will retry next check — \(detail)"
+                    "Review not posted — \(detail)"
                 )
             }
 
@@ -400,6 +459,7 @@ actor ReviewEngine {
             }
 
             reviewedState.insert(pendingReview.reviewKey)
+            attempts.clear(pendingReview.reviewKey, at: now())
             lastReviewed.record(
                 "\(repository.githubSlug)#\(pullRequest.number)",
                 head: metadata.headRefOid
@@ -418,8 +478,16 @@ actor ReviewEngine {
                 onEvent: onEvent
             )
         } catch {
+            // Nothing posted, so the dedup key stays unwritten and the next poll retries —
+            // but the attempt is counted, which is what bounds and paces that retry.
+            let failures = attempts.recordFailure(for: pendingReview.reviewKey, at: now())
+            let message = error.localizedDescription + " " + RetryPolicy.note(
+                failures: failures,
+                budget: configuration.failureBudget,
+                pollIntervalMinutes: configuration.pollIntervalMinutes
+            )
             await logger.append(
-                "PR \(repository.githubSlug)#\(pullRequest.number) failed: \(error.localizedDescription)"
+                "PR \(repository.githubSlug)#\(pullRequest.number) failed: \(message)"
             )
             await onEvent(
                 HistoryEntry(
@@ -429,7 +497,7 @@ actor ReviewEngine {
                     pullRequestNumber: pullRequest.number,
                     pullRequestTitle: pullRequest.title,
                     pullRequestURL: pullRequest.url,
-                    message: error.localizedDescription
+                    message: message
                 )
             )
         }
@@ -452,6 +520,13 @@ actor ReviewEngine {
                 )
             }
         }
+    }
+
+    private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
+        let watching = "Watching \(repositoryCount) repositor\(repositoryCount == 1 ? "y" : "ies")"
+        guard deferredRequests > 0 else { return watching }
+        return watching
+            + " — \(deferredRequests) request\(deferredRequests == 1 ? "" : "s") paused after repeated failures; Run now retries"
     }
 
     private func pullRequestMetadata(
