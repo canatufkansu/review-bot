@@ -636,7 +636,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
             onEvent: { entry in await recorder.append(entry) },
             onStatus: { _ in }
         )
-        XCTAssertEqual(await runner.timelineCallCount(), 2)
+        let retriedTimelineCalls = await runner.timelineCallCount()
+        XCTAssertEqual(retriedTimelineCalls, 2)
 
         // …and repeated failures are bounded like any other, rather than posting a
         // failure entry on every poll forever.
@@ -650,12 +651,13 @@ final class ReviewEngineFeatureTests: XCTestCase {
             clock.advance(minutes: 24 * 60)
         }
         events = await recorder.snapshot()
+        let boundedTimelineCalls = await runner.timelineCallCount()
         XCTAssertEqual(
             events.filter { $0.kind == .failed }.count,
             5,
             "The default budget is five attempts at this request"
         )
-        XCTAssertEqual(await runner.timelineCallCount(), 5)
+        XCTAssertEqual(boundedTimelineCalls, 5)
     }
 
     func testAnEmptyTimelineStillFallsBackToTheHeadCommit() async throws {
@@ -667,7 +669,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
         // the head OID keys the request, exactly as before.
         await engine.poll(configuration: fixture.configuration, onEvent: { _ in }, onStatus: { _ in })
 
-        XCTAssertEqual(await runner.postCount(), 1)
+        let posts = await runner.postCount()
+        XCTAssertEqual(posts, 1)
         XCTAssertTrue(
             ReviewedStateStore(paths: fixture.paths)
                 .contains("acme/widget#42@1234567890abcdef@1234567890abcdef"),
