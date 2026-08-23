@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-08-23
+
 ### Added
 
 - **Bounded retries for reviews that never post.** A review request whose reviewers fail (or return no verdict), or whose post GitHub rejects, is still retried — but attempts are now counted, spaced by a widening backoff (the first retry stays immediate, then the added gap doubles each time — 15m, 45m, 1h45m at the default poll interval, capped at 4 hours), and abandoned after a configurable budget. A new **Failure budget** box on the Reviewers tab sets that budget (default 5 attempts, or off for the previous unbounded behavior). Previously a permanently broken reviewer — a missing CLI, a bad model name, expired auth — re-ran the whole pipeline (fetch, worktree, full diff, every reviewer at up to 900s) on *every* poll forever and flooded the history with failures. A new commit or re-request starts the budget over, and **Run now** ignores both the backoff and the budget — so fixing the cause and clicking it resumes abandoned requests. While any request is paused this way, the status line says so instead of reporting a quiet "Watching 1 repository".
@@ -96,7 +98,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/melihucar/review-bot/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/melihucar/review-bot/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/melihucar/review-bot/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/melihucar/review-bot/compare/v0.1.6...v0.1.7
