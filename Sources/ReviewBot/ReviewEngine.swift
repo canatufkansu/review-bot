@@ -177,6 +177,28 @@ actor ReviewEngine {
 
             var pending: [PendingPullRequest] = []
             for pullRequest in pullRequests {
+                // Inspecting a pull request can fail on its own (metadata or timeline),
+                // which is now reported rather than silently degraded — so it needs the
+                // same bound as a failing review, or a renamed repo or a lost token
+                // would post one failure per poll forever.
+                let inspectionKey = "\(repository.githubSlug)#\(pullRequest.number)@discovery"
+                let inspection = manual ? RetryDecision.run : RetryPolicy.decide(
+                    attempt: attempts.attempt(for: inspectionKey),
+                    budget: configuration.failureBudget,
+                    pollIntervalMinutes: configuration.pollIntervalMinutes,
+                    now: now()
+                )
+                if let deferral = deferralLog(
+                    inspection,
+                    repository: repository,
+                    number: pullRequest.number,
+                    subject: "inspection of"
+                ) {
+                    await logger.append(deferral)
+                    deferred += 1
+                    continue
+                }
+
                 do {
                     let metadata = try await pullRequestMetadata(
                         number: pullRequest.number,
@@ -188,6 +210,8 @@ actor ReviewEngine {
                         githubUser: githubUser,
                         fallback: metadata.headRefOid
                     )
+                    attempts.clear(inspectionKey, at: now())
+
                     let reviewKey = "\(repository.githubSlug)#\(pullRequest.number)@\(metadata.headRefOid)@\(requestMarker)"
                     guard !reviewedState.contains(reviewKey) else { continue }
 
@@ -238,8 +262,14 @@ actor ReviewEngine {
                         )
                     )
                 } catch {
+                    let failures = attempts.recordFailure(for: inspectionKey, at: now())
+                    let message = error.localizedDescription + " " + RetryPolicy.note(
+                        failures: failures,
+                        budget: configuration.failureBudget,
+                        pollIntervalMinutes: configuration.pollIntervalMinutes
+                    )
                     await logger.append(
-                        "Could not inspect \(repository.githubSlug)#\(pullRequest.number): \(error.localizedDescription)"
+                        "Could not inspect \(repository.githubSlug)#\(pullRequest.number): \(message)"
                     )
                     await onEvent(
                         HistoryEntry(
@@ -249,7 +279,7 @@ actor ReviewEngine {
                             pullRequestNumber: pullRequest.number,
                             pullRequestTitle: pullRequest.title,
                             pullRequestURL: pullRequest.url,
-                            message: error.localizedDescription
+                            message: message
                         )
                     )
                 }
@@ -272,19 +302,20 @@ actor ReviewEngine {
         }
     }
 
-    /// The log line for a request discovery is skipping, or `nil` when it may run.
+    /// The log line for work discovery is skipping, or `nil` when it may run.
     private func deferralLog(
         _ decision: RetryDecision,
         repository: RepositoryConfiguration,
-        number: Int
+        number: Int,
+        subject: String = "review of"
     ) -> String? {
         switch decision {
         case .run:
             return nil
         case let .exhausted(failures):
-            return "Skipping \(repository.githubSlug)#\(number): \(failures) failed attempts at this request, giving up until a new commit, a re-request, or a manual run."
+            return "Skipping \(subject) \(repository.githubSlug)#\(number): \(failures) failed attempts, giving up until a new commit, a re-request, or a manual run."
         case let .backOff(remaining):
-            return "Backing off \(repository.githubSlug)#\(number): retrying in \(RetryPolicy.durationDescription(remaining))."
+            return "Backing off \(subject) \(repository.githubSlug)#\(number): retrying in \(RetryPolicy.durationDescription(remaining))."
         }
     }
 
@@ -569,7 +600,16 @@ actor ReviewEngine {
             ],
             timeout: 60
         )
-        guard result.succeeded else { return fallback }
+        // Never fall back to the head OID on a failed lookup: that key is usually one
+        // an earlier review already recorded, so a rate limit or a network blip would
+        // silently swallow a genuine re-request at the same commit. Fail instead, and
+        // let the caller record it and retry. The fallback stays for the honest case —
+        // a timeline with no `review_requested` event for this user.
+        guard result.succeeded else {
+            throw ReviewEngineError.commandFailed(
+                "Could not read the review request timeline for #\(number): \(conciseError(result))"
+            )
+        }
 
         return result.stdout
             .split(whereSeparator: \.isNewline)
@@ -739,32 +779,69 @@ actor ReviewEngine {
         var results = await withTaskGroup(of: ReviewerResult.self) { group in
             for (name, reviewer) in enabled {
                 group.addTask {
-                    switch name {
-                    case .claude:
-                        await self.runClaude(
-                            configuration: reviewer,
-                            prompt: prompt,
-                            worktree: worktree
-                        )
-                    case .codex:
-                        await self.runCodex(
-                            configuration: reviewer,
-                            prompt: prompt,
-                            worktree: worktree
-                        )
-                    case .opencode:
-                        await self.runOpencode(
-                            configuration: reviewer,
-                            prompt: prompt,
-                            worktree: worktree
-                        )
-                    }
+                    await self.runReviewer(
+                        name,
+                        configuration: reviewer,
+                        prompt: prompt,
+                        worktree: worktree
+                    )
                 }
             }
             return await group.reduce(into: []) { $0.append($1) }
         }
         results.sort { order[$0.reviewer, default: 0] < order[$1.reviewer, default: 0] }
         return results
+    }
+
+    /// How many times one reviewer may be run within a single review. The worktree,
+    /// diff and thread are already prepared at this point, so a second run costs one
+    /// CLI invocation rather than the whole pipeline — worth it for a crash, a
+    /// transient API error, or a missing verdict line, which would otherwise discard
+    /// every other reviewer's work and wait out a poll interval.
+    private static let reviewerAttemptsPerReview = 2
+
+    private func runReviewer(
+        _ name: ReviewerName,
+        configuration: ReviewerConfiguration,
+        prompt: String,
+        worktree: URL
+    ) async -> ReviewerResult {
+        var result = await runReviewerOnce(
+            name,
+            configuration: configuration,
+            prompt: prompt,
+            worktree: worktree
+        )
+        var attempt = 1
+        while attempt < Self.reviewerAttemptsPerReview, result.isWorthRetrying {
+            await logger.append(
+                "\(name.rawValue) \(result.failure.map { "failed (\($0))" } ?? "returned no verdict"); running it again before giving up on this review."
+            )
+            result = await runReviewerOnce(
+                name,
+                configuration: configuration,
+                prompt: prompt,
+                worktree: worktree
+            )
+            attempt += 1
+        }
+        return result
+    }
+
+    private func runReviewerOnce(
+        _ name: ReviewerName,
+        configuration: ReviewerConfiguration,
+        prompt: String,
+        worktree: URL
+    ) async -> ReviewerResult {
+        switch name {
+        case .claude:
+            await runClaude(configuration: configuration, prompt: prompt, worktree: worktree)
+        case .codex:
+            await runCodex(configuration: configuration, prompt: prompt, worktree: worktree)
+        case .opencode:
+            await runOpencode(configuration: configuration, prompt: prompt, worktree: worktree)
+        }
     }
 
     private func runReconciliation(
@@ -851,7 +928,7 @@ actor ReviewEngine {
                 failure: nil
             )
         } catch {
-            return failedReviewer(.claude, configuration, message: error.localizedDescription)
+            return failedReviewer(.claude, configuration, error: error)
         }
     }
 
@@ -888,7 +965,7 @@ actor ReviewEngine {
                 failure: nil
             )
         } catch {
-            return failedReviewer(.codex, configuration, message: error.localizedDescription)
+            return failedReviewer(.codex, configuration, error: error)
         }
     }
 
@@ -939,7 +1016,7 @@ actor ReviewEngine {
                 failure: nil
             )
         } catch {
-            return failedReviewer(.opencode, configuration, message: error.localizedDescription)
+            return failedReviewer(.opencode, configuration, error: error)
         }
     }
 
@@ -974,14 +1051,34 @@ actor ReviewEngine {
     private func failedReviewer(
         _ reviewer: ReviewerName,
         _ configuration: ReviewerConfiguration,
-        message: String
+        error: Error
+    ) -> ReviewerResult {
+        var timedOut = false
+        if let commandError = error as? CommandExecutionError,
+           case .timedOut = commandError {
+            timedOut = true
+        }
+        return failedReviewer(
+            reviewer,
+            configuration,
+            message: error.localizedDescription,
+            timedOut: timedOut
+        )
+    }
+
+    private func failedReviewer(
+        _ reviewer: ReviewerName,
+        _ configuration: ReviewerConfiguration,
+        message: String,
+        timedOut: Bool = false
     ) -> ReviewerResult {
         ReviewerResult(
             reviewer: reviewer,
             model: configuration.model,
             output: "_\(reviewer.rawValue) review failed: \(message)_",
             verdict: nil,
-            failure: message
+            failure: message,
+            timedOut: timedOut
         )
     }
 

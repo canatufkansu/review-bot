@@ -326,6 +326,18 @@ struct ReviewerResult: Equatable {
     var output: String
     var verdict: ReviewVerdict?
     var failure: String?
+    /// True when the reviewer ran out its own timeout. Re-running it inside the same
+    /// review would spend that timeout again on a CLI that is most likely still hung,
+    /// so these are left to the next poll instead of retried in place.
+    var timedOut = false
+
+    /// Whether running this reviewer again right now is worth the wall time: a crash,
+    /// a transient API error, or a missing verdict line may well succeed on a second
+    /// try; a timeout will not.
+    var isWorthRetrying: Bool {
+        guard !timedOut else { return false }
+        return failure != nil || verdict == nil
+    }
 }
 
 enum ReviewDecision: String, Codable, CaseIterable, Identifiable {

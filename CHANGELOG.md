@@ -11,6 +11,15 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed `gh` timeline lookup no longer swallows a re-request** ([#6](https://github.com/melihucar/review-bot/issues/6)). The marker lookup fell back to the pull request's head commit whenever the command failed — and that key is usually one an earlier review already recorded, so a rate limit or a network blip turned a genuine re-request at the same commit into a silent skip: no review, no history entry, no log line. A failed lookup is now reported as a failure and retried on the next poll; the fallback stays for the honest case of a timeline with no `review_requested` event.
+- Pull requests that cannot be inspected (metadata or timeline) are now bounded by the same failure budget and backoff as failing reviews, so a renamed repository or a token that lost access no longer posts a failure entry on every poll forever.
+
+### Changed
+
+- **A reviewer that fails is run again within the same review** instead of discarding the whole review and waiting out a poll interval. The worktree, diff and thread are already prepared, so the retry costs one CLI invocation rather than the entire pipeline, and the other reviewers' work is not thrown away. Timeouts are not retried in place — re-running a hung CLI would just spend its 900s again — and are left to the poll-level backoff.
+
 ## [0.1.10] - 2026-08-23
 
 ### Added
