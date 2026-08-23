@@ -92,7 +92,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let postCount = await runner.postCount()
         let codexCount = await runner.codexCount()
         XCTAssertEqual(postCount, 0)
-        XCTAssertEqual(codexCount, 2)
+        // Two polls, and a failing reviewer is run twice within each review.
+        XCTAssertEqual(codexCount, 4)
         XCTAssertTrue(events.contains(where: { $0.kind == .failed }))
         XCTAssertFalse(events.contains(where: {
             [.approved, .changesRequested, .commented].contains($0.kind)
@@ -484,17 +485,18 @@ final class ReviewEngineFeatureTests: XCTestCase {
             await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
         }
         var codexRuns = await runner.codexCount()
-        XCTAssertEqual(codexRuns, 2, "The second failure should start a backoff window")
+        // Two reviews attempted, each running the failing reviewer twice.
+        XCTAssertEqual(codexRuns, 4, "The second failure should start a backoff window")
 
         clock.advance(minutes: 14)
         await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
         codexRuns = await runner.codexCount()
-        XCTAssertEqual(codexRuns, 2, "Still inside the 15-minute window")
+        XCTAssertEqual(codexRuns, 4, "Still inside the 15-minute window")
 
         clock.advance(minutes: 2)
         await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
         codexRuns = await runner.codexCount()
-        XCTAssertEqual(codexRuns, 3, "The window elapsed, so the request is retried")
+        XCTAssertEqual(codexRuns, 6, "The window elapsed, so the request is retried")
     }
 
     func testFailureBudgetStopsRetryingAndSaysSo() async throws {
@@ -518,7 +520,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
 
         let codexRuns = await runner.codexCount()
         let events = await recorder.snapshot()
-        XCTAssertEqual(codexRuns, 2, "The budget is two attempts, however long we keep polling")
+        XCTAssertEqual(codexRuns, 4, "The budget is two review attempts, however long we keep polling")
         XCTAssertEqual(events.filter { $0.kind == .failed }.count, 2)
         XCTAssertTrue(
             events.contains { $0.kind == .failed && $0.message.contains("giving up") },
@@ -548,7 +550,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
             onStatus: { value in await statuses.append(value) }
         )
         var codexRuns = await runner.codexCount()
-        XCTAssertEqual(codexRuns, 1, "The budget is spent, so a scheduled poll skips the request")
+        XCTAssertEqual(codexRuns, 2, "The budget is spent, so a scheduled poll skips the request")
         let reported = await statuses.snapshot()
         XCTAssertTrue(
             reported.contains { $0.contains("paused after repeated failures") },
@@ -563,7 +565,114 @@ final class ReviewEngineFeatureTests: XCTestCase {
             onStatus: { _ in }
         )
         codexRuns = await runner.codexCount()
-        XCTAssertEqual(codexRuns, 2, "A manual run ignores the budget and retries")
+        XCTAssertEqual(codexRuns, 4, "A manual run ignores the budget and retries")
+    }
+
+    func testAReviewerThatFailsOnceIsRerunWithinTheSameReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexFailuresBeforeSuccess: 1)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let codexRuns = await runner.codexCount()
+        let claudeRuns = await runner.claudeCount()
+        let posts = await runner.postCount()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(codexRuns, 2, "The failed reviewer is run again inside the same review")
+        XCTAssertEqual(claudeRuns, 1, "The reviewer that succeeded is not re-run")
+        XCTAssertEqual(posts, 1, "The review posts in this poll rather than waiting for the next")
+        XCTAssertFalse(events.contains { $0.kind == .failed })
+    }
+
+    func testAReviewerTimeoutIsNotRerunWithinTheSameReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexTimesOut: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let codexRuns = await runner.codexCount()
+        let posts = await runner.postCount()
+        XCTAssertEqual(codexRuns, 1, "Re-running a timeout would just spend the timeout again")
+        XCTAssertEqual(posts, 0)
+    }
+
+    func testAFailedTimelineLookupIsReportedAndRetriedRatherThanSkipped() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock(failTimeline: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let recorder = EventRecorder()
+
+        // Issue #6: the marker lookup used to fall back to the head OID, which an
+        // earlier review has usually already recorded — silently swallowing a genuine
+        // re-request at the same commit.
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+        var events = await recorder.snapshot()
+        let claudeRuns = await runner.claudeCount()
+        XCTAssertEqual(claudeRuns, 0, "The pull request cannot be keyed, so no review runs")
+        XCTAssertTrue(
+            events.contains { $0.kind == .failed && $0.pullRequestNumber == 42 },
+            "The failure is visible in history instead of vanishing"
+        )
+
+        // The next poll tries again…
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+        XCTAssertEqual(await runner.timelineCallCount(), 2)
+
+        // …and repeated failures are bounded like any other, rather than posting a
+        // failure entry on every poll forever.
+        clock.advance(minutes: 24 * 60)
+        for _ in 0..<4 {
+            await engine.poll(
+                configuration: fixture.configuration,
+                onEvent: { entry in await recorder.append(entry) },
+                onStatus: { _ in }
+            )
+            clock.advance(minutes: 24 * 60)
+        }
+        events = await recorder.snapshot()
+        XCTAssertEqual(
+            events.filter { $0.kind == .failed }.count,
+            5,
+            "The default budget is five attempts at this request"
+        )
+        XCTAssertEqual(await runner.timelineCallCount(), 5)
+    }
+
+    func testAnEmptyTimelineStillFallsBackToTheHeadCommit() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(emptyTimeline: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        // No `review_requested` event for this user is an honest answer, not a failure:
+        // the head OID keys the request, exactly as before.
+        await engine.poll(configuration: fixture.configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        XCTAssertEqual(await runner.postCount(), 1)
+        XCTAssertTrue(
+            ReviewedStateStore(paths: fixture.paths)
+                .contains("acme/widget#42@1234567890abcdef@1234567890abcdef"),
+            "The head OID is used as the request marker"
+        )
     }
 
     func testASuccessfulReviewClearsTheFailureCount() async throws {
@@ -658,6 +767,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var claudePrompt = ""
     private var preparedDiffSeen = false
     private var ghPrDiffCalled = false
+    private var timelineCalls = 0
     private var incrementalDiffArgs: [String]?
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
@@ -665,6 +775,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let opencodeVerdict: ReviewVerdict
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
+    private let codexFailuresBeforeSuccess: Int
+    private let codexTimesOut: Bool
+    private let failTimeline: Bool
+    private let emptyTimeline: Bool
     private let conversationText: String
     private let claudeBody: String
 
@@ -675,6 +789,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         opencodeVerdict: ReviewVerdict = .clean,
         reconciledVerdict: ReviewVerdict? = nil,
         failCodex: Bool = false,
+        codexFailuresBeforeSuccess: Int = 0,
+        codexTimesOut: Bool = false,
+        failTimeline: Bool = false,
+        emptyTimeline: Bool = false,
         conversationText: String = "PR conversation",
         claudeBody: String = "Looks safe."
     ) {
@@ -684,6 +802,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.opencodeVerdict = opencodeVerdict
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
+        self.codexFailuresBeforeSuccess = codexFailuresBeforeSuccess
+        self.codexTimesOut = codexTimesOut
+        self.failTimeline = failTimeline
+        self.emptyTimeline = emptyTimeline
         self.conversationText = conversationText
         self.claudeBody = claudeBody
     }
@@ -705,7 +827,11 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: #"{"title":"Improve widgets","headRefOid":"1234567890abcdef","baseRefName":"main","baseRefOid":"abcdef1234567890","url":"https://github.com/acme/widget/pull/42"}"#)
         }
         if executable == "gh", arguments.contains("repos/acme/widget/issues/42/timeline") {
-            return result(stdout: "2026-07-15T10:00:00Z\n")
+            timelineCalls += 1
+            if failTimeline {
+                return result(exitCode: 1, stderr: "simulated timeline failure")
+            }
+            return result(stdout: emptyTimeline ? "" : "2026-07-15T10:00:00Z\n")
         }
         if executable == "git", arguments.contains("fetch") {
             return result()
@@ -763,7 +889,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "codex" {
             codexRuns += 1
-            if failCodex {
+            if codexTimesOut {
+                throw CommandExecutionError.timedOut(command: "codex", seconds: 900)
+            }
+            if failCodex || codexRuns <= codexFailuresBeforeSuccess {
                 return result(exitCode: 1, stderr: "simulated codex failure")
             }
             if let outputIndex = arguments.firstIndex(of: "-o"),
@@ -815,6 +944,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
+    func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
 
     private func result(
