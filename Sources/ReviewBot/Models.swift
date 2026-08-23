@@ -64,8 +64,15 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var decisionPolicy: DecisionPolicy
     var reviewScope: ReviewScope
     /// Maximum number of times a single pull request will be reviewed (across new
-    /// commits and re-requests). `nil` means unlimited.
+    /// commits and re-requests). Counts reviews that actually posted; `nil` means
+    /// unlimited.
     var maxReviewRoundsPerPR: Int?
+    /// How many times one review request may fail (a reviewer that errors or
+    /// returns no verdict, or a post GitHub rejects) before Review Bot stops
+    /// retrying it. Attempts are also spaced out by an exponential backoff, so a
+    /// permanently broken reviewer costs a bounded amount of work instead of
+    /// re-running on every poll forever. `nil` means retry indefinitely.
+    var maxFailedAttemptsPerReview: Int?
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -91,7 +98,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         customPrompt: "",
         decisionPolicy: .default,
         reviewScope: .fullPullRequest,
-        maxReviewRoundsPerPR: nil
+        maxReviewRoundsPerPR: nil,
+        maxFailedAttemptsPerReview: 5
     )
 
     private enum CodingKeys: String, CodingKey {
@@ -105,6 +113,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case decisionPolicy
         case reviewScope
         case maxReviewRoundsPerPR
+        case maxFailedAttemptsPerReview
     }
 
     init(
@@ -117,7 +126,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         customPrompt: String,
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
-        maxReviewRoundsPerPR: Int? = nil
+        maxReviewRoundsPerPR: Int? = nil,
+        maxFailedAttemptsPerReview: Int? = 5
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -129,6 +139,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
         self.maxReviewRoundsPerPR = maxReviewRoundsPerPR.map { max(1, $0) }
+        self.maxFailedAttemptsPerReview = maxFailedAttemptsPerReview.map { max(1, $0) }
     }
 
     init(from decoder: Decoder) throws {
@@ -176,6 +187,40 @@ struct ReviewBotConfiguration: Codable, Equatable {
             maxReviewRoundsPerPR = max(1, rounds)
         } else {
             maxReviewRoundsPerPR = nil
+        }
+        // Absent from a pre-existing config: adopt the bounded default rather than
+        // the historical unbounded retry.
+        if values.contains(.maxFailedAttemptsPerReview) {
+            maxFailedAttemptsPerReview = try values.decodeIfPresent(
+                Int.self,
+                forKey: .maxFailedAttemptsPerReview
+            ).map { max(1, $0) }
+        } else {
+            maxFailedAttemptsPerReview = ReviewBotConfiguration.default.maxFailedAttemptsPerReview
+        }
+    }
+
+    /// Written by hand rather than synthesized because `maxFailedAttemptsPerReview`
+    /// must survive as an explicit `null`: absent means "this config predates the
+    /// setting, adopt the default", while `null` means the user turned the budget
+    /// off. The synthesized encoder omits nil optionals, which conflates the two.
+    /// Keep every property below in sync when adding a field.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(repositories, forKey: .repositories)
+        try container.encode(pollIntervalMinutes, forKey: .pollIntervalMinutes)
+        try container.encode(isPaused, forKey: .isPaused)
+        try container.encode(claude, forKey: .claude)
+        try container.encode(codex, forKey: .codex)
+        try container.encode(opencode, forKey: .opencode)
+        try container.encode(customPrompt, forKey: .customPrompt)
+        try container.encode(decisionPolicy, forKey: .decisionPolicy)
+        try container.encode(reviewScope, forKey: .reviewScope)
+        try container.encodeIfPresent(maxReviewRoundsPerPR, forKey: .maxReviewRoundsPerPR)
+        if let maxFailedAttemptsPerReview {
+            try container.encode(maxFailedAttemptsPerReview, forKey: .maxFailedAttemptsPerReview)
+        } else {
+            try container.encodeNil(forKey: .maxFailedAttemptsPerReview)
         }
     }
 }

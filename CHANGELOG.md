@@ -11,6 +11,15 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Added
+
+- **Bounded retries for reviews that never post.** A review request whose reviewers fail (or return no verdict), or whose post GitHub rejects, is still retried — but attempts are now counted, spaced by an exponential backoff (the first retry stays immediate, then the extra wait doubles per failure, capped at 4 hours), and abandoned after a configurable budget. A new **Failure budget** box on the Reviewers tab sets that budget (default 5 attempts, or off for the previous unbounded behavior). Previously a permanently broken reviewer — a missing CLI, a bad model name, expired auth — re-ran the whole pipeline (fetch, worktree, full diff, every reviewer at up to 900s) on *every* poll forever and flooded the history with failures. A new commit or re-request starts the budget over.
+- Failure entries in history now say which attempt failed and what happens next ("Attempt 2 of 5 — retrying in about 15 minutes.").
+
+### Changed
+
+- The re-review limit caption now states that it counts reviews that were actually posted; failed attempts are governed by the new failure budget instead.
+
 ## [0.1.9] - 2026-08-18
 
 ### Changed
