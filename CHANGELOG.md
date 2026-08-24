@@ -6,21 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Each tagged release publishes the notes from its matching version section below, so
-keep `## [Unreleased]` up to date as changes land. To cut a release, rename
-`## [Unreleased]` to `## [<version>] - <date>` and start a fresh empty `## [Unreleased]`.
+keep `## [Unreleased]
 
-## [Unreleased]
-
-### Fixed
-
-- **A failed `gh` timeline lookup no longer swallows a re-request** ([#6](https://github.com/melihucar/review-bot/issues/6)). The marker lookup fell back to the pull request's head commit whenever the command failed — and that key is usually one an earlier review already recorded, so a rate limit or a network blip turned a genuine re-request at the same commit into a silent skip: no review, no history entry, no log line. A failed lookup is now reported as a failure and retried on the next poll; the fallback stays for the honest case of a timeline with no `review_requested` event.
-- Pull requests that cannot be inspected (metadata or timeline) are now bounded by the same failure budget and backoff as failing reviews, so a renamed repository or a token that lost access no longer posts a failure entry on every poll forever.
-
-### Changed
-
-- **A reviewer that fails is run again within the same review** instead of discarding the whole review and waiting out a poll interval. The worktree, diff and thread are already prepared, so the retry costs one CLI invocation rather than the entire pipeline, and the other reviewers' work is not thrown away. Timeouts are not retried in place — re-running a hung CLI would just spend its 900s again — and are left to the poll-level backoff.
-
-## [0.1.10] - 2026-08-23
+## [0.1.11] - 2026-08-24
 
 ### Added
 
@@ -29,7 +17,13 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ### Changed
 
+- **A reviewer that fails is run again within the same review** instead of discarding the whole review and waiting out a poll interval. The worktree, diff and thread are already prepared, so the retry costs one CLI invocation rather than the entire pipeline, and the other reviewers' work is not thrown away. Timeouts are not retried in place — re-running a hung CLI would just spend its 900s again — and are left to the poll-level backoff.
 - The re-review limit caption now states that it counts reviews that were actually posted; failed attempts are governed by the new failure budget instead.
+
+### Fixed
+
+- **A failed `gh` timeline lookup no longer swallows a re-request** ([#6](https://github.com/melihucar/review-bot/issues/6)). The marker lookup fell back to the pull request's head commit whenever the command failed — and that key is usually one an earlier review already recorded, so a rate limit or a network blip turned a genuine re-request at the same commit into a silent skip: no review, no history entry, no log line. A failed lookup is now reported as a failure and retried on the next poll; the fallback stays for the honest case of a timeline with no `review_requested` event.
+- Pull requests that cannot be inspected (metadata or timeline) are now bounded by the same failure budget and backoff as failing reviews, so a renamed repository or a token that lost access no longer posts a failure entry on every poll forever.
 
 ## [0.1.9] - 2026-08-18
 
@@ -107,8 +101,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.10...HEAD
-[0.1.10]: https://github.com/melihucar/review-bot/compare/v0.1.9...v0.1.10
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/melihucar/review-bot/compare/v0.1.9...v0.1.11
 [0.1.9]: https://github.com/melihucar/review-bot/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/melihucar/review-bot/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/melihucar/review-bot/compare/v0.1.6...v0.1.7
