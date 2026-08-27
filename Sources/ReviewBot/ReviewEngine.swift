@@ -413,12 +413,16 @@ actor ReviewEngine {
                 )
             )
 
-            // Only post when every enabled reviewer finished with a parseable verdict.
-            // If any reviewer failed or returned no verdict, post nothing and leave the
-            // request unmarked so the next poll retries it.
-            let unfinished = results.filter { $0.failure != nil || $0.verdict == nil }
-            guard !results.isEmpty, unfinished.isEmpty else {
-                let detail = unfinished.isEmpty
+            // Post as long as *someone* finished. A reviewer that failed is named in the posted
+            // body rather than suppressing the review: holding the whole panel hostage to one CLI
+            // means an exhausted quota throws away the findings the other reviewer already
+            // produced, and keeps doing so until the failure budget abandons the request
+            // entirely — so a provider outage reads to the author as no review at all.
+            // Nobody finishing is different in kind: there is no review to post, so leave the
+            // request unmarked for the next poll.
+            let unfinished = results.filter { $0.verdict == nil }
+            guard results.contains(where: { $0.verdict != nil }) else {
+                let detail = results.isEmpty
                     ? "no reviewer produced a result"
                     : unfinished.map { result in
                         if let failure = result.failure {
@@ -428,6 +432,13 @@ actor ReviewEngine {
                     }.joined(separator: "; ")
                 throw ReviewEngineError.reviewIncomplete(
                     "Review not posted — \(detail)"
+                )
+            }
+            if !unfinished.isEmpty {
+                await logger.append(
+                    "Posting \(repository.githubSlug)#\(pullRequest.number) without "
+                        + unfinished.map(\.reviewer.rawValue).joined(separator: ", ")
+                        + "; the review discloses that it is a partial panel."
                 )
             }
 
@@ -929,6 +940,11 @@ actor ReviewEngine {
             )
             attempt += 1
         }
+        if result.failureClass == .terminal, let failure = result.failure {
+            await logger.append(
+                "\(name.rawValue) failed for a reason a second call cannot fix (\(failure)); skipping the in-review retry and reviewing without it."
+            )
+        }
         return result
     }
 
@@ -1197,7 +1213,10 @@ actor ReviewEngine {
         let verdictSummary = results.map {
             "\($0.reviewer.rawValue): `\($0.verdict?.rawValue ?? "unavailable")`"
         }.joined(separator: ", ")
-        let details = results.map { result in
+        // Only reviewers that produced a verdict get a details block; a failed one has no
+        // review body to show, and an empty disclosure triangle reads as an empty review
+        // rather than an absent one. The blockquote below names them instead.
+        let details = results.filter { $0.verdict != nil }.map { result in
             """
             <details><summary><strong>\(result.reviewer.rawValue) — \(result.model)</strong></summary>
 
@@ -1216,6 +1235,31 @@ actor ReviewEngine {
             note = guardReason == nil
                 ? "This review is neutral under the current decision policy (a reviewer failed, returned an unreadable verdict, or the policy leaves this severity to you)."
                 : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+        }
+
+        // A decision reached by part of the panel is a weaker signal than one reached by all of
+        // it, and the difference is invisible from the outside — so say it, and say which
+        // reviewer is missing. Without this an approval from one surviving reviewer would be
+        // indistinguishable from a unanimous one.
+        var partialPanelDisclosure = ""
+        let unfinished = results.filter { $0.verdict == nil }
+        if !unfinished.isEmpty {
+            let missing = unfinished.map { result in
+                let reason: String
+                if result.timedOut {
+                    reason = "timed out"
+                } else if let failure = result.failure {
+                    reason = "failed — \(inlineDetail(failure))"
+                } else {
+                    reason = "returned no verdict"
+                }
+                return "**\(result.reviewer.rawValue)** (\(reason))"
+            }.joined(separator: ", ")
+            partialPanelDisclosure = """
+
+
+            > **Partial panel: \(missing) did not contribute a verdict.** The decision above reflects only the reviewers that finished, so it is a weaker signal than a full panel — weigh it accordingly.
+            """
         }
 
         var guardDisclosure = ""
@@ -1248,7 +1292,7 @@ actor ReviewEngine {
         return """
         ## Automated review — PR #\(pullRequest.number)
 
-        **Decision: \(decision.title)** — \(note)\(reconciliationSection)\(guardDisclosure)
+        **Decision: \(decision.title)** — \(note)\(partialPanelDisclosure)\(reconciliationSection)\(guardDisclosure)
 
         Independent reviews of `\(commitSHA.prefix(8))` (\(verdictSummary)). These findings are advisory; verify them before acting.
 
@@ -1324,13 +1368,48 @@ actor ReviewEngine {
         }
     }
 
+    /// The reason a command failed, which is at the *end* of its output, not the beginning.
+    /// `codex` echoes the whole review prompt to stdout before it fails, so taking the first
+    /// characters reported the prompt instead of the error — an exhausted quota logged as
+    /// "Reading additional input from stdin…", which is neither actionable to read nor
+    /// classifiable by `ReviewerFailureClass`. Prefer stderr, then any lines that announce an
+    /// error, then the tail.
     private func conciseError(_ result: CommandResult) -> String {
-        let value = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? result.stdout
-            : result.stderr
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "command exited with status \(result.exitCode)" }
-        return String(trimmed.prefix(600))
+        let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stderr.isEmpty { return String(stderr.suffix(600)) }
+
+        let stdout = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stdout.isEmpty { return "command exited with status \(result.exitCode)" }
+
+        let errorLines = stdout
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter {
+                $0.range(
+                    of: #"(?i)\b(error|failure|failed|fatal|panic|unauthorized)\b"#,
+                    options: .regularExpression
+                ) != nil
+            }
+        if !errorLines.isEmpty {
+            return String(errorLines.suffix(4).joined(separator: " ").suffix(600))
+        }
+        return String(stdout.suffix(600))
+    }
+
+    /// Squeezes a captured failure onto one line for a posted Markdown blockquote. The text is a
+    /// CLI's own output rather than anything a pull request controls, but it still lands in a
+    /// public comment, so keep it short and strip the characters that would break out of the
+    /// quote or open a code span.
+    private func inlineDetail(_ value: String, limit: Int = 180) -> String {
+        let flattened = value
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .replacingOccurrences(of: "`", with: "'")
+        return flattened.count > limit
+            ? String(flattened.prefix(limit)).trimmingCharacters(in: .whitespaces) + "…"
+            : flattened
     }
 
     private func safeFilename(_ value: String) -> String {

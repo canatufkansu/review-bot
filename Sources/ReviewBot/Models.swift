@@ -320,6 +320,42 @@ enum ReviewVerdict: String, Codable, CaseIterable {
     }
 }
 
+/// Why a reviewer failed, to the extent its own output says so. The only distinction that
+/// matters here is whether calling it again could plausibly produce a different answer.
+enum ReviewerFailureClass: Equatable {
+    /// The same call will fail the same way: an exhausted quota, a rejected credential, a
+    /// model the account may not use. Retrying only spends wall time.
+    case terminal
+    /// Might succeed on a second try — a crash, a dropped connection, a 5xx, a missing
+    /// verdict line.
+    case transient
+
+    /// Deliberately conservative: anything unrecognised is `transient`. Mistaking a
+    /// recoverable failure for a terminal one silently drops a reviewer from the panel,
+    /// while the reverse costs a single extra CLI call — a cost the retry already accepts.
+    /// The markers are phrases a CLI emits about *itself*, long enough not to fire on a
+    /// pull request that happens to discuss quotas or authentication.
+    static func classify(_ message: String) -> ReviewerFailureClass {
+        let haystack = message.lowercased()
+        let terminalMarkers = [
+            "usage limit",
+            "rate limit exceeded",
+            "insufficient_quota",
+            "exceeded your current quota",
+            "is not supported when using",
+            "invalid api key",
+            "invalid_api_key",
+            "authentication_error",
+            "authentication failed",
+            "not authenticated",
+            "please run `codex login`",
+            "please run `claude login`",
+            "credit balance is too low",
+        ]
+        return terminalMarkers.contains { haystack.contains($0) } ? .terminal : .transient
+    }
+}
+
 struct ReviewerResult: Equatable {
     var reviewer: ReviewerName
     var model: String
@@ -331,11 +367,17 @@ struct ReviewerResult: Equatable {
     /// so these are left to the next poll instead of retried in place.
     var timedOut = false
 
+    /// `nil` when the reviewer finished; otherwise whether a second call could help.
+    var failureClass: ReviewerFailureClass? {
+        guard let failure else { return nil }
+        return ReviewerFailureClass.classify(failure)
+    }
+
     /// Whether running this reviewer again right now is worth the wall time: a crash,
     /// a transient API error, or a missing verdict line may well succeed on a second
-    /// try; a timeout will not.
+    /// try; a timeout or an exhausted quota will not.
     var isWorthRetrying: Bool {
-        guard !timedOut else { return false }
+        guard !timedOut, failureClass != .terminal else { return false }
         return failure != nil || verdict == nil
     }
 }

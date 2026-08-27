@@ -71,13 +71,67 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
     }
 
-    func testReviewerFailureIsNotPostedAndRetriedOnNextPoll() async throws {
+    func testAFailedReviewerDoesNotSuppressTheReviewThatSurvived() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(failCodex: true)
         let engine = ReviewEngine(paths: fixture.paths, runner: runner)
         let recorder = EventRecorder()
         var configuration = fixture.configuration
         configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let codexCount = await runner.codexCount()
+        let body = await runner.lastPostedBody()
+        XCTAssertEqual(codexCount, 2, "The failure is unrecognised, so it is still retried in place")
+        XCTAssertEqual(postCount, 1, "Claude's findings are posted rather than thrown away")
+        XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
+        XCTAssertFalse(events.contains(where: { $0.kind == .failed }))
+        // The author has to be able to tell a one-reviewer approval from a unanimous one.
+        XCTAssertTrue(body.contains("Partial panel"))
+        XCTAssertTrue(body.contains("**codex**"))
+        XCTAssertTrue(body.contains("simulated codex failure"))
+        // A reviewer with no review body gets no empty disclosure triangle.
+        XCTAssertFalse(body.contains("<strong>codex —"))
+    }
+
+    func testAQuotaFailureSkipsTheInReviewRetry() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            failCodex: true,
+            codexFailureMessage: "ERROR: You've hit your usage limit. Try again at 2:22 PM."
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let engineEvents = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await engineEvents.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let codexCount = await runner.codexCount()
+        let postCount = await runner.postCount()
+        XCTAssertEqual(codexCount, 1, "A second call against an exhausted quota fails identically")
+        XCTAssertEqual(postCount, 1)
+    }
+
+    func testNothingIsPostedWhenNoReviewerProducesAVerdict() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
 
         for _ in 0..<2 {
@@ -91,6 +145,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let events = await recorder.snapshot()
         let postCount = await runner.postCount()
         let codexCount = await runner.codexCount()
+        // An empty panel is different in kind from a partial one: there is no review to post,
+        // and in particular nothing that could be mistaken for an approval.
         XCTAssertEqual(postCount, 0)
         // Two polls, and a failing reviewer is run twice within each review.
         XCTAssertEqual(codexCount, 4)
@@ -635,6 +691,9 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let runner = ReviewWorkflowMock(failCodex: true)
         let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         var configuration = fixture.configuration
+        // Codex alone, so its failure leaves the review with no verdict at all — the only case
+        // that still declines to post, and therefore the one the poll-level backoff governs.
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
         configuration.failureBudget = .unlimited
 
@@ -664,6 +723,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         let recorder = EventRecorder()
         var configuration = fixture.configuration
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
         configuration.failureBudget = .attempts(2)
 
@@ -698,6 +758,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         let statuses = StatusRecorder()
         var configuration = fixture.configuration
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
         configuration.failureBudget = .attempts(1)
 
@@ -761,7 +822,25 @@ final class ReviewEngineFeatureTests: XCTestCase {
 
         let codexRuns = await runner.codexCount()
         let posts = await runner.postCount()
+        let body = await runner.lastPostedBody()
         XCTAssertEqual(codexRuns, 1, "Re-running a timeout would just spend the timeout again")
+        XCTAssertEqual(posts, 1, "Claude finished, so its review posts without waiting for codex")
+        XCTAssertTrue(body.contains("**codex** (timed out)"))
+    }
+
+    func testASoleReviewerTimingOutPostsNothing() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexTimesOut: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let codexRuns = await runner.codexCount()
+        let posts = await runner.postCount()
+        XCTAssertEqual(codexRuns, 1)
         XCTAssertEqual(posts, 0)
     }
 
@@ -939,6 +1018,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let opencodeVerdict: ReviewVerdict
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
+    private let codexFailureMessage: String
     private let codexFailuresBeforeSuccess: Int
     private let codexTimesOut: Bool
     private let failTimeline: Bool
@@ -962,6 +1042,9 @@ private actor ReviewWorkflowMock: CommandRunning {
         opencodeVerdict: ReviewVerdict = .clean,
         reconciledVerdict: ReviewVerdict? = nil,
         failCodex: Bool = false,
+        /// What the failing `codex` writes to stderr. The default is unrecognisable, so it
+        /// classifies as transient; pass a quota or auth message to exercise the terminal path.
+        codexFailureMessage: String = "simulated codex failure",
         codexFailuresBeforeSuccess: Int = 0,
         codexTimesOut: Bool = false,
         failTimeline: Bool = false,
@@ -982,6 +1065,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.opencodeVerdict = opencodeVerdict
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
+        self.codexFailureMessage = codexFailureMessage
         self.codexFailuresBeforeSuccess = codexFailuresBeforeSuccess
         self.codexTimesOut = codexTimesOut
         self.failTimeline = failTimeline
@@ -1121,7 +1205,7 @@ private actor ReviewWorkflowMock: CommandRunning {
                 throw CommandExecutionError.timedOut(command: "codex", seconds: 900)
             }
             if failCodex || codexRuns <= codexFailuresBeforeSuccess {
-                return result(exitCode: 1, stderr: "simulated codex failure")
+                return result(exitCode: 1, stderr: codexFailureMessage)
             }
             if let outputIndex = arguments.firstIndex(of: "-o"),
                arguments.indices.contains(outputIndex + 1) {
