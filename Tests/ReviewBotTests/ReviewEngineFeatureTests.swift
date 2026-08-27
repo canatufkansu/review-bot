@@ -269,6 +269,44 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postArgument, "--approve")
     }
 
+    func testReconciliationPanelExcludesTheReviewerThatFailed() async throws {
+        // A three-reviewer panel makes this reachable: two reviewers straddle the gate, so
+        // reconciliation runs, while a third failed. `results` deliberately retains the failed
+        // reviewer so the posted body can disclose a partial panel — but its `output` is the
+        // CLI's error text, and handing that to the adjudicator as a review invites it to weigh
+        // a quota notice as a dissenting opinion.
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .shouldFix,
+            opencodeVerdict: .clean,
+            reconciledVerdict: .clean,
+            failCodex: true,
+            codexFailureMessage: "ERROR: You've hit your usage limit. Try again at 2:22 PM."
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+        configuration.opencode.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let reconciliationCount = await runner.reconciliationCount()
+        let prompt = await runner.lastReconciliationPrompt()
+        XCTAssertEqual(reconciliationCount, 1, "SHOULD_FIX against CLEAN straddles the gate")
+        XCTAssertTrue(prompt.contains("--- BEGIN Claude REVIEW (verdict: SHOULD_FIX) ---"))
+        XCTAssertTrue(prompt.contains("--- BEGIN opencode REVIEW (verdict: CLEAN) ---"))
+        XCTAssertFalse(prompt.contains("Codex REVIEW"),
+            "a reviewer that produced no verdict has no review to reconcile")
+        XCTAssertFalse(prompt.contains("usage limit"),
+            "the failed CLI's error text must not reach the adjudicator as review content")
+
+        // The panel is still disclosed as partial in the comment the author reads — excluding
+        // Codex from adjudication must not also hide that it was missing.
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertTrue(postedBody.contains("Partial panel"))
+    }
+
     func testCodexOnlyShouldFixVerdictRequestsChanges() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(codexVerdict: .shouldFix)
@@ -1038,6 +1076,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var codexRuns = 0
     private var opencodeRuns = 0
     private var reconciliationRuns = 0
+    private var reconciliationPrompt = ""
     private var postedBody = ""
     private var postArgument = ""
     private var claudePrompt = ""
@@ -1217,8 +1256,13 @@ private actor ReviewWorkflowMock: CommandRunning {
             let prompt = arguments.firstIndex(of: "-p").flatMap { index in
                 arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
             } ?? ""
-            if prompt.contains("reconciling two independent automated reviews") {
+            // Match on the heading rather than a sentence: the surrounding prose gets reworded,
+            // and a stale sentinel here does not fail — it silently routes the adjudication
+            // through the ordinary reviewer branch, leaving the reconciliation tests green while
+            // testing nothing.
+            if prompt.contains("## How to reconcile") {
                 reconciliationRuns += 1
+                reconciliationPrompt = prompt
                 let verdict = reconciledVerdict ?? .clean
                 return result(stdout: "## Reconciliation\nRe-checked findings.\n\nVERDICT: \(verdict.rawValue)\n")
             }
@@ -1287,6 +1331,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
     func reconciliationCount() -> Int { reconciliationRuns }
+    func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }
     func lastPostArgument() -> String { postArgument }
     func lastClaudePrompt() -> String { claudePrompt }

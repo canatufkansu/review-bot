@@ -63,4 +63,45 @@ final class ProcessRunnerTests: XCTestCase {
 
         XCTAssertFalse(entries.contains(""))
     }
+
+    func testComposeEnvironmentRewritesPWDToTheChildsActualDirectory() {
+        // Foundation's `currentDirectoryURL` changes the child's real `getcwd()` but leaves the
+        // inherited `PWD` alone. A tool that trusts `PWD` — opencode resolves its project root
+        // from it — then runs against wherever the app was launched from, and reviews that
+        // codebase instead of the pull request's worktree.
+        let composed = ProcessRunner.composeEnvironment(
+            inherited: [
+                "PATH": minimalPath,
+                "PWD": "/Users/dev/review-bot",
+                "OLDPWD": "/Users/dev/review-bot",
+                "HOME": home,
+            ],
+            path: "/opt/homebrew/bin:\(minimalPath)",
+            workingDirectory: "/var/reviewbot/worktrees/acme-widget/pr-42",
+            overrides: nil
+        )
+
+        XCTAssertEqual(composed["PWD"], "/var/reviewbot/worktrees/acme-widget/pr-42")
+        // OLDPWD describes a `cd` this process never made; there is no honest value for it.
+        XCTAssertNil(composed["OLDPWD"])
+        XCTAssertEqual(composed["PATH"], "/opt/homebrew/bin:\(minimalPath)")
+        // Everything else the app inherited still reaches the child.
+        XCTAssertEqual(composed["HOME"], home)
+    }
+
+    func testComposeEnvironmentAppliesOverridesLast() {
+        let composed = ProcessRunner.composeEnvironment(
+            inherited: ["PATH": minimalPath, "OPENCODE_CONFIG_DIR": "/stale"],
+            path: minimalPath,
+            workingDirectory: "/work",
+            overrides: [
+                "OPENCODE_CONFIG_DIR": "/fresh",
+                "OPENCODE_CONFIG_CONTENT": #"{"permission":{"*":"deny"}}"#,
+            ]
+        )
+
+        XCTAssertEqual(composed["OPENCODE_CONFIG_DIR"], "/fresh")
+        XCTAssertEqual(composed["OPENCODE_CONFIG_CONTENT"], #"{"permission":{"*":"deny"}}"#)
+        XCTAssertEqual(composed["PWD"], "/work")
+    }
 }

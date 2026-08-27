@@ -102,6 +102,37 @@ struct ProcessRunner: CommandRunning {
         return entries.joined(separator: ":")
     }
 
+    /// Builds the environment a child command runs under: the inherited environment, with the
+    /// augmented `PATH`, a truthful `PWD`, and any per-command overrides merged over it. Pure so
+    /// it can be tested without spawning anything.
+    ///
+    /// `PWD` is the reason this exists. Foundation sets a child's working directory through
+    /// `currentDirectoryURL`, which changes the actual `getcwd()` but leaves the inherited `PWD`
+    /// variable untouched — so the child is handed a shell variable that contradicts where it is
+    /// really running. Most tools call `getcwd()` and never notice. `opencode` trusts `PWD`, and
+    /// resolved its project root from it: a Review Bot launched from a terminal sitting in some
+    /// other repository reviewed *that* repository's files while its diff and thread came from the
+    /// pull request, so it produced a confident review of a codebase the PR had nothing to do with.
+    /// Nothing in the output marks it as such — the verdict counts toward the panel like any other.
+    ///
+    /// `OLDPWD` is dropped rather than corrected: it describes a `cd` this process never made, and
+    /// there is no honest value for it here.
+    static func composeEnvironment(
+        inherited: [String: String],
+        path: String,
+        workingDirectory: String,
+        overrides: [String: String]?
+    ) -> [String: String] {
+        var environment = inherited
+        environment["PATH"] = path
+        environment["PWD"] = workingDirectory
+        environment.removeValue(forKey: "OLDPWD")
+        for (key, value) in overrides ?? [:] {
+            environment[key] = value
+        }
+        return environment
+    }
+
     /// Asks the user's login+interactive shell for its `PATH`, or `nil` if the probe fails.
     /// Uses `-i -l` so rc files that initialise version managers (commonly `~/.zshrc`) are sourced,
     /// wraps the shell in the same `perl alarm` timeout used for reviews so a hanging rc file can't
@@ -234,14 +265,14 @@ struct ProcessRunner: CommandRunning {
         process.standardError = stderrHandle
         process.standardInput = FileHandle.nullDevice
 
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = Self.augmentedPath
-        if let environmentOverrides {
-            for (key, value) in environmentOverrides {
-                environment[key] = value
-            }
-        }
-        process.environment = environment
+        process.environment = Self.composeEnvironment(
+            inherited: ProcessInfo.processInfo.environment,
+            path: Self.augmentedPath,
+            // `currentDirectory` is what `process.currentDirectoryURL` was just set to, so the two
+            // cannot drift; when it is nil the child inherits this process's own directory.
+            workingDirectory: currentDirectory?.path ?? fileManager.currentDirectoryPath,
+            overrides: environmentOverrides
+        )
 
         try process.run()
         process.waitUntilExit()

@@ -969,15 +969,23 @@ actor ReviewEngine {
         configuration: ReviewBotConfiguration,
         worktree: URL
     ) async -> ReviewerResult {
-        let prompt = DefaultPrompt.reconciliation(
-            reviews: results.map {
+        // Only reviewers that reached a verdict are adjudicated. `results` keeps the ones that
+        // failed so the posted body can disclose a partial panel, but a failed reviewer has no
+        // review to reconcile: its `output` is the CLI's error text — an exhausted-quota notice,
+        // a model-not-supported line — and pasting that in under a `REVIEW (verdict: unavailable)`
+        // header invites the adjudicator to weigh a stack trace as a dissenting opinion. It also
+        // cannot be part of the disagreement being resolved, because `gateDisagreement` counts
+        // only parsed verdicts.
+        let panel = results.compactMap { result in
+            result.verdict.map {
                 (
-                    reviewer: $0.reviewer.rawValue,
-                    body: VerdictParser.bodyWithoutTrailer($0.output),
-                    verdict: $0.verdict?.rawValue ?? "unavailable"
+                    reviewer: result.reviewer.rawValue,
+                    body: VerdictParser.bodyWithoutTrailer(result.output),
+                    verdict: $0.rawValue
                 )
             }
-        )
+        }
+        let prompt = DefaultPrompt.reconciliation(reviews: panel)
         // Reviewers are enabled whenever verdicts disagree; prefer Claude as
         // adjudicator, then Codex, then opencode.
         if configuration.claude.enabled {
