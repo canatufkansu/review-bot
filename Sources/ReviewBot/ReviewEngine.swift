@@ -1400,6 +1400,11 @@ actor ReviewEngine {
     /// CLI's own output rather than anything a pull request controls, but it still lands in a
     /// public comment, so keep it short and strip the characters that would break out of the
     /// quote or open a code span.
+    ///
+    /// Keeps the **tail**, for the same reason `conciseError` does: a CLI states its diagnosis
+    /// last, after whatever it echoed on the way there. Codex echoes the entire prompt — which
+    /// embeds `REVIEW.md` — to stderr before failing, so taking the head published a slab of the
+    /// repository's review rules to a public PR comment and none of the actual error.
     private func inlineDetail(_ value: String, limit: Int = 180) -> String {
         let flattened = value
             .split(whereSeparator: \.isNewline)
@@ -1408,7 +1413,7 @@ actor ReviewEngine {
             .joined(separator: " ")
             .replacingOccurrences(of: "`", with: "'")
         return flattened.count > limit
-            ? String(flattened.prefix(limit)).trimmingCharacters(in: .whitespaces) + "…"
+            ? "…" + String(flattened.suffix(limit)).trimmingCharacters(in: .whitespaces)
             : flattened
     }
 

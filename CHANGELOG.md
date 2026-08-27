@@ -11,6 +11,13 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-08-27
+
+### Fixed
+
+- **The app did not poll until someone opened its menu.** `AppModel.start()` — which launches the scheduler — was called only from `.task` on `MenuBarView` and `DashboardView`. `MenuBarView` is the popover's *content*, and SwiftUI does not instantiate it until the menu bar icon is clicked, so a freshly launched Review Bot watched nothing at all until a human happened to click it. This hit hardest in the configuration the app is built for: started at login, it would sit idle indefinitely, and the icon looked identical to a bot that was working. The scheduler now starts from the menu bar label, which is always rendered; `start()` was already idempotent.
+- **A partial-panel disclosure quoted the echoed prompt instead of the error.** `inlineDetail` truncated the captured failure from the head, but a CLI states its diagnosis last — Codex echoes the whole prompt, which embeds the repository's `REVIEW.md`, to stderr before reporting why it failed. The posted comment therefore carried a slab of internal review rules into a public PR thread and none of the actual error. It now keeps the tail, matching `conciseError`.
+
 ## [0.1.13] - 2026-08-27
 
 ### Changed
@@ -128,7 +135,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/melihucar/review-bot/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/melihucar/review-bot/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/melihucar/review-bot/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/melihucar/review-bot/compare/v0.1.9...v0.1.11
