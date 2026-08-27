@@ -440,8 +440,10 @@ final class ReviewEngineFeatureTests: XCTestCase {
             onStatus: { _ in }
         )
 
+        // Bound before asserting: XCTUnwrap takes an @autoclosure, which cannot carry an `await`.
+        let captured = await runner.mergePreviewDuringReview()
         let preview = try XCTUnwrap(
-            await runner.mergePreviewDuringReview(),
+            captured,
             "the reviewer must be able to read the preview, so it must exist before claude runs"
         )
         XCTAssertTrue(preview.contains("`main` has moved 2 commits ahead"))
