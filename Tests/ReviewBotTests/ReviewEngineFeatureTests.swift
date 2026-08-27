@@ -423,6 +423,81 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(usedGhDiff, "First review of a PR should use the full PR diff")
     }
 
+    // MARK: - Merge preview
+
+    /// The point of the preview is that the reviewer can *read* it. Asserting on the file's
+    /// contents at the moment `claude` ran — not merely that some code wrote it — is what proves it
+    /// reaches the reviewer, and that it is written before reviewers start rather than after.
+    func testMergePreviewReachesTheReviewerWhenTheBaseHasMoved() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let preview = try XCTUnwrap(
+            await runner.mergePreviewDuringReview(),
+            "the reviewer must be able to read the preview, so it must exist before claude runs"
+        )
+        XCTAssertTrue(preview.contains("`main` has moved 2 commits ahead"))
+        // Both sides changed shared.swift; the mock's merge-tree also reports it as conflicting.
+        XCTAssertTrue(preview.contains("## Changed on both sides"))
+        XCTAssertTrue(preview.contains("`shared.swift`"))
+        // The PR deletes dropped.swift, but the base never touched it — no stake, not a risk.
+        XCTAssertFalse(
+            preview.contains("## Deleted here"),
+            "a deletion the base branch never touched must not be reported as a merge risk"
+        )
+        // The base-side change is the evidence a merge finding would rest on; paths alone are not
+        // actionable from a worktree checked out at the head.
+        XCTAssertTrue(preview.contains("addedOnBase"))
+    }
+
+    /// The common case. Writing a preview that says "nothing to see" would spend context on every
+    /// review to describe an empty overlap, so a current branch must not produce the file at all.
+    func testNoMergePreviewWhenThePullRequestIsCurrentWithItsBase() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()  // baseCommitsAhead: 0
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let preview = await runner.mergePreviewDuringReview()
+        let postCount = await runner.postCount()
+        XCTAssertNil(preview)
+        XCTAssertEqual(postCount, 1, "and the review itself proceeds exactly as before")
+    }
+
+    /// A stale base is not a defect, and the preview is context rather than a finding: it must not
+    /// leak into the decision. The reviewers' verdicts alone still determine the outcome.
+    func testMergePreviewDoesNotChangeTheDecisionOnItsOwn() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(events.map(\.kind), [.requestDetected, .reviewStarted, .approved])
+        XCTAssertEqual(postArgument, "--approve")
+    }
+
     func testReviewRoundCapSkipsPullRequestOnceLimitReached() async throws {
         let fixture = try FeatureFixture()
         // Two prior review rounds already recorded for PR #42.
@@ -772,6 +847,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var ghPrDiffCalled = false
     private var timelineCalls = 0
     private var incrementalDiffArgs: [String]?
+    /// The merge preview as the reviewer saw it, captured at the moment `claude` was invoked —
+    /// non-`nil` only when the file was actually present in the worktree by then.
+    private var mergePreviewText: String?
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
@@ -784,6 +862,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let emptyTimeline: Bool
     private let conversationText: String
     private let claudeBody: String
+    private let baseCommitsAhead: Int
 
     init(
         failFirstPost: Bool = false,
@@ -797,7 +876,11 @@ private actor ReviewWorkflowMock: CommandRunning {
         failTimeline: Bool = false,
         emptyTimeline: Bool = false,
         conversationText: String = "PR conversation",
-        claudeBody: String = "Looks safe."
+        claudeBody: String = "Looks safe.",
+        /// Commits the base branch has gained since the merge base. `0` — the default — means the
+        /// pull request is current with its base, so `mergePreview` returns before issuing any
+        /// further plumbing and every other test's command sequence is unchanged.
+        baseCommitsAhead: Int = 0
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
@@ -811,6 +894,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.emptyTimeline = emptyTimeline
         self.conversationText = conversationText
         self.claudeBody = claudeBody
+        self.baseCommitsAhead = baseCommitsAhead
     }
 
     func run(
@@ -854,6 +938,33 @@ private actor ReviewWorkflowMock: CommandRunning {
             // The prior-reviewed commit is present locally.
             return result()
         }
+        // --- Merge preview plumbing. Must precede the generic `git diff` branch below, which
+        // records `incrementalDiffArgs`: these calls would otherwise overwrite the incremental
+        // invocation the scope tests assert on.
+        if executable == "git", arguments.contains("merge-base") {
+            return result(stdout: "aaaaaaaabbbbbbbb\n")
+        }
+        if executable == "git", arguments.contains("rev-list") {
+            return result(stdout: "\(baseCommitsAhead)\n")
+        }
+        if executable == "git", arguments.contains("merge-tree") {
+            // Exit 1 is git's "merged, with conflicts" — an answer, not a failure.
+            return result(
+                exitCode: 1,
+                stdout: "treeoid\nshared.swift\n\nCONFLICT (content): Merge conflict in shared.swift\n"
+            )
+        }
+        if executable == "git", arguments.contains("--name-only") {
+            let forHead = arguments.last == "1234567890abcdef"
+            if arguments.contains("--diff-filter=D") {
+                return result(stdout: forHead ? "dropped.swift\n" : "")
+            }
+            return result(stdout: forHead ? "shared.swift\ndropped.swift\n" : "shared.swift\n")
+        }
+        if executable == "git", arguments.contains("diff"), arguments.contains("--") {
+            return result(stdout: "diff --git a/shared.swift b/shared.swift\n+let addedOnBase = 1\n")
+        }
+
         if executable == "git", arguments.contains("diff") {
             incrementalDiffArgs = arguments
             return result(stdout: "diff --git a/incremental.swift b/incremental.swift\n")
@@ -886,6 +997,10 @@ private actor ReviewWorkflowMock: CommandRunning {
             if let currentDirectory {
                 preparedDiffSeen = FileManager.default.fileExists(
                     atPath: currentDirectory.appendingPathComponent(".review-bot-diff.patch").path
+                )
+                mergePreviewText = try? String(
+                    contentsOf: currentDirectory.appendingPathComponent(".review-bot-merge.md"),
+                    encoding: .utf8
                 )
             }
             return result(stdout: "## Summary\n\(claudeBody)\n\nVERDICT: \(claudeVerdict.rawValue)\n")
@@ -946,6 +1061,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastPostArgument() -> String { postArgument }
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
+    func mergePreviewDuringReview() -> String? { mergePreviewText }
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }

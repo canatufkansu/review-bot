@@ -387,7 +387,7 @@ actor ReviewEngine {
                 worktree: worktree,
                 scope: configuration.reviewScope,
                 priorHead: priorHead,
-                currentHead: metadata.headRefOid
+                metadata: metadata
             )
 
             await emit(
@@ -631,8 +631,9 @@ actor ReviewEngine {
         worktree: URL,
         scope: ReviewScope,
         priorHead: String?,
-        currentHead: String
+        metadata: PullRequestMetadata
     ) async throws -> ReviewContext {
+        let currentHead = metadata.headRefOid
         let narrowedDiff = scope == .incremental
             ? await incrementalDiffText(
                 repository: repository,
@@ -674,6 +675,16 @@ actor ReviewEngine {
 
             """
             : ""
+
+        // What the diff cannot show: how this pull request interacts with a base branch that has
+        // moved since it was cut. Best-effort — a repository whose base ref could not be resolved
+        // still gets a review, just without the merge section.
+        if let preview = await mergePreview(repository: repository, metadata: metadata) {
+            try? Data(preview.render().utf8).write(
+                to: worktree.appendingPathComponent(".review-bot-merge.md"),
+                options: .atomic
+            )
+        }
 
         async let conversation = captureCommand {
             try await self.runner.run(
@@ -726,6 +737,78 @@ actor ReviewEngine {
             options: .atomic
         )
         return ReviewContext(thread: thread, diff: diffText)
+    }
+
+    /// How this pull request interacts with a base branch that may have moved since it was cut, or
+    /// `nil` when that cannot be determined (the base ref is not present locally, so there is
+    /// nothing honest to say).
+    ///
+    /// Every command here is read-only plumbing against the shared clone — the review worktree is
+    /// never touched, and no merge is ever performed. `merge-tree --write-tree` computes the merge
+    /// in memory and writes only to the object store.
+    private func mergePreview(
+        repository: RepositoryConfiguration,
+        metadata: PullRequestMetadata
+    ) async -> MergePreview? {
+        func git(_ arguments: [String], timeout: Int = 60) async -> CommandResult? {
+            let result = try? await runner.run(
+                "git",
+                arguments: ["-C", repository.path] + arguments,
+                timeout: timeout
+            )
+            return result
+        }
+        func lines(_ result: CommandResult?) -> [String] {
+            guard let result, result.succeeded else { return [] }
+            return result.stdout
+                .split(whereSeparator: \.isNewline)
+                .map(String.init)
+                .filter { !$0.isEmpty }
+        }
+
+        let base = metadata.baseRefOid
+        let head = metadata.headRefOid
+        guard let mergeBaseResult = await git(["merge-base", base, head]),
+              mergeBaseResult.succeeded,
+              case let mergeBase = mergeBaseResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
+              !mergeBase.isEmpty
+        else { return nil }
+
+        // Already current with the base: the three-dot diff is exactly what lands, so skip the
+        // remaining plumbing rather than paying for it to describe an empty overlap.
+        let behind = lines(await git(["rev-list", "--count", "\(mergeBase)..\(base)"])).first
+            .flatMap(Int.init) ?? 0
+        guard behind > 0 else { return nil }
+
+        // `merge-tree` exits 1 on conflicts and >1 on real errors (notably a git older than 2.38,
+        // which has no `--write-tree`). Only treat 0 and 1 as an answer.
+        let mergeTree = await git(["merge-tree", "--write-tree", "--name-only", base, head], timeout: 120)
+        let mergeTreeOutput = (mergeTree?.exitCode ?? 2) <= 1 ? mergeTree?.stdout : nil
+
+        let prChanged = lines(await git(["diff", "--name-only", mergeBase, head], timeout: 120))
+        let baseChanged = lines(await git(["diff", "--name-only", mergeBase, base], timeout: 120))
+        let prDeleted = lines(
+            await git(["diff", "--diff-filter=D", "--name-only", mergeBase, head], timeout: 120)
+        )
+
+        // The base branch's own changes, restricted to the paths this pull request also touched.
+        // Unrestricted this is routinely an order of magnitude larger and none of the excess is
+        // evidence, so the restriction is what makes inlining it affordable at all.
+        let overlap = Set(prChanged).intersection(Set(baseChanged)).sorted()
+        let baseSideDiff = overlap.isEmpty
+            ? ""
+            : (await git(["diff", mergeBase, base, "--"] + overlap, timeout: 120))
+                .flatMap { $0.succeeded ? $0.stdout : nil } ?? ""
+
+        return MergePreview.compose(
+            baseRefName: metadata.baseRefName,
+            behindCount: behind,
+            mergeTreeOutput: mergeTreeOutput,
+            prChangedPaths: prChanged,
+            baseChangedPaths: baseChanged,
+            prDeletedPaths: prDeleted,
+            baseSideDiff: baseSideDiff
+        )
     }
 
     /// The unified diff between the last-reviewed commit and the current head, or `nil` when an

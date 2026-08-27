@@ -6,7 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Each tagged release publishes the notes from its matching version section below, so
-keep `## [Unreleased]
+keep `## [Unreleased]` up to date as changes land. To cut a release, rename
+`## [Unreleased]` to `## [<version>] - <date>` and start a fresh empty `## [Unreleased]`.
+
+## [Unreleased]
+
+### Added
+
+- **Merge preview: reviewers now see the pull request as it will land, not only as it was written.** `gh pr diff` is a three-dot diff — the PR against the commit it was *cut from* — and the review worktree is checked out at the PR's head, so nothing a reviewer could read reflected the base branch. A branch that went stale mid-review could therefore delete a symbol the base still called and no reviewer could see it. A new `.review-bot-merge.md` in the worktree reports the conflicting paths, the paths **both** sides changed since the merge base, the files the PR deletes that the base still modifies, and the base branch's own diff for those paths as inline evidence (restricted to the overlap, which is what makes it affordable; capped, with any dropped path named rather than silently missing). The overlap list is the point: the dangerous case has *no* merge conflict at all — when one side removes a `use` line and the other edits a different method, git auto-merges the two into code that no longer compiles. The file is written only when the base branch has actually moved ahead; a pull request that is current with its base produces no preview and costs nothing extra, since its diff is already exactly what lands.
+- The scope gate gains one narrow exception to match: a defect that appears only once the PR merges may be `BLOCKING` even though its `path:line` is not an added line in the diff, since the diff cannot contain it by construction. It is limited to PR-versus-base interactions, requires the evidence to name the concrete breakage, and explicitly does not make staleness on its own a reportable finding. The reconciliation prompt honours the same exception, so an adjudicator no longer overturns a merge finding for lacking a diff anchor.
+
+### Fixed
+
+- Restored the `## [Unreleased]` section and the truncated release instructions in this file; both were lost when 0.1.11 was cut.
 
 ## [0.1.11] - 2026-08-24
 
