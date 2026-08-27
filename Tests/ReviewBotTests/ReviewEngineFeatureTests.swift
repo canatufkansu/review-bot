@@ -96,10 +96,10 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertFalse(events.contains(where: { $0.kind == .failed }))
         // The author has to be able to tell a one-reviewer approval from a unanimous one.
         XCTAssertTrue(body.contains("Partial panel"))
-        XCTAssertTrue(body.contains("**codex**"))
+        XCTAssertTrue(body.contains("**Codex**"))
         XCTAssertTrue(body.contains("simulated codex failure"))
         // A reviewer with no review body gets no empty disclosure triangle.
-        XCTAssertFalse(body.contains("<strong>codex —"))
+        XCTAssertFalse(body.contains("<strong>Codex —"))
     }
 
     func testAQuotaFailureSkipsTheInReviewRetry() async throws {
@@ -825,7 +825,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let body = await runner.lastPostedBody()
         XCTAssertEqual(codexRuns, 1, "Re-running a timeout would just spend the timeout again")
         XCTAssertEqual(posts, 1, "Claude finished, so its review posts without waiting for codex")
-        XCTAssertTrue(body.contains("**codex** (timed out)"))
+        XCTAssertTrue(body.contains("**Codex** (timed out)"))
     }
 
     func testASoleReviewerTimingOutPostsNothing() async throws {
