@@ -125,6 +125,42 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postCount, 1)
     }
 
+    func testTheDisclosureQuotesTheErrorRatherThanTheEchoedPrompt() async throws {
+        // Codex echoes the prompt it was handed — which embeds the repository's REVIEW.md —
+        // to stderr before reporting why it failed. Truncating that from the head published a
+        // slab of internal review rules to a public PR comment and omitted the error entirely.
+        let echoedPrompt = String(repeating: "consult the Branching & Merging Strategy. ", count: 12)
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            failCodex: true,
+            codexFailureMessage: echoedPrompt
+                + "--- END REVIEW.md ---\n"
+                + "warning: Model metadata for 'gpt-5-codex' not found. Defaulting to fallback "
+                + "metadata; this can degrade performance and cause issues.\n"
+                + "ERROR: The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let body = await runner.lastPostedBody()
+        XCTAssertTrue(body.contains("Partial panel"))
+        XCTAssertTrue(
+            body.contains("is not supported when using Codex with a ChatGPT account"),
+            "the disclosure has to carry the diagnosis, which a CLI states last"
+        )
+        XCTAssertFalse(
+            body.contains("END REVIEW.md"),
+            "the echoed prompt must not reach a public comment"
+        )
+    }
+
     func testNothingIsPostedWhenNoReviewerProducesAVerdict() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(failCodex: true)
