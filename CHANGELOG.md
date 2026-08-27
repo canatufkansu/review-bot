@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Changed
+
+- **A reconciliation downgrade now has to justify itself.** Reconciliation exists to stop one reviewer's false blocker from gating a correct PR, so it can only ever loosen the decision — the baseline it replaces is already the strictest verdict. That makes the downgrade step the one place in the pipeline with final say and no counterweight, and a finding could be reduced below the gate on a bare severity reclassification after the adjudicator had already confirmed it was real and in scope. `DefaultPrompt.reconciliation` now separates validity from impact: once a finding survives substantiation and the scope gate, reducing it requires naming the concrete consequence — what happens at runtime, to a caller, to a stored record, or to a reader acting on the text — and why that does not warrant correcting before merge. "Polish", "documentation only", and "no realistic accident" are called out as conclusions that need their work shown rather than justifications, and a finding whose impact cannot be stated keeps the severity it was given. The step also corrects severity upward where the code supports it, so it is no longer framed as one-way.
+
 ## [0.1.14] - 2026-08-27
 
 ### Fixed
