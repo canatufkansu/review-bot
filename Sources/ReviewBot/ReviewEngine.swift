@@ -340,7 +340,12 @@ actor ReviewEngine {
                     "-C", repository.path,
                     "fetch", "--quiet", "origin",
                     "refs/pull/\(pullRequest.number)/head",
-                    "refs/heads/\(metadata.baseRefName)",
+                    // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
+                    // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
+                    // merely an opportunistic side effect of the clone's configured fetch
+                    // refspec. `mergePreview` reads that remote-tracking ref, so name it here
+                    // rather than depending on how this particular clone happens to be set up.
+                    "+refs/heads/\(metadata.baseRefName):refs/remotes/origin/\(metadata.baseRefName)",
                 ],
                 timeout: 180
             )
@@ -766,8 +771,24 @@ actor ReviewEngine {
                 .filter { !$0.isEmpty }
         }
 
-        let base = metadata.baseRefOid
+        // `baseRefOid` is a snapshot GitHub took of the base ref, not its live tip. Once an author
+        // merges the base branch in, that snapshot becomes an ancestor of the head, `behind`
+        // collapses to 0, and the preview silently disappears — precisely in the case it exists
+        // for, since a branch that has been synced once is the one most likely to drift again.
+        // `prepareReviewContext` fetches the base into `refs/remotes/origin/<name>` immediately
+        // before this, so prefer that ref and fall back to the snapshot only when it will not
+        // resolve (an unusual remote layout, or a base branch deleted since the fetch).
         let head = metadata.headRefOid
+        let trackedBase = await git([
+            "rev-parse", "--verify", "--quiet",
+            "refs/remotes/origin/\(metadata.baseRefName)^{commit}",
+        ])
+        let base = trackedBase.flatMap { result -> String? in
+            guard result.succeeded else { return nil }
+            let oid = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            return oid.isEmpty ? nil : oid
+        } ?? metadata.baseRefOid
+
         guard let mergeBaseResult = await git(["merge-base", base, head]),
               mergeBaseResult.succeeded,
               case let mergeBase = mergeBaseResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines),

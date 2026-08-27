@@ -460,6 +460,87 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(preview.contains("addedOnBase"))
     }
 
+    /// Regression: the preview was resolved from `baseRefOid`, the snapshot `gh pr view` reports
+    /// rather than the base branch's live tip. Once an author merges the base in, that snapshot is
+    /// an ancestor of the head, so `behind` reads 0 and the preview silently disappears — and a
+    /// branch synced once is exactly the one most likely to drift again. Observed in production on
+    /// a pull request GitHub itself reported as `behind_by=1`.
+    func testMergePreviewResolvesTheBaseFromTheLiveRefNotTheStaleSnapshot() async throws {
+        let fixture = try FeatureFixture()
+        // The mock's `rev-list` only reports commits against the remote-tracking OID; asking about
+        // the snapshot returns 0, so reading the wrong ref yields no preview at all.
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let captured = await runner.mergePreviewDuringReview()
+        let preview = try XCTUnwrap(
+            captured,
+            "a base that has moved must produce a preview even when baseRefOid is already merged in"
+        )
+        XCTAssertTrue(preview.contains("`main` has moved 2 commits ahead"))
+
+        // Bound before asserting: XCTUnwrap takes an @autoclosure, which cannot carry an `await`.
+        let capturedRevParse = await runner.revParseInvocation()
+        let revParse = try XCTUnwrap(capturedRevParse)
+        XCTAssertTrue(
+            revParse.contains("refs/remotes/origin/main^{commit}"),
+            "the base must be resolved by ref name against the remote-tracking branch"
+        )
+    }
+
+    /// The fallback still has to work: an unresolvable remote-tracking ref must not lose the
+    /// preview entirely, since `baseRefOid` remains a truthful — if possibly stale — base.
+    func testMergePreviewFallsBackToTheSnapshotWhenTheTrackingRefWillNotResolve() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2, trackedBaseOid: nil)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let captured = await runner.mergePreviewDuringReview()
+        let preview = try XCTUnwrap(
+            captured,
+            "a failed rev-parse must fall back to baseRefOid rather than drop the preview"
+        )
+        XCTAssertTrue(preview.contains("`main` has moved 2 commits ahead"))
+    }
+
+    /// `mergePreview` reads `refs/remotes/origin/<base>`, so the fetch has to actually write it.
+    /// A bare `refs/heads/<name>` refspec only lands in FETCH_HEAD and updates the tracking ref as
+    /// an opportunistic side effect of the clone's configured refspec — not a guarantee.
+    func testFetchNamesTheRemoteTrackingDestinationForTheBaseBranch() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        // Bound before asserting: XCTUnwrap takes an @autoclosure, which cannot carry an `await`.
+        let capturedFetch = await runner.fetchInvocation()
+        let fetch = try XCTUnwrap(capturedFetch)
+        XCTAssertTrue(
+            fetch.contains("+refs/heads/main:refs/remotes/origin/main"),
+            "the base fetch must name its destination so the tracking ref is always updated"
+        )
+    }
+
     /// The common case. Writing a preview that says "nothing to see" would spend context on every
     /// review to describe an empty overlap, so a current branch must not produce the file at all.
     func testNoMergePreviewWhenThePullRequestIsCurrentWithItsBase() async throws {
@@ -865,6 +946,14 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let conversationText: String
     private let claudeBody: String
     private let baseCommitsAhead: Int
+    private let trackedBaseOid: String?
+
+    /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
+    /// `rev-list` has to distinguish it from the remote-tracking OID to reproduce the bug.
+    static let staleBaseOid = "abcdef1234567890"
+
+    private var fetchArgs: [String]?
+    private var revParseArgs: [String]?
 
     init(
         failFirstPost: Bool = false,
@@ -882,7 +971,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// Commits the base branch has gained since the merge base. `0` — the default — means the
         /// pull request is current with its base, so `mergePreview` returns before issuing any
         /// further plumbing and every other test's command sequence is unchanged.
-        baseCommitsAhead: Int = 0
+        baseCommitsAhead: Int = 0,
+        /// What `rev-parse refs/remotes/origin/main` resolves to. `nil` makes it fail the way git
+        /// does for an unresolvable ref, which is the only case that may fall back to the snapshot.
+        trackedBaseOid: String? = "trackedbaseoid00"
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
@@ -897,6 +989,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.conversationText = conversationText
         self.claudeBody = claudeBody
         self.baseCommitsAhead = baseCommitsAhead
+        self.trackedBaseOid = trackedBaseOid
     }
 
     func run(
@@ -923,6 +1016,7 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: emptyTimeline ? "" : "2026-07-15T10:00:00Z\n")
         }
         if executable == "git", arguments.contains("fetch") {
+            fetchArgs = arguments
             return result()
         }
         if executable == "git", arguments.contains("worktree"), arguments.contains("add") {
@@ -943,11 +1037,25 @@ private actor ReviewWorkflowMock: CommandRunning {
         // --- Merge preview plumbing. Must precede the generic `git diff` branch below, which
         // records `incrementalDiffArgs`: these calls would otherwise overwrite the incremental
         // invocation the scope tests assert on.
+        if executable == "git", arguments.contains("rev-parse") {
+            revParseArgs = arguments
+            guard let trackedBaseOid else {
+                // `--verify --quiet` exits non-zero with no output when the ref will not resolve.
+                return result(exitCode: 1)
+            }
+            return result(stdout: "\(trackedBaseOid)\n")
+        }
         if executable == "git", arguments.contains("merge-base") {
             return result(stdout: "aaaaaaaabbbbbbbb\n")
         }
         if executable == "git", arguments.contains("rev-list") {
-            return result(stdout: "\(baseCommitsAhead)\n")
+            // The bug this guards against: `baseRefOid` is a snapshot that the author has already
+            // merged in, so counting commits against it yields 0 and the preview vanishes. Only
+            // the live remote-tracking ref shows the base has moved. Answer for whichever OID the
+            // engine actually asked about, so reading the wrong one produces no preview at all.
+            let liveBase = trackedBaseOid ?? Self.staleBaseOid
+            let range = arguments.last ?? ""
+            return result(stdout: "\(range.hasSuffix("..\(liveBase)") ? baseCommitsAhead : 0)\n")
         }
         if executable == "git", arguments.contains("merge-tree") {
             // Exit 1 is git's "merged, with conflicts" — an answer, not a failure.
@@ -1064,6 +1172,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
     func mergePreviewDuringReview() -> String? { mergePreviewText }
+    func fetchInvocation() -> [String]? { fetchArgs }
+    func revParseInvocation() -> [String]? { revParseArgs }
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }

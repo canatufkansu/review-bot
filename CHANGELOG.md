@@ -11,6 +11,11 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **The merge preview never ran on the pull requests that needed it most.** It resolved the base branch from `baseRefOid`, which is the snapshot GitHub reports in `gh pr view` rather than the base ref's live tip. As soon as an author merges the base branch in — the ordinary way to resolve a conflict — that snapshot becomes an ancestor of the pull request head, so the "how far has the base moved" count collapsed to `0` and the preview was silently skipped. The effect was backwards: a branch that had been synced once, and so was most likely to drift again, was exactly the branch that got no preview. Observed on a pull request GitHub itself reported as `behind_by=1`, where the base had since moved a commit that touched a file the pull request also changed. The base is now resolved from `refs/remotes/origin/<baseRefName>`, falling back to `baseRefOid` only when that ref will not resolve.
+- The base-branch fetch now names its destination (`+refs/heads/<name>:refs/remotes/origin/<name>`). A bare `refs/heads/<name>` refspec only lands in `FETCH_HEAD`; the remote-tracking ref the merge preview reads was updated merely as an opportunistic side effect of the clone's configured fetch refspec, which is not a guarantee.
+
 ## [0.1.12] - 2026-08-27
 
 ### Added
