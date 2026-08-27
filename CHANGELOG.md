@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-08-27
+
 ### Added
 
 - **Merge preview: reviewers now see the pull request as it will land, not only as it was written.** `gh pr diff` is a three-dot diff — the PR against the commit it was *cut from* — and the review worktree is checked out at the PR's head, so nothing a reviewer could read reflected the base branch. A branch that went stale mid-review could therefore delete a symbol the base still called and no reviewer could see it. A new `.review-bot-merge.md` in the worktree reports the conflicting paths, the paths **both** sides changed since the merge base, the files the PR deletes that the base still modifies, and the base branch's own diff for those paths as inline evidence (restricted to the overlap, which is what makes it affordable; capped, with any dropped path named rather than silently missing). The overlap list is the point: the dangerous case has *no* merge conflict at all — when one side removes a `use` line and the other edits a different method, git auto-merges the two into code that no longer compiles. The file is written only when the base branch has actually moved ahead; a pull request that is current with its base produces no preview and costs nothing extra, since its diff is already exactly what lands.
@@ -113,7 +115,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/melihucar/review-bot/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/melihucar/review-bot/compare/v0.1.9...v0.1.11
 [0.1.9]: https://github.com/melihucar/review-bot/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/melihucar/review-bot/compare/v0.1.7...v0.1.8
