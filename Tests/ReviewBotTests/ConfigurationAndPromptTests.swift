@@ -203,4 +203,32 @@ final class ConfigurationAndPromptTests: XCTestCase {
 
         XCTAssertTrue(prompt.hasSuffix("VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>"))
     }
+
+    func testReconciliationDoesNotAssumeExactlyTwoReviewers() {
+        // The panel is however many reviewers are enabled. The prompt used to say "two" three
+        // times over, so a third enabled reviewer handed the adjudicator a document that
+        // miscounted its own contents and told it to weigh "the stricter one" of three.
+        let prompt = DefaultPrompt.reconciliation(reviews: [
+            (reviewer: "Claude", body: "Should-fix: the count is wrong.", verdict: "SHOULD_FIX"),
+            (reviewer: "Codex", body: "None.", verdict: "CLEAN"),
+            (reviewer: "opencode", body: "Blocking: unsafe cast.", verdict: "BLOCKING"),
+        ])
+
+        for reviewer in ["Claude", "Codex", "opencode"] {
+            XCTAssertTrue(prompt.contains("--- BEGIN \(reviewer) REVIEW"), "\(reviewer) is missing")
+        }
+        XCTAssertFalse(prompt.contains("two independent"))
+        XCTAssertFalse(prompt.contains("the two reviews"))
+        XCTAssertFalse(prompt.contains("average the two"))
+        XCTAssertFalse(prompt.contains("a finding both raised"))
+
+        // Counting reviewers is not evidence: the panel mixes models of very different capability,
+        // so agreement between two weak reviewers must not outweigh one strong dissent.
+        XCTAssertTrue(prompt.contains("counting them measures the panel rather than the code"))
+
+        // Two of three verdicts clear the gate here. The adjudicator must not read that as a
+        // majority, nor read a name's absence as assent.
+        XCTAssertTrue(prompt.contains("do not average them, and do not defer to the strictest by default"))
+        XCTAssertTrue(prompt.contains("absence of evidence, not agreement"))
+    }
 }
