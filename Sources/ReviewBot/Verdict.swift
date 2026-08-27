@@ -37,19 +37,16 @@ enum DecisionEvaluator {
         let actions = parsed.map { policy.action(for: $0) }
         let worstAction = actions.max(by: { $0.rank < $1.rank })
 
-        // A verdict the policy treats as blocking wins, even if another reviewer failed to parse.
-        if worstAction == .requestChanges {
-            return .requestChanges
-        }
-
-        // Every reviewer produced a readable verdict: honour the strictest configured action
-        // (`.comment` if any level is set to "leave it to me", otherwise `.approve`).
-        if !results.isEmpty, parsed.count == results.count {
-            return worstAction ?? .approve
-        }
-
-        // A reviewer failed or emitted no verdict: stay neutral.
-        return .comment
+        // Decide on whoever finished, and honour the strictest configured action among them
+        // (`.comment` if any level is set to "leave it to me", otherwise `.approve`). A reviewer
+        // that failed contributes nothing rather than pinning the decision to neutral: an outage
+        // in one CLI would otherwise mean the other reviewer's findings never gate anything, and
+        // the review that says so is posted with the absence disclosed in its body.
+        //
+        // `worstAction` is nil exactly when no reviewer parsed a verdict, which is the one case
+        // with nothing to decide on. The engine declines to post at all there; `.comment` is the
+        // safe answer for any other caller.
+        return worstAction ?? .comment
     }
 
     /// True when two or more reviewers parsed a verdict but land on opposite sides of the

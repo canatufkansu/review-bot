@@ -38,12 +38,25 @@ final class VerdictTests: XCTestCase {
         XCTAssertEqual(DecisionEvaluator.evaluate(results, policy: .default), .approve)
     }
 
-    func testUnreadableVerdictProducesNeutralComment() {
+    func testSurvivingReviewerDecidesWhenTheOtherProducesNoVerdict() {
         let results = [
             result(.claude, verdict: .clean),
             result(.codex, verdict: nil),
         ]
+        // The failed reviewer contributes nothing rather than pinning the panel to neutral.
+        // The posted body discloses that it is a partial panel; see `aggregateReview`.
+        XCTAssertEqual(DecisionEvaluator.evaluate(results, policy: .default), .approve)
+    }
+
+    func testNoReadableVerdictAtAllStaysNeutral() {
+        let results = [
+            result(.claude, verdict: nil),
+            result(.codex, verdict: nil),
+        ]
+        // Nothing to decide on — and notably not an approval, which is what a naive
+        // "strictest of an empty set" would produce.
         XCTAssertEqual(DecisionEvaluator.evaluate(results, policy: .default), .comment)
+        XCTAssertEqual(DecisionEvaluator.evaluate([], policy: .default), .comment)
     }
 
     func testPolicyCanBlockOnNits() {
@@ -133,6 +146,64 @@ final class VerdictTests: XCTestCase {
         XCTAssertEqual(DecisionEvaluator.decision(for: .nitsOnly, policy: policy), .requestChanges)
         // BLOCKING is never configurable.
         XCTAssertEqual(DecisionEvaluator.decision(for: .blocking, policy: policy), .requestChanges)
+    }
+
+    func testExhaustedQuotaAndRejectedCredentialsAreTerminal() {
+        let terminal = [
+            "ERROR: You've hit your usage limit. Try again at 2:22 PM.",
+            "stream error: insufficient_quota",
+            "The model `gpt-5.6-sol` is not supported when using Codex with a ChatGPT account",
+            "API Error: 401 {\"type\":\"authentication_error\"}",
+            "Not authenticated. Please run `codex login`.",
+            "Your credit balance is too low to access the API.",
+        ]
+        for message in terminal {
+            XCTAssertEqual(
+                ReviewerFailureClass.classify(message),
+                .terminal,
+                "expected terminal: \(message)"
+            )
+            XCTAssertFalse(
+                ReviewerResult(
+                    reviewer: .codex,
+                    model: "m",
+                    output: "",
+                    verdict: nil,
+                    failure: message
+                ).isWorthRetrying,
+                "a terminal failure must not be retried in place: \(message)"
+            )
+        }
+    }
+
+    func testUnrecognisedAndRecoverableFailuresStayTransient() {
+        let transient = [
+            "command exited with status 1",
+            "API Error: 529 overloaded_error",
+            "error sending request for url (https://api.example.com): connection reset by peer",
+            // A pull request is allowed to talk about quotas and logins without disarming
+            // the retry: the markers describe what a CLI says about itself.
+            "reviewed src/billing/quota.rs and src/auth/login.rs",
+        ]
+        for message in transient {
+            XCTAssertEqual(
+                ReviewerFailureClass.classify(message),
+                .transient,
+                "expected transient: \(message)"
+            )
+        }
+    }
+
+    func testTimeoutIsStillNotRetriedInPlace() {
+        var result = ReviewerResult(
+            reviewer: .claude,
+            model: "m",
+            output: "",
+            verdict: nil,
+            failure: "timed out after 900s"
+        )
+        result.timedOut = true
+        XCTAssertFalse(result.isWorthRetrying)
     }
 
     private func result(

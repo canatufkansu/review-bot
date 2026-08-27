@@ -71,13 +71,67 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
     }
 
-    func testReviewerFailureIsNotPostedAndRetriedOnNextPoll() async throws {
+    func testAFailedReviewerDoesNotSuppressTheReviewThatSurvived() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(failCodex: true)
         let engine = ReviewEngine(paths: fixture.paths, runner: runner)
         let recorder = EventRecorder()
         var configuration = fixture.configuration
         configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let codexCount = await runner.codexCount()
+        let body = await runner.lastPostedBody()
+        XCTAssertEqual(codexCount, 2, "The failure is unrecognised, so it is still retried in place")
+        XCTAssertEqual(postCount, 1, "Claude's findings are posted rather than thrown away")
+        XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
+        XCTAssertFalse(events.contains(where: { $0.kind == .failed }))
+        // The author has to be able to tell a one-reviewer approval from a unanimous one.
+        XCTAssertTrue(body.contains("Partial panel"))
+        XCTAssertTrue(body.contains("**Codex**"))
+        XCTAssertTrue(body.contains("simulated codex failure"))
+        // A reviewer with no review body gets no empty disclosure triangle.
+        XCTAssertFalse(body.contains("<strong>Codex —"))
+    }
+
+    func testAQuotaFailureSkipsTheInReviewRetry() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            failCodex: true,
+            codexFailureMessage: "ERROR: You've hit your usage limit. Try again at 2:22 PM."
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let engineEvents = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await engineEvents.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let codexCount = await runner.codexCount()
+        let postCount = await runner.postCount()
+        XCTAssertEqual(codexCount, 1, "A second call against an exhausted quota fails identically")
+        XCTAssertEqual(postCount, 1)
+    }
+
+    func testNothingIsPostedWhenNoReviewerProducesAVerdict() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
 
         for _ in 0..<2 {
@@ -91,6 +145,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let events = await recorder.snapshot()
         let postCount = await runner.postCount()
         let codexCount = await runner.codexCount()
+        // An empty panel is different in kind from a partial one: there is no review to post,
+        // and in particular nothing that could be mistaken for an approval.
         XCTAssertEqual(postCount, 0)
         // Two polls, and a failing reviewer is run twice within each review.
         XCTAssertEqual(codexCount, 4)
@@ -460,6 +516,87 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(preview.contains("addedOnBase"))
     }
 
+    /// Regression: the preview was resolved from `baseRefOid`, the snapshot `gh pr view` reports
+    /// rather than the base branch's live tip. Once an author merges the base in, that snapshot is
+    /// an ancestor of the head, so `behind` reads 0 and the preview silently disappears — and a
+    /// branch synced once is exactly the one most likely to drift again. Observed in production on
+    /// a pull request GitHub itself reported as `behind_by=1`.
+    func testMergePreviewResolvesTheBaseFromTheLiveRefNotTheStaleSnapshot() async throws {
+        let fixture = try FeatureFixture()
+        // The mock's `rev-list` only reports commits against the remote-tracking OID; asking about
+        // the snapshot returns 0, so reading the wrong ref yields no preview at all.
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let captured = await runner.mergePreviewDuringReview()
+        let preview = try XCTUnwrap(
+            captured,
+            "a base that has moved must produce a preview even when baseRefOid is already merged in"
+        )
+        XCTAssertTrue(preview.contains("`main` has moved 2 commits ahead"))
+
+        // Bound before asserting: XCTUnwrap takes an @autoclosure, which cannot carry an `await`.
+        let capturedRevParse = await runner.revParseInvocation()
+        let revParse = try XCTUnwrap(capturedRevParse)
+        XCTAssertTrue(
+            revParse.contains("refs/remotes/origin/main^{commit}"),
+            "the base must be resolved by ref name against the remote-tracking branch"
+        )
+    }
+
+    /// The fallback still has to work: an unresolvable remote-tracking ref must not lose the
+    /// preview entirely, since `baseRefOid` remains a truthful — if possibly stale — base.
+    func testMergePreviewFallsBackToTheSnapshotWhenTheTrackingRefWillNotResolve() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2, trackedBaseOid: nil)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let captured = await runner.mergePreviewDuringReview()
+        let preview = try XCTUnwrap(
+            captured,
+            "a failed rev-parse must fall back to baseRefOid rather than drop the preview"
+        )
+        XCTAssertTrue(preview.contains("`main` has moved 2 commits ahead"))
+    }
+
+    /// `mergePreview` reads `refs/remotes/origin/<base>`, so the fetch has to actually write it.
+    /// A bare `refs/heads/<name>` refspec only lands in FETCH_HEAD and updates the tracking ref as
+    /// an opportunistic side effect of the clone's configured refspec — not a guarantee.
+    func testFetchNamesTheRemoteTrackingDestinationForTheBaseBranch() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        // Bound before asserting: XCTUnwrap takes an @autoclosure, which cannot carry an `await`.
+        let capturedFetch = await runner.fetchInvocation()
+        let fetch = try XCTUnwrap(capturedFetch)
+        XCTAssertTrue(
+            fetch.contains("+refs/heads/main:refs/remotes/origin/main"),
+            "the base fetch must name its destination so the tracking ref is always updated"
+        )
+    }
+
     /// The common case. Writing a preview that says "nothing to see" would spend context on every
     /// review to describe an empty overlap, so a current branch must not produce the file at all.
     func testNoMergePreviewWhenThePullRequestIsCurrentWithItsBase() async throws {
@@ -554,6 +691,9 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let runner = ReviewWorkflowMock(failCodex: true)
         let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         var configuration = fixture.configuration
+        // Codex alone, so its failure leaves the review with no verdict at all — the only case
+        // that still declines to post, and therefore the one the poll-level backoff governs.
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
         configuration.failureBudget = .unlimited
 
@@ -583,6 +723,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         let recorder = EventRecorder()
         var configuration = fixture.configuration
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
         configuration.failureBudget = .attempts(2)
 
@@ -617,6 +758,7 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         let statuses = StatusRecorder()
         var configuration = fixture.configuration
+        configuration.claude.enabled = false
         configuration.codex.enabled = true
         configuration.failureBudget = .attempts(1)
 
@@ -680,7 +822,25 @@ final class ReviewEngineFeatureTests: XCTestCase {
 
         let codexRuns = await runner.codexCount()
         let posts = await runner.postCount()
+        let body = await runner.lastPostedBody()
         XCTAssertEqual(codexRuns, 1, "Re-running a timeout would just spend the timeout again")
+        XCTAssertEqual(posts, 1, "Claude finished, so its review posts without waiting for codex")
+        XCTAssertTrue(body.contains("**Codex** (timed out)"))
+    }
+
+    func testASoleReviewerTimingOutPostsNothing() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexTimesOut: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let codexRuns = await runner.codexCount()
+        let posts = await runner.postCount()
+        XCTAssertEqual(codexRuns, 1)
         XCTAssertEqual(posts, 0)
     }
 
@@ -858,6 +1018,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let opencodeVerdict: ReviewVerdict
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
+    private let codexFailureMessage: String
     private let codexFailuresBeforeSuccess: Int
     private let codexTimesOut: Bool
     private let failTimeline: Bool
@@ -865,6 +1026,14 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let conversationText: String
     private let claudeBody: String
     private let baseCommitsAhead: Int
+    private let trackedBaseOid: String?
+
+    /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
+    /// `rev-list` has to distinguish it from the remote-tracking OID to reproduce the bug.
+    static let staleBaseOid = "abcdef1234567890"
+
+    private var fetchArgs: [String]?
+    private var revParseArgs: [String]?
 
     init(
         failFirstPost: Bool = false,
@@ -873,6 +1042,9 @@ private actor ReviewWorkflowMock: CommandRunning {
         opencodeVerdict: ReviewVerdict = .clean,
         reconciledVerdict: ReviewVerdict? = nil,
         failCodex: Bool = false,
+        /// What the failing `codex` writes to stderr. The default is unrecognisable, so it
+        /// classifies as transient; pass a quota or auth message to exercise the terminal path.
+        codexFailureMessage: String = "simulated codex failure",
         codexFailuresBeforeSuccess: Int = 0,
         codexTimesOut: Bool = false,
         failTimeline: Bool = false,
@@ -882,7 +1054,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// Commits the base branch has gained since the merge base. `0` — the default — means the
         /// pull request is current with its base, so `mergePreview` returns before issuing any
         /// further plumbing and every other test's command sequence is unchanged.
-        baseCommitsAhead: Int = 0
+        baseCommitsAhead: Int = 0,
+        /// What `rev-parse refs/remotes/origin/main` resolves to. `nil` makes it fail the way git
+        /// does for an unresolvable ref, which is the only case that may fall back to the snapshot.
+        trackedBaseOid: String? = "trackedbaseoid00"
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
@@ -890,6 +1065,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.opencodeVerdict = opencodeVerdict
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
+        self.codexFailureMessage = codexFailureMessage
         self.codexFailuresBeforeSuccess = codexFailuresBeforeSuccess
         self.codexTimesOut = codexTimesOut
         self.failTimeline = failTimeline
@@ -897,6 +1073,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.conversationText = conversationText
         self.claudeBody = claudeBody
         self.baseCommitsAhead = baseCommitsAhead
+        self.trackedBaseOid = trackedBaseOid
     }
 
     func run(
@@ -923,6 +1100,7 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: emptyTimeline ? "" : "2026-07-15T10:00:00Z\n")
         }
         if executable == "git", arguments.contains("fetch") {
+            fetchArgs = arguments
             return result()
         }
         if executable == "git", arguments.contains("worktree"), arguments.contains("add") {
@@ -943,11 +1121,25 @@ private actor ReviewWorkflowMock: CommandRunning {
         // --- Merge preview plumbing. Must precede the generic `git diff` branch below, which
         // records `incrementalDiffArgs`: these calls would otherwise overwrite the incremental
         // invocation the scope tests assert on.
+        if executable == "git", arguments.contains("rev-parse") {
+            revParseArgs = arguments
+            guard let trackedBaseOid else {
+                // `--verify --quiet` exits non-zero with no output when the ref will not resolve.
+                return result(exitCode: 1)
+            }
+            return result(stdout: "\(trackedBaseOid)\n")
+        }
         if executable == "git", arguments.contains("merge-base") {
             return result(stdout: "aaaaaaaabbbbbbbb\n")
         }
         if executable == "git", arguments.contains("rev-list") {
-            return result(stdout: "\(baseCommitsAhead)\n")
+            // The bug this guards against: `baseRefOid` is a snapshot that the author has already
+            // merged in, so counting commits against it yields 0 and the preview vanishes. Only
+            // the live remote-tracking ref shows the base has moved. Answer for whichever OID the
+            // engine actually asked about, so reading the wrong one produces no preview at all.
+            let liveBase = trackedBaseOid ?? Self.staleBaseOid
+            let range = arguments.last ?? ""
+            return result(stdout: "\(range.hasSuffix("..\(liveBase)") ? baseCommitsAhead : 0)\n")
         }
         if executable == "git", arguments.contains("merge-tree") {
             // Exit 1 is git's "merged, with conflicts" — an answer, not a failure.
@@ -1013,7 +1205,7 @@ private actor ReviewWorkflowMock: CommandRunning {
                 throw CommandExecutionError.timedOut(command: "codex", seconds: 900)
             }
             if failCodex || codexRuns <= codexFailuresBeforeSuccess {
-                return result(exitCode: 1, stderr: "simulated codex failure")
+                return result(exitCode: 1, stderr: codexFailureMessage)
             }
             if let outputIndex = arguments.firstIndex(of: "-o"),
                arguments.indices.contains(outputIndex + 1) {
@@ -1064,6 +1256,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
     func mergePreviewDuringReview() -> String? { mergePreviewText }
+    func fetchInvocation() -> [String]? { fetchArgs }
+    func revParseInvocation() -> [String]? { revParseArgs }
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
