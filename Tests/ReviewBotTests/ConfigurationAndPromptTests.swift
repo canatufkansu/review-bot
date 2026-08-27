@@ -181,4 +181,26 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Treat database rollbacks as Blocking."))
         XCTAssertTrue(prompt.hasSuffix("--- END REVIEW.md ---"))
     }
+
+    func testReconciliationMakesADowngradeJustifyItself() {
+        let prompt = DefaultPrompt.reconciliation(reviews: [
+            (reviewer: "Claude", body: "## Findings\nShould-fix: the count is wrong.", verdict: "SHOULD_FIX"),
+            (reviewer: "Codex", body: "## Findings\nNone.", verdict: "CLEAN"),
+        ])
+
+        // Both reviews reach the adjudicator verbatim, tagged with who said what.
+        XCTAssertTrue(prompt.contains("--- BEGIN Claude REVIEW (verdict: SHOULD_FIX) ---"))
+        XCTAssertTrue(prompt.contains("--- BEGIN Codex REVIEW (verdict: CLEAN) ---"))
+        XCTAssertTrue(prompt.contains("the count is wrong."))
+
+        // A finding that survives substantiation and scope can still be reduced, but only
+        // by naming what it actually costs — "polish" is the conclusion, not the argument.
+        XCTAssertTrue(prompt.contains("Severity moves in both directions"))
+        XCTAssertTrue(prompt.contains("is not a justification on its own"))
+        XCTAssertTrue(prompt.contains("the finding stands at the severity it was given"))
+        // And the adjudicator is not confined to loosening.
+        XCTAssertTrue(prompt.contains("warrants a *higher* severity"))
+
+        XCTAssertTrue(prompt.hasSuffix("VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>"))
+    }
 }

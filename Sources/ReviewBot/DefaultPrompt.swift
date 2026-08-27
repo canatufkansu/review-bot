@@ -105,6 +105,7 @@ VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
         2. Confirm scope: the finding's `path:line` must be a line this PR adds or changes in `.review-bot-diff.patch`. A defect in unchanged code, a third-party dependency, a generated file, or a vendored SDK is pre-existing and out of scope — a `Nit` at most, never gating, even when this PR is the first thing to exercise it. **Exception:** a defect that appears only once this PR merges into its base branch — a deleted symbol the base still calls, a dropped import the base now needs — is in scope and may gate, even with no added line to point at, provided `.review-bot-merge.md` is present and its evidence names the concrete breakage. Do not overturn such a finding for lacking a diff anchor; overturn it only if the evidence does not support it.
         3. If the finding claims a framework, library, or language feature "won't", "doesn't", or "can't" do something, verify that against the dependency's actual code or documented version behavior. Discard behavior claims you cannot confirm.
         4. A finding only one reviewer raised is not weaker for that reason; a finding both raised is not automatically correct. Judge each on the code.
+        5. Severity moves in both directions, and a downgrade has to earn itself. Once a finding has survived steps 1-3 — substantiated, in scope, behavior claims confirmed — reducing it below the gate is a claim about **impact**, not about validity, and you must state that impact concretely: name what actually happens at runtime, to a caller, to a stored record, or to a reader acting on the text, and say why that does not warrant correcting before merge. "Polish", "documentation only", "cosmetic", or "no realistic accident" is not a justification on its own — it is the conclusion you have to show your work for. If you cannot state the concrete consequence and why it is tolerable, the finding stands at the severity it was given. Equally, if a finding you substantiate warrants a *higher* severity than either review gave it, say so: this step corrects severity in whichever direction the code supports.
 
         Set the final verdict from the findings that survive, considering in-scope findings only:
         - `BLOCKING` — a surviving, in-scope, merge-stopping correctness, security, or data-loss defect.
@@ -112,7 +113,7 @@ VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
         - `NITS_ONLY` — only optional polish or pre-existing/out-of-scope notes remain.
         - `CLEAN` — nothing survives.
 
-        Output a brief reconciliation: one line per disputed finding stating whether you upheld or overturned it and why (substantiated or not, in-scope or pre-existing, behavior-claim confirmed or not). Then end with exactly one machine-readable line and nothing after it:
+        Output a brief reconciliation: one line per disputed finding stating whether you upheld, raised, downgraded, or overturned it and why (substantiated or not, in-scope or pre-existing, behavior-claim confirmed or not). A finding you downgrade rather than overturn is one you agree is real, so its line must carry the concrete impact and why that impact does not block the merge. Then end with exactly one machine-readable line and nothing after it:
 
         VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
         """#
