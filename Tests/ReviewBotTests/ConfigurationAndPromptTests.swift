@@ -85,7 +85,7 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertEqual(configuration.reviewScope, .incremental)
     }
 
-    func testConfigurationWithoutAuthModeDefaultsToSession() throws {
+    func testConfigurationWithoutAuthModeDefaultsToSessionAndDisabledDeepSeek() throws {
         let json = #"""
         {
           "repositories": [],
@@ -100,10 +100,11 @@ final class ConfigurationAndPromptTests: XCTestCase {
             from: Data(json.utf8)
         )
 
-        // A config written before per-reviewer sign-in existed must keep behaving exactly as it
-        // did: every reviewer on its CLI's own login, with no credential injected.
         XCTAssertEqual(configuration.claude.authMode, .session)
         XCTAssertEqual(configuration.codex.authMode, .session)
+        XCTAssertFalse(configuration.deepseek.enabled)
+        XCTAssertEqual(configuration.deepseek.model, "deepseek-chat")
+        XCTAssertEqual(configuration.enabledReviewers.map(\.name), [.claude])
     }
 
     func testOpencodeIsAlwaysSessionAuthEvenIfConfigSaysOtherwise() throws {
@@ -122,9 +123,9 @@ final class ConfigurationAndPromptTests: XCTestCase {
             from: Data(json.utf8)
         )
 
-        // opencode authenticates through its own config directory and reads no key variable, so
-        // `environmentOverrides` would inject nothing while the settings panel claimed a key was
-        // in use.
+        // The mirror image of the DeepSeek rule below. opencode authenticates through its own
+        // config directory and reads no key variable, so `environmentOverrides` would inject
+        // nothing while `meteredUsage` started counting it as billed to the developer's key.
         XCTAssertEqual(configuration.opencode.authMode, .session)
         XCTAssertFalse(ReviewerName.opencode.supportsAPIKeyAuth)
     }
@@ -154,6 +155,27 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertEqual(configuration.claude.effort, .high)
     }
 
+    func testDeepSeekAlwaysUsesAPIKeyAuthEvenIfConfigSaysOtherwise() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": false, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "medium" },
+          "deepseek": { "enabled": true, "model": "deepseek-chat", "effort": "high", "authMode": "session" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // There is no DeepSeek CLI to borrow a session from.
+        XCTAssertEqual(configuration.deepseek.authMode, .apiKey)
+        XCTAssertEqual(configuration.enabledReviewers.map(\.name), [.deepseek])
+    }
+
     func testAuthModeRoundTripsAndConfigurationNeverCarriesTheKey() throws {
         var configuration = ReviewBotConfiguration.default
         configuration.claude.authMode = .apiKey
@@ -172,14 +194,40 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertEqual(decoded.codex.authMode, .session)
     }
 
+    func testEnabledReviewersKeepAStableOrder() {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+        configuration.opencode.enabled = true
+        configuration.deepseek.enabled = true
+
+        // This order is `ReviewerName`'s declaration order, and it is load-bearing twice over: it
+        // fixes the order the panels appear in the posted review, and it is the order
+        // `runReconciliation` walks when picking an adjudicator. DeepSeek is last so the one
+        // reviewer that always bills a key never adjudicates while a CLI is available.
+        XCTAssertEqual(
+            configuration.enabledReviewers.map(\.name),
+            [.claude, .codex, .opencode, .deepseek]
+        )
+        XCTAssertEqual(configuration.enabledReviewers.map(\.name), ReviewerName.allCases)
+
+        // Disabling one reviewer removes it without disturbing the order of the rest.
+        configuration.codex.enabled = false
+        XCTAssertEqual(
+            configuration.enabledReviewers.map(\.name),
+            [.claude, .opencode, .deepseek]
+        )
+    }
+
     func testSettingsLookupReturnsEachReviewersOwnConfiguration() {
-        // `settings(for:)` is a switch over identically typed properties, so a copy-paste there
-        // would hand one reviewer another's model, effort, and auth mode with nothing to catch
-        // it — and it is what decides which reviewer a saved key is looked up for.
+        // `settings(for:)` is a four-arm switch over identically typed properties, so a
+        // copy-paste there would hand one reviewer another's model, effort, and auth mode with
+        // nothing to catch it. `enabledReviewers` is built on top of it.
         var configuration = ReviewBotConfiguration.default
         configuration.claude.model = "model-claude"
         configuration.codex.model = "model-codex"
         configuration.opencode.model = "model-opencode"
+        configuration.deepseek.model = "model-deepseek"
 
         for reviewer in ReviewerName.allCases {
             XCTAssertEqual(
@@ -192,18 +240,19 @@ final class ConfigurationAndPromptTests: XCTestCase {
 
     /// The "adding a reviewer" checklist, as assertions. Every one of these is a total switch
     /// over `ReviewerName`, so a new case compiles only once each has an arm — but nothing makes
-    /// that arm *correct*, and a wrong one is a key read from the wrong variable, handed to the
-    /// wrong CLI, or a cost report promised for a reviewer that collects no figures.
+    /// that arm *correct*, and several of them were written when there were two reviewers and
+    /// answered by accident for the third and fourth.
     func testEveryReviewerDeclaresACoherentCredentialAndUsageSurface() {
         XCTAssertEqual(ReviewerName.allCases.map(\.commandName), [
             "claude",
             "codex",
             "opencode",
+            nil,
         ])
-        // Outbound: what a CLI child process is handed. opencode takes none.
         XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyEnvironmentVariable), [
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
+            nil,
             nil,
         ])
         // Inbound: what Review Bot itself reads a key from, ahead of the Keychain. Total, so it
@@ -212,22 +261,35 @@ final class ConfigurationAndPromptTests: XCTestCase {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "OPENCODE_API_KEY",
+            "DEEPSEEK_API_KEY",
         ])
         let inbound = ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable)
         XCTAssertEqual(Set(inbound).count, inbound.count, "two reviewers would share a key")
 
         // Only a CLI can borrow a login; only a reviewer Review Bot can hand a key to may be put
-        // in key mode. opencode is the reviewer that separates the two predicates.
-        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true])
-        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false])
+        // in key mode. opencode is the one reviewer that is neither, which is why it needs both
+        // predicates rather than one.
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true, false])
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false, true])
         XCTAssertFalse(
             ReviewerName.allCases.contains { !$0.supportsSessionAuth && !$0.supportsAPIKeyAuth },
             "a reviewer with neither auth mode could never be credentialed at all"
         )
 
-        // Claude's CLI prints a usage envelope; Codex and opencode print the review and nothing
-        // else, so claiming otherwise would promise the usage report a figure nothing collects.
-        XCTAssertEqual(ReviewerName.allCases.map(\.reportsTokenUsage), [true, false, false])
+        // Claude's CLI prints a usage envelope and DeepSeek's API reports tokens; Codex and
+        // opencode print the review and nothing else, so claiming otherwise would promise the
+        // usage report a figure nothing collects.
+        XCTAssertEqual(ReviewerName.allCases.map(\.reportsTokenUsage), [true, false, false, true])
+        XCTAssertEqual(ReviewerName.allCases.map(\.usesEffortSetting), [true, true, true, false])
+
+        for reviewer in ReviewerName.allCases {
+            XCTAssertEqual(
+                reviewer.efforts.isEmpty,
+                !reviewer.usesEffortSetting,
+                "\(reviewer.rawValue) offers effort levels it does not use, or none it does"
+            )
+            XCTAssertFalse(reviewer.symbolName.isEmpty)
+        }
     }
 
     func testTokenSummaryTreatsCachedTokensAsASubsetOfInput() {
@@ -383,6 +445,46 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Mandatory repository review rules"))
         XCTAssertTrue(prompt.contains("Treat database rollbacks as Blocking."))
         XCTAssertTrue(prompt.hasSuffix("--- END REVIEW.md ---"))
+    }
+
+    /// `finalReviewRequest` restates the output contract — including a `## Merge gate` section and
+    /// the severity rules — at the moment DeepSeek is asked for its answer. A chat model routinely
+    /// echoes a chunk of that back inside the review it writes, and `InjectionGuard` downgrades an
+    /// approval whose own prose describes a merge blocker. Instruction text that trips that check
+    /// would turn every legitimate DeepSeek approval into a neutral comment, with no reviewer at
+    /// fault and nothing in the logs pointing here.
+    func testTheFinalReviewRequestCannotDowngradeAnApprovalIfTheModelEchoesIt() {
+        let echoed = """
+        ## Summary
+        The change is safe.
+
+        ## Findings
+        Blocking: None. Should-fix: None. Nit: None.
+
+        ## Merge gate
+        Mergeable as-is.
+
+        \(DefaultPrompt.finalReviewRequest)
+
+        VERDICT: CLEAN
+        """
+        let result = ReviewerResult(
+            reviewer: .deepseek,
+            model: "deepseek-chat",
+            output: echoed,
+            verdict: .clean,
+            failure: nil
+        )
+
+        XCTAssertNil(
+            InjectionGuard.flagIfApproveUnsafe(
+                thread: "PR conversation, nothing planted",
+                diff: "diff --git a/a.swift b/a.swift\n+let x = 1\n",
+                results: [result],
+                adjudication: nil
+            ),
+            "the restated contract must not read as the reviewer calling the PR unmergeable"
+        )
     }
 
     func testReconciliationMakesADowngradeJustifyItself() {

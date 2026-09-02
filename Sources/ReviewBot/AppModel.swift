@@ -82,13 +82,28 @@ final class AppModel: ObservableObject {
     func refreshToolAvailability() async {
         var statuses: [String: Bool] = [:]
         // The probe list is derived from the reviewers rather than written out, so a reviewer
-        // added to `ReviewerName` is checked without a second edit here.
+        // added to `ReviewerName` is checked without a second edit here. DeepSeek has no
+        // `commandName` and so is skipped: there is no binary to find, and its readiness is a
+        // question about credentials, which `refreshSavedKeys` answers below.
         for tool in ["gh"] + ReviewerName.allCases.compactMap(\.commandName) {
             let result = try? await runner.run("which", arguments: [tool], timeout: 10)
             statuses[tool] = result?.succeeded == true
         }
         toolAvailability = statuses
         await refreshSavedKeys()
+    }
+
+    /// Whether a reviewer could run right now.
+    ///
+    /// A CLI-backed reviewer needs its binary on `PATH`; DeepSeek is reached over HTTP, so the
+    /// equivalent question is whether a key resolves for it — from this app's environment or the
+    /// Keychain. Answering both through one call keeps the UI from having to know which reviewers
+    /// are processes and which are endpoints.
+    func isReviewerAvailable(_ reviewer: ReviewerName) -> Bool {
+        guard let command = reviewer.commandName else {
+            return reviewersWithSavedKey.contains(reviewer)
+        }
+        return toolAvailability[command] == true
     }
 
     /// Which reviewers have a key available — from the Keychain, or from the environment, which

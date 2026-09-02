@@ -4,10 +4,10 @@ import Security
 /// Storage for reviewer API keys. Keys are never written to `config.json`, which is a plain
 /// JSON file in Application Support; they live in the login Keychain instead.
 ///
-/// A key is only ever meaningful for a reviewer whose `supportsAPIKeyAuth` is true — one that
-/// reads a key from the environment its process is started with. opencode is not such a
-/// reviewer: it authenticates through its own configuration directory, so Review Bot has
-/// nowhere to put a key for it even if one were stored.
+/// A key is only ever meaningful for a reviewer whose `supportsAPIKeyAuth` is true — either a
+/// CLI that reads one from its environment, or a reviewer with no CLI at all, for which a key is
+/// the only way in. opencode is neither: it authenticates through its own configuration
+/// directory, so Review Bot has nowhere to put a key for it even if one were stored.
 protocol CredentialStoring: Sendable {
     func apiKey(for reviewer: ReviewerName) -> String?
     func setAPIKey(_ key: String, for reviewer: ReviewerName) throws
