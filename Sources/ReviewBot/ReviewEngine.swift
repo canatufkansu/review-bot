@@ -339,6 +339,7 @@ actor ReviewEngine {
         let repository = pendingReview.repository
         var worktreeURL: URL?
         var worktreeAdded = false
+        var spent: TokenUsage?
 
         do {
             await onStatus("Preparing \(repository.name) #\(pullRequest.number)…")
@@ -433,6 +434,14 @@ actor ReviewEngine {
                 credentials: credentials
             )
 
+            // Whatever has been billed so far, in a variable declared outside the `do` so a
+            // review that spends real money and then fails still records the spend. Assigned
+            // here — above the incomplete-review throw below, not after it — because a panel
+            // where every metered reviewer failed burned tokens on every attempt too, and its
+            // history entry is the only place that spend can ever be recorded. Re-computed once
+            // the adjudicator has run, since reconciliation is a metered call of its own.
+            spent = usageTotal(results: results, adjudication: nil, configuration: configuration)
+
             // Post as long as *someone* finished. A reviewer that failed is named in the posted
             // body rather than suppressing the review: holding the whole panel hostage to one CLI
             // means an exhausted quota throws away the findings the other reviewer already
@@ -465,7 +474,14 @@ actor ReviewEngine {
             let policy = configuration.decisionPolicy
             let strictDecision = DecisionEvaluator.evaluate(results, policy: policy)
             var decision = strictDecision
+            // The adjudication that *decided* the review — nil when reconciliation produced no
+            // verdict, in which case the strictest verdict stands and there is nothing to
+            // disclose in the posted body.
             var adjudication: ReviewerResult?
+            // The adjudication that was *billed*: every reconciliation that ran, verdict or not.
+            // Kept apart from `adjudication` because a call that came back useless was charged
+            // exactly like one that came back decisive.
+            var adjudicationSpend: ReviewerResult?
             if DecisionEvaluator.gateDisagreement(results, policy: policy) {
                 await onStatus("Reviewers disagreed on \(repository.name) #\(pullRequest.number); reconciling…")
                 let adjudicated = await runReconciliation(
@@ -474,6 +490,7 @@ actor ReviewEngine {
                     worktree: worktree,
                     credentials: credentials
                 )
+                adjudicationSpend = adjudicated
                 if let verdict = adjudicated.verdict {
                     decision = DecisionEvaluator.decision(for: verdict, policy: policy)
                     adjudication = adjudicated
@@ -482,6 +499,11 @@ actor ReviewEngine {
                         "Reconciliation for \(repository.githubSlug)#\(pullRequest.number) produced no verdict; using strictest (\(strictDecision.title))."
                     )
                 }
+                spent = usageTotal(
+                    results: results,
+                    adjudication: adjudicationSpend,
+                    configuration: configuration
+                )
             }
             var guardReason: InjectionGuard.Reason?
             if decision == .approve {
@@ -501,7 +523,12 @@ actor ReviewEngine {
                 results: results,
                 decision: decision,
                 adjudication: adjudication,
-                guardReason: guardReason
+                guardReason: guardReason,
+                usageReport: usageReport(
+                    results: results,
+                    adjudication: adjudicationSpend,
+                    configuration: configuration
+                )
             )
             let reviewFile = try saveReview(
                 reviewBody,
@@ -538,16 +565,26 @@ actor ReviewEngine {
             let reconciledNote = adjudication.map {
                 " Reconciled by \($0.reviewer.rawValue) → \($0.verdict?.rawValue ?? "unavailable")."
             } ?? ""
+            // Recorded whether or not the report is posted, so spend stays traceable either way.
+            let total = spent
+            let usageNote = total.map { usage in
+                " \(TokenUsage.abbreviated(usage.totalTokens)) tokens"
+                    + (usage.costSummary.map { ", \($0)" } ?? "")
+                    + "."
+            } ?? ""
             await emit(
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(usageNote)",
+                usage: total,
                 onEvent: onEvent
             )
         } catch {
             // Nothing posted, so the dedup key stays unwritten and the next poll retries —
-            // but the attempt is counted, which is what bounds and paces that retry.
+            // but the attempt is counted, which is what bounds and paces that retry. Any tokens
+            // the reviewers already burned are recorded too: a metered panel that finished and
+            // then failed to reach GitHub cost exactly as much as one that posted.
             let failures = attempts.recordFailure(for: pendingReview.reviewKey, at: now())
             let message = error.localizedDescription + " " + RetryPolicy.note(
                 failures: failures,
@@ -565,7 +602,8 @@ actor ReviewEngine {
                     pullRequestNumber: pullRequest.number,
                     pullRequestTitle: pullRequest.title,
                     pullRequestURL: pullRequest.url,
-                    message: message
+                    message: message,
+                    usage: spent
                 )
             )
         }
@@ -957,13 +995,22 @@ actor ReviewEngine {
             await logger.append(
                 "\(name.rawValue) \(result.failure.map { "failed (\($0))" } ?? "returned no verdict"); running it again before giving up on this review."
             )
-            result = await runReviewerOnce(
+            var retried = await runReviewerOnce(
                 name,
                 configuration: configuration,
                 prompt: prompt,
                 worktree: worktree,
                 credentials: credentials
             )
+            // The abandoned attempt was still billed — including, and especially, when it
+            // *failed*, which is the commonest reason to be here at all. Carrying its usage
+            // forward rather than letting the second result replace it is the difference
+            // between reporting what a metered reviewer cost and reporting half of it, so
+            // `failedReviewer` has to keep a failed attempt's usage for this to add up.
+            if let alreadySpent = result.usage {
+                retried.usage = (retried.usage ?? TokenUsage()) + alreadySpent
+            }
+            result = retried
             attempt += 1
         }
         if result.failureClass == .terminal, let failure = result.failure {
@@ -1144,7 +1191,9 @@ actor ReviewEngine {
                     "--model", configuration.model,
                     "--effort", configuration.effort.rawValue,
                     "--allowedTools", "Read", "Grep", "Glob",
-                    "--output-format", "text",
+                    // JSON rather than text so the CLI's own token counts and dollar cost come
+                    // back with the review. Parsed defensively — see `claudeOutput`.
+                    "--output-format", "json",
                 ],
                 currentDirectory: worktree,
                 environment: environmentOverrides(
@@ -1154,18 +1203,115 @@ actor ReviewEngine {
                 ),
                 timeout: 900
             )
+            let parsed = claudeOutput(result.stdout)
             guard result.succeeded else {
-                return failedReviewer(.claude, configuration, message: conciseError(result))
+                // A failing CLI that still emitted the envelope explains itself in `result`;
+                // raw JSON in the history would not.
+                let explanation = parsed.parsedEnvelope
+                    ? parsed.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    : ""
+                return failedReviewer(
+                    .claude,
+                    configuration,
+                    message: explanation.isEmpty
+                        ? conciseError(result)
+                        : String(explanation.prefix(600)),
+                    // Billed all the same, and this is the branch the retry usually comes from.
+                    usage: parsed.usage
+                )
+            }
+            if let failure = parsed.failure {
+                return failedReviewer(
+                    .claude,
+                    configuration,
+                    message: failure,
+                    usage: parsed.usage
+                )
             }
             return ReviewerResult(
                 reviewer: .claude,
                 model: configuration.model,
-                output: result.stdout,
-                verdict: VerdictParser.parse(result.stdout),
-                failure: nil
+                output: parsed.text,
+                verdict: VerdictParser.parse(parsed.text),
+                failure: nil,
+                usage: parsed.usage
             )
         } catch {
             return failedReviewer(.claude, configuration, error: error)
+        }
+    }
+
+    private struct CLIReviewOutput {
+        let text: String
+        let usage: TokenUsage?
+        let failure: String?
+        /// False when stdout was not the JSON envelope, so callers know `text` is raw output.
+        let parsedEnvelope: Bool
+    }
+
+    /// Reads Claude's `--output-format json` envelope.
+    ///
+    /// Falls back to treating stdout as the review verbatim when it is not that envelope, so a
+    /// CLI that accepts the flag but prints something else — or a mocked runner in the tests —
+    /// behaves exactly as it did before. That is a parsing fallback, not a compatibility probe:
+    /// `--output-format json` is passed unconditionally, so a `claude` old enough to *reject*
+    /// the flag exits non-zero and the reviewer fails rather than being re-run as text — there
+    /// is no capability probe, and a probing re-run would spend a second billed call on every
+    /// review to guard against a CLI nobody has reported. Cost comes straight from the CLI, so
+    /// there is no price table to keep current.
+    private func claudeOutput(_ stdout: String) -> CLIReviewOutput {
+        guard let envelope = try? JSONDecoder().decode(
+            ClaudeResultEnvelope.self,
+            from: Data(stdout.utf8)
+        ), let result = envelope.result else {
+            return CLIReviewOutput(text: stdout, usage: nil, failure: nil, parsedEnvelope: false)
+        }
+
+        let usage = TokenUsage(
+            // Cache *writes* are fresh input tokens that happen to have been stored; only reads
+            // were served from cache.
+            inputTokens: (envelope.usage?.inputTokens ?? 0)
+                + (envelope.usage?.cacheCreationInputTokens ?? 0),
+            cachedInputTokens: envelope.usage?.cacheReadInputTokens ?? 0,
+            outputTokens: envelope.usage?.outputTokens ?? 0,
+            requests: 1,
+            costUSD: envelope.totalCostUSD
+        )
+        return CLIReviewOutput(
+            text: result,
+            usage: usage,
+            failure: envelope.isError == true
+                ? String(result.trimmingCharacters(in: .whitespacesAndNewlines).prefix(600))
+                : nil,
+            parsedEnvelope: true
+        )
+    }
+
+    private struct ClaudeResultEnvelope: Decodable {
+        struct Usage: Decodable {
+            let inputTokens: Int?
+            let outputTokens: Int?
+            let cacheReadInputTokens: Int?
+            let cacheCreationInputTokens: Int?
+
+            private enum CodingKeys: String, CodingKey {
+                case inputTokens = "input_tokens"
+                case outputTokens = "output_tokens"
+                case cacheReadInputTokens = "cache_read_input_tokens"
+                case cacheCreationInputTokens = "cache_creation_input_tokens"
+            }
+        }
+
+        let result: String?
+        let isError: Bool?
+        let totalCostUSD: Double?
+        let usage: Usage?
+
+        private enum CodingKeys: String, CodingKey {
+            case result
+            case isError = "is_error"
+            case totalCostUSD = "total_cost_usd"
+            case usage
         }
     }
 
@@ -1322,11 +1468,18 @@ actor ReviewEngine {
         )
     }
 
+    /// A failure that still reports what it consumed must carry it. A provider bills a call that
+    /// errored exactly like one that succeeded, and a failure is the *dominant* trigger for the
+    /// in-review retry (`ReviewerResult.isWorthRetrying`), so dropping the usage here would
+    /// under-report the retried review — the one case this feature exists to get right.
+    /// `usage` stays `nil` where there is genuinely nothing to report: a command that threw
+    /// before producing output, a timeout, a missing key caught before the CLI ever ran.
     private func failedReviewer(
         _ reviewer: ReviewerName,
         _ configuration: ReviewerConfiguration,
         message: String,
-        timedOut: Bool = false
+        timedOut: Bool = false,
+        usage: TokenUsage? = nil
     ) -> ReviewerResult {
         ReviewerResult(
             reviewer: reviewer,
@@ -1334,8 +1487,93 @@ actor ReviewEngine {
             output: "_\(reviewer.rawValue) review failed: \(message)_",
             verdict: nil,
             failure: message,
-            timedOut: timedOut
+            timedOut: timedOut,
+            usage: usage
         )
+    }
+
+    /// Everything the developer is billed per token for, across the reviewers and the adjudicator.
+    ///
+    /// A result is counted on its `usage`, not on whether it succeeded — a reviewer whose call
+    /// errored, and an adjudicator that came back without a verdict, were both billed.
+    /// Session-auth CLI reviewers are deliberately excluded: their cost is a flat subscription, so
+    /// attributing dollars to one review would be fiction. Always computed, regardless of whether
+    /// the report is posted, so history and the logs can total spend either way.
+    private func meteredUsage(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> [(reviewer: ReviewerName, model: String, usage: TokenUsage, isAdjudicator: Bool)] {
+        let entries = results.map { ($0, false) } + (adjudication.map { [($0, true)] } ?? [])
+        return entries.compactMap { result, isAdjudicator in
+            guard configuration.settings(for: result.reviewer).authMode == .apiKey,
+                  let usage = result.usage else {
+                return nil
+            }
+            return (result.reviewer, result.model, usage, isAdjudicator)
+        }
+    }
+
+    private func usageTotal(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> TokenUsage? {
+        let metered = meteredUsage(
+            results: results,
+            adjudication: adjudication,
+            configuration: configuration
+        )
+        guard !metered.isEmpty else { return nil }
+        return metered.map(\.usage).reduce(TokenUsage(), +)
+    }
+
+    /// The usage section appended to the posted review, or `nil` when it is switched off or there
+    /// is nothing metered to report.
+    private func usageReport(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> String? {
+        guard configuration.includeUsageInReview else { return nil }
+        let metered = meteredUsage(
+            results: results,
+            adjudication: adjudication,
+            configuration: configuration
+        )
+        guard !metered.isEmpty,
+              let total = usageTotal(
+                  results: results,
+                  adjudication: adjudication,
+                  configuration: configuration
+              ) else {
+            return nil
+        }
+
+        let rows = metered.map { entry in
+            let label = entry.isAdjudicator
+                ? "\(entry.reviewer.rawValue) (reconciliation)"
+                : entry.reviewer.rawValue
+            let cost = entry.usage.costSummary ?? "not reported"
+            return "| \(label) | `\(entry.model)` | \(entry.usage.tokenSummary) | \(cost) |"
+        }.joined(separator: "\n")
+
+        let totalCost = total.costSummary.map { " — **\($0)**" } ?? ""
+        return """
+
+
+        <details><summary><strong>Token usage and cost\(totalCost)</strong></summary>
+
+        | Reviewer | Model | Tokens | Cost |
+        | --- | --- | --- | --- |
+        \(rows)
+
+        \(TokenUsage.abbreviated(total.totalTokens)) tokens in total, as reported by the \
+        reviewers themselves. Only reviewers billed per token are listed; reviewers using a \
+        signed-in CLI are covered by its subscription.
+
+        </details>
+        """
     }
 
     private func aggregateReview(
@@ -1344,7 +1582,8 @@ actor ReviewEngine {
         results: [ReviewerResult],
         decision: ReviewDecision,
         adjudication: ReviewerResult?,
-        guardReason: InjectionGuard.Reason?
+        guardReason: InjectionGuard.Reason?,
+        usageReport: String?
     ) -> String {
         let verdictSummary = results.map {
             "\($0.reviewer.rawValue): `\($0.verdict?.rawValue ?? "unavailable")`"
@@ -1432,7 +1671,7 @@ actor ReviewEngine {
 
         Independent reviews of `\(commitSHA.prefix(8))` (\(verdictSummary)). These findings are advisory; verify them before acting.
 
-        \(details)
+        \(details)\(usageReport ?? "")
 
         ---
         <sub>Generated locally by Review Bot.</sub>
@@ -1463,6 +1702,7 @@ actor ReviewEngine {
         repository: RepositoryConfiguration,
         pullRequest: PullRequestSummary,
         message: String,
+        usage: TokenUsage? = nil,
         onEvent: @escaping EventSink
     ) async {
         let entry = HistoryEntry(
@@ -1472,7 +1712,8 @@ actor ReviewEngine {
             pullRequestNumber: pullRequest.number,
             pullRequestTitle: pullRequest.title,
             pullRequestURL: pullRequest.url,
-            message: message
+            message: message,
+            usage: usage
         )
         await logger.append(
             "\(kind.label): \(repository.githubSlug)#\(pullRequest.number) — \(message)"

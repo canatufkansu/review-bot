@@ -192,9 +192,9 @@ final class ConfigurationAndPromptTests: XCTestCase {
 
     /// The "adding a reviewer" checklist, as assertions. Every one of these is a total switch
     /// over `ReviewerName`, so a new case compiles only once each has an arm — but nothing makes
-    /// that arm *correct*, and a wrong one is a key read from the wrong variable or handed to
-    /// the wrong CLI.
-    func testEveryReviewerDeclaresACoherentCredentialSurface() {
+    /// that arm *correct*, and a wrong one is a key read from the wrong variable, handed to the
+    /// wrong CLI, or a cost report promised for a reviewer that collects no figures.
+    func testEveryReviewerDeclaresACoherentCredentialAndUsageSurface() {
         XCTAssertEqual(ReviewerName.allCases.map(\.commandName), [
             "claude",
             "codex",
@@ -224,6 +224,68 @@ final class ConfigurationAndPromptTests: XCTestCase {
             ReviewerName.allCases.contains { !$0.supportsSessionAuth && !$0.supportsAPIKeyAuth },
             "a reviewer with neither auth mode could never be credentialed at all"
         )
+
+        // Claude's CLI prints a usage envelope; Codex and opencode print the review and nothing
+        // else, so claiming otherwise would promise the usage report a figure nothing collects.
+        XCTAssertEqual(ReviewerName.allCases.map(\.reportsTokenUsage), [true, false, false])
+    }
+
+    func testTokenSummaryTreatsCachedTokensAsASubsetOfInput() {
+        // `inputTokens` holds the uncached portion, so a summary that printed it as "in" while
+        // listing the cached count beside it understated the real input by the cached amount.
+        let usage = TokenUsage(
+            inputTokens: 28_033,
+            cachedInputTokens: 18_688,
+            outputTokens: 2_898,
+            requests: 12
+        )
+
+        XCTAssertEqual(usage.totalInputTokens, 46_721)
+        XCTAssertEqual(usage.totalTokens, 49_619)
+        XCTAssertEqual(usage.tokenSummary, "46.7k in (18.7k cached) + 2.9k out over 12 calls")
+    }
+
+    func testTokenSummaryOmitsCacheAndCallCountWhenThereIsNothingToSay() {
+        let usage = TokenUsage(inputTokens: 900, outputTokens: 120, requests: 1)
+        XCTAssertEqual(usage.tokenSummary, "900 in + 120 out")
+    }
+
+    func testUsageAddsUpAndKeepsAnUnknownCostUnknown() {
+        let priced = TokenUsage(inputTokens: 10, outputTokens: 5, requests: 1, costUSD: 0.25)
+        let unpriced = TokenUsage(inputTokens: 20, outputTokens: 7, requests: 1)
+
+        let both = priced + unpriced
+        XCTAssertEqual(both.inputTokens, 30)
+        XCTAssertEqual(both.outputTokens, 12)
+        XCTAssertEqual(both.requests, 2)
+        XCTAssertEqual(both.costUSD, 0.25, "a reviewer with no price must not zero out a known cost")
+
+        let neither = unpriced + unpriced
+        XCTAssertNil(neither.costUSD, "two unknowns must stay unknown, not become $0.00")
+    }
+
+    func testCostFormattingKeepsSmallAmountsLegible() {
+        XCTAssertEqual(TokenUsage(costUSD: 0.006453).costSummary, "$0.0065")
+        XCTAssertEqual(TokenUsage(costUSD: 12.5).costSummary, "$12.50")
+        XCTAssertNil(TokenUsage().costSummary)
+    }
+
+    func testUsageSettingDefaultsOnAndSurvivesOlderConfigurations() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "medium" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertTrue(configuration.includeUsageInReview)
     }
 
     func testLastReviewedStoreRoundTripsHeadPerPullRequest() throws {

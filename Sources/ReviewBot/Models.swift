@@ -39,6 +39,77 @@ enum ReviewScope: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// What one reviewer consumed producing one review.
+struct TokenUsage: Codable, Equatable {
+    var inputTokens: Int
+    /// Input tokens served from the provider's prompt cache; billed at a lower rate.
+    var cachedInputTokens: Int
+    var outputTokens: Int
+    /// Number of provider calls this usage covers. More than one when a reviewer was run
+    /// again inside the same review, or when the reconciliation pass is added in.
+    var requests: Int
+    /// `nil` when the provider does not report cost — a missing cost must never be shown
+    /// as `$0.00`.
+    var costUSD: Double?
+
+    init(
+        inputTokens: Int = 0,
+        cachedInputTokens: Int = 0,
+        outputTokens: Int = 0,
+        requests: Int = 0,
+        costUSD: Double? = nil
+    ) {
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.outputTokens = outputTokens
+        self.requests = requests
+        self.costUSD = costUSD
+    }
+
+    var totalTokens: Int { inputTokens + cachedInputTokens + outputTokens }
+
+    static func + (lhs: TokenUsage, rhs: TokenUsage) -> TokenUsage {
+        TokenUsage(
+            inputTokens: lhs.inputTokens + rhs.inputTokens,
+            cachedInputTokens: lhs.cachedInputTokens + rhs.cachedInputTokens,
+            outputTokens: lhs.outputTokens + rhs.outputTokens,
+            requests: lhs.requests + rhs.requests,
+            costUSD: lhs.costUSD == nil && rhs.costUSD == nil
+                ? nil
+                : (lhs.costUSD ?? 0) + (rhs.costUSD ?? 0)
+        )
+    }
+
+    /// Input tokens in total, cached and uncached. `inputTokens` alone is the uncached portion,
+    /// which is the figure that matters for pricing but not the one a reader expects to see.
+    var totalInputTokens: Int { inputTokens + cachedInputTokens }
+
+    /// e.g. `24.1k in (11.0k cached) + 2.0k out over 2 calls`. The cached count is a subset of
+    /// the input count, matching how providers report it.
+    var tokenSummary: String {
+        var input = "\(Self.abbreviated(totalInputTokens)) in"
+        if cachedInputTokens > 0 {
+            input += " (\(Self.abbreviated(cachedInputTokens)) cached)"
+        }
+        let joined = "\(input) + \(Self.abbreviated(outputTokens)) out"
+        return requests > 1 ? "\(joined) over \(requests) calls" : joined
+    }
+
+    /// `nil` when cost is unknown, so callers can say so rather than imply it was free.
+    var costSummary: String? {
+        guard let costUSD else { return nil }
+        return costUSD >= 1
+            ? String(format: "$%.2f", costUSD)
+            : String(format: "$%.4f", costUSD)
+    }
+
+    static func abbreviated(_ count: Int) -> String {
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1_000) }
+        return String(count)
+    }
+}
+
 /// Where a reviewer gets its provider credentials.
 enum ReviewerAuthMode: String, Codable, CaseIterable, Identifiable {
     /// Use whatever the reviewer's CLI is already signed in as. Review Bot passes no key.
@@ -145,6 +216,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var codex: ReviewerConfiguration
     var opencode: ReviewerConfiguration
     var customPrompt: String
+    /// Whether the posted review reports what the API-key reviewers consumed.
+    var includeUsageInReview: Bool
     var decisionPolicy: DecisionPolicy
     var reviewScope: ReviewScope
     /// Maximum number of times a single pull request will be reviewed (across new
@@ -180,6 +253,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
             authMode: .session
         ),
         customPrompt: "",
+        includeUsageInReview: true,
         decisionPolicy: .default,
         reviewScope: .fullPullRequest,
         maxReviewRoundsPerPR: nil,
@@ -199,6 +273,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case codex
         case opencode
         case customPrompt
+        case includeUsageInReview
         case decisionPolicy
         case reviewScope
         case maxReviewRoundsPerPR
@@ -213,6 +288,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         codex: ReviewerConfiguration,
         opencode: ReviewerConfiguration,
         customPrompt: String,
+        includeUsageInReview: Bool = true,
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
         maxReviewRoundsPerPR: Int? = nil,
@@ -225,6 +301,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.codex = codex
         self.opencode = opencode
         self.customPrompt = customPrompt
+        self.includeUsageInReview = includeUsageInReview
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
         self.maxReviewRoundsPerPR = maxReviewRoundsPerPR.map { max(1, $0) }
@@ -276,6 +353,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
         // migrated config from selecting one where Review Bot would inject nothing.
         opencode.authMode = .session
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
+        includeUsageInReview = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .includeUsageInReview
+        ) ?? true
         decisionPolicy = try values.decodeIfPresent(
             DecisionPolicy.self,
             forKey: .decisionPolicy
@@ -339,6 +420,9 @@ struct HistoryEntry: Codable, Equatable, Identifiable {
     var pullRequestTitle: String?
     var pullRequestURL: String?
     var message: String
+    /// Combined usage for the review this entry describes, so spend can be totalled from
+    /// `history.json` later. Absent on entries written before usage was tracked.
+    var usage: TokenUsage?
 }
 
 struct ReviewQueueItem: Equatable, Identifiable {
@@ -412,6 +496,19 @@ enum ReviewerName: String, Codable, CaseIterable {
         case .claude: "ANTHROPIC_API_KEY"
         case .codex: "OPENAI_API_KEY"
         case .opencode: "OPENCODE_API_KEY"
+        }
+    }
+
+    /// Whether the reviewer tells us what it spent. Claude's CLI reports both tokens and a
+    /// dollar figure under `--output-format json`; Codex and opencode print the review and
+    /// nothing else, so there is no usage envelope to read. Written as an explicit answer per
+    /// reviewer rather than as a negation of the two that report nothing today, so a reviewer
+    /// added later has to state which it is.
+    var reportsTokenUsage: Bool {
+        switch self {
+        case .claude: true
+        case .codex: false
+        case .opencode: false
         }
     }
 }
@@ -494,6 +591,10 @@ struct ReviewerResult: Equatable {
     /// review would spend that timeout again on a CLI that is most likely still hung,
     /// so these are left to the next poll instead of retried in place.
     var timedOut = false
+    /// `nil` when the reviewer cannot report what it consumed. When a reviewer is retried
+    /// inside one review this holds every attempt's spend, not the last one's — a discarded
+    /// first attempt still billed the key.
+    var usage: TokenUsage?
 
     /// `nil` when the reviewer finished; otherwise whether a second call could help.
     var failureClass: ReviewerFailureClass? {

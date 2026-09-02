@@ -712,6 +712,241 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(events.contains { $0.kind == .failed })
     }
 
+    // MARK: - Token usage and cost
+
+    func testClaudeJSONEnvelopeYieldsTheReviewTextAndItsReportedCost() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeEmitsJSONEnvelope: true)
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+        // The envelope must be unwrapped: its `result` field is the review, and the JSON itself
+        // must never be posted.
+        XCTAssertTrue(postedBody.contains("Looks safe."))
+        XCTAssertFalse(postedBody.contains("total_cost_usd"))
+        XCTAssertTrue(postedBody.contains("Token usage and cost"))
+        XCTAssertTrue(postedBody.contains("$0.1234"))
+
+        let decision = events.last
+        XCTAssertEqual(decision?.usage?.costUSD, 0.1234)
+        // Cache writes are fresh input; only reads came from cache.
+        XCTAssertEqual(decision?.usage?.inputTokens, 1_500)
+        XCTAssertEqual(decision?.usage?.cachedInputTokens, 5_000)
+        XCTAssertEqual(decision?.usage?.outputTokens, 200)
+    }
+
+    /// A reviewer that returns no verdict is run again inside the same review, and for a metered
+    /// reviewer the discarded attempt was billed all the same. Keeping only the second attempt's
+    /// figure reports a retried review at roughly half what it cost.
+    func testARetriedMeteredReviewerReportsTheSpendOfEveryAttempt() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeEmitsJSONEnvelope: true,
+            claudeRunsWithoutVerdict: 1
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let claudeCount = await runner.claudeCount()
+        let postCount = await runner.postCount()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(claudeCount, 2, "A verdict-less attempt is retried inside the same review")
+        XCTAssertEqual(postCount, 1, "The second attempt carries the verdict, so the review posts")
+        let usage = try XCTUnwrap(events.last?.usage, "a metered reviewer must report what it spent")
+        XCTAssertEqual(usage.requests, 2, "Both attempts were paid for")
+        XCTAssertEqual(usage.inputTokens, 3_000)
+        XCTAssertEqual(usage.cachedInputTokens, 10_000)
+        XCTAssertEqual(usage.outputTokens, 400)
+        XCTAssertEqual(usage.costUSD ?? 0, 0.2468, accuracy: 0.000_001)
+        XCTAssertTrue(postedBody.contains("$0.2468"))
+    }
+
+    func testPlainTextClaudeOutputStillWorksWhenTheEnvelopeIsAbsent() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeEmitsJSONEnvelope: false)
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        // Metered, deliberately: `meteredUsage` filters on `authMode` *before* it looks at
+        // `usage`, so on the default session mode the nil-usage assertion below would hold
+        // whatever the parser did, and would go on holding it if the fallback broke.
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postCount = await runner.postCount()
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(postCount, 1, "a CLI that returns plain text must still review")
+        XCTAssertTrue(postedBody.contains("Looks safe."))
+        XCTAssertNil(events.last?.usage, "no envelope means no usage to report")
+        XCTAssertFalse(
+            postedBody.contains("Token usage and cost"),
+            "a metered reviewer that reported nothing must not get an empty cost table"
+        )
+    }
+
+    /// A provider bills a call that errored exactly like one that succeeded, and a failure — not
+    /// a missing verdict — is the commonest reason a reviewer is run again inside one review.
+    /// Dropping the failed attempt's spend under-reports the retried review by half, which is
+    /// precisely the case this feature exists to get right.
+    func testAFailedButBilledAttemptStillCountsTowardTheReportedSpend() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeEmitsJSONEnvelope: true,
+            claudeFailingRuns: 1
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let claudeCount = await runner.claudeCount()
+        let postCount = await runner.postCount()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(claudeCount, 2, "a transient failure is retried inside the same review")
+        XCTAssertEqual(postCount, 1, "the second attempt succeeded, so the review posts")
+        let usage = try XCTUnwrap(events.last?.usage, "a metered reviewer must report what it spent")
+        XCTAssertEqual(usage.requests, 2, "the failed call was billed too")
+        XCTAssertEqual(usage.inputTokens, 3_000)
+        XCTAssertEqual(usage.cachedInputTokens, 10_000)
+        XCTAssertEqual(usage.outputTokens, 400)
+        XCTAssertEqual(usage.costUSD ?? 0, 0.2468, accuracy: 0.000_001)
+        XCTAssertTrue(postedBody.contains("$0.2468"))
+    }
+
+    /// The same rule one level up: a review where every reviewer failed still burned tokens on
+    /// every attempt, and posts nothing, so the history entry is the only place that spend can
+    /// ever be recorded.
+    func testSpendIsRecordedEvenWhenNoReviewerReachedAVerdict() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeEmitsJSONEnvelope: true,
+            claudeFailingRuns: Int.max
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+        // The fixture enables Claude alone, so Claude failing is the whole panel failing.
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        XCTAssertEqual(postCount, 0, "nothing to post when no reviewer produced a verdict")
+        let failure = try XCTUnwrap(events.last)
+        XCTAssertEqual(failure.kind, .failed)
+        let usage = try XCTUnwrap(failure.usage, "the failed attempts were billed all the same")
+        XCTAssertEqual(usage.requests, 2)
+        XCTAssertEqual(usage.costUSD ?? 0, 0.2468, accuracy: 0.000_001)
+    }
+
+    func testSessionAuthReviewersAreLeftOutOfTheCostReport() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeEmitsJSONEnvelope: true)
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore()
+        )
+        let recorder = EventRecorder()
+
+        // Claude stays on its signed-in CLI, so its cost is a subscription, not this review's.
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+        XCTAssertFalse(postedBody.contains("Token usage and cost"))
+        XCTAssertNil(events.last?.usage)
+    }
+
+    func testUsageIsRecordedInHistoryEvenWhenItIsNotPosted() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeEmitsJSONEnvelope: true)
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+        configuration.includeUsageInReview = false
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+        XCTAssertFalse(
+            postedBody.contains("Token usage and cost"),
+            "the toggle controls the posted review only"
+        )
+        XCTAssertEqual(events.last?.usage?.costUSD, 0.1234, "tracking continues regardless")
+    }
+
     // MARK: - Merge preview
 
     /// The point of the preview is that the reviewer can *read* it. Asserting on the file's
@@ -1322,6 +1557,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let emptyTimeline: Bool
     private let conversationText: String
     private let claudeBody: String
+    private let claudeEmitsJSONEnvelope: Bool
+    private let claudeRunsWithoutVerdict: Int
+    private let claudeFailingRuns: Int
     private let baseCommitsAhead: Int
     private let trackedBaseOid: String?
     /// Shared with a credential store so a test can tell whether keys were resolved before or
@@ -1351,6 +1589,17 @@ private actor ReviewWorkflowMock: CommandRunning {
         emptyTimeline: Bool = false,
         conversationText: String = "PR conversation",
         claudeBody: String = "Looks safe.",
+        /// Wraps the review in the envelope `claude --output-format json` really returns, which
+        /// is where the CLI reports its tokens and its cost.
+        claudeEmitsJSONEnvelope: Bool = false,
+        /// How many of the leading `claude` review runs omit the trailing `VERDICT:` line. A
+        /// reviewer that finishes without a verdict is retried inside the same review, so this
+        /// is how the retry path is reached without a failure to muddy what is being measured.
+        claudeRunsWithoutVerdict: Int = 0,
+        /// How many of the leading `claude` review runs exit non-zero while still returning the
+        /// JSON envelope — the shape a call that was billed and then errored really has. The
+        /// failure text is unrecognisable, so it classifies as transient and is retried.
+        claudeFailingRuns: Int = 0,
         /// Commits the base branch has gained since the merge base. `0` — the default — means the
         /// pull request is current with its base, so `mergePreview` returns before issuing any
         /// further plumbing and every other test's command sequence is unchanged.
@@ -1374,6 +1623,9 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.emptyTimeline = emptyTimeline
         self.conversationText = conversationText
         self.claudeBody = claudeBody
+        self.claudeEmitsJSONEnvelope = claudeEmitsJSONEnvelope
+        self.claudeRunsWithoutVerdict = claudeRunsWithoutVerdict
+        self.claudeFailingRuns = claudeFailingRuns
         self.baseCommitsAhead = baseCommitsAhead
         self.trackedBaseOid = trackedBaseOid
     }
@@ -1528,7 +1780,39 @@ private actor ReviewWorkflowMock: CommandRunning {
                     encoding: .utf8
                 )
             }
-            return result(stdout: "## Summary\n\(claudeBody)\n\nVERDICT: \(claudeVerdict.rawValue)\n")
+            // The verdict line is what makes this a finished review, so omitting it is how a
+            // run that produced nothing usable — rather than one that failed — is simulated.
+            let trailer = claudeRuns <= claudeRunsWithoutVerdict
+                ? ""
+                : "\nVERDICT: \(claudeVerdict.rawValue)\n"
+            let review = "## Summary\n\(claudeBody)\n\(trailer)"
+            // A call that errored: the CLI exits non-zero and still reports what it consumed,
+            // because the provider billed it either way.
+            let failed = claudeRuns <= claudeFailingRuns
+            guard claudeEmitsJSONEnvelope else {
+                return failed
+                    ? result(exitCode: 1, stderr: "simulated claude failure")
+                    : result(stdout: review)
+            }
+            // The shape `claude --output-format json` really returns.
+            let envelope: [String: Any] = [
+                "type": "result",
+                "subtype": failed ? "error_during_execution" : "success",
+                "is_error": failed,
+                "result": failed ? "Simulated transient provider error." : review,
+                "total_cost_usd": 0.1234,
+                "usage": [
+                    "input_tokens": 1_000,
+                    "output_tokens": 200,
+                    "cache_read_input_tokens": 5_000,
+                    "cache_creation_input_tokens": 500,
+                ],
+            ]
+            let data = try JSONSerialization.data(withJSONObject: envelope)
+            return result(
+                exitCode: failed ? 1 : 0,
+                stdout: String(decoding: data, as: UTF8.self)
+            )
         }
         if executable == "codex" {
             codexRuns += 1

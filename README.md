@@ -13,6 +13,7 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
 - Run an immediate manual check even while monitoring is paused.
 - Independently enable Claude, Codex, and opencode and configure each model and effort level.
 - Choose per reviewer whether to use its signed-in CLI or an API key held in the macOS Keychain (Claude and Codex; opencode authenticates through its own configuration).
+- Track tokens and cost per review for the reviewers billed per token, and optionally publish that in the review.
 - Append a small developer-specific instruction prompt to every review.
 - Enforce repository-specific rules from `REVIEW.md`.
 - Run enabled reviewers independently in a read-only worktree.
@@ -86,6 +87,20 @@ Keys are stored in your login Keychain under "Review Bot reviewer API keys" and 
 Because the app is ad-hoc signed by default, macOS asks for your login password to read a saved key after a rebuild, and "Always Allow" does not stick — it authorizes the one build in front of it. Each Keychain item records the identity of the app that saved it, and with no signing identity that record is a hash of the binary, so every rebuild looks like a different application. Only a Developer ID fixes it (`CODE_SIGN_IDENTITY="Developer ID Application: …" make app`), because the item can then record your team identity, which rebuilds keep. A self-signed certificate is not enough — it was tested; the item still falls back to recording the binary hash.
 
 For development, a reviewer already set to **API key** can take its key from Review Bot's own environment instead of the Keychain: `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are read when set, taking precedence over a saved key — useful for `make run` or a one-off script without saving anything, and it skips the Keychain prompt entirely. It changes nothing about the default **Signed-in CLI** mode, which still unsets those variables, so exporting a key without also switching that reviewer to API key leaves it on its own login. This only helps when the app is started from a shell: launched from Finder or at login it inherits launchd's environment, so the packaged app reads the Keychain.
+
+### Token usage and cost
+
+Reviews are metered for the reviewers you pay per token. Every provider call a reviewer makes is counted — including the extra attempt when a reviewer is re-run inside the same review, and the reconciliation pass, which is a full extra call charged to whichever reviewer adjudicated — and the total is written to the activity history, so you can see what a particular pull request cost and total spend from `history.json`. **Reviewers → Usage and cost** controls whether the same figures are appended to the posted GitHub review; tracking happens either way.
+
+| Reviewer | Tokens | Cost |
+| --- | --- | --- |
+| Claude | Reported by the CLI | Reported by the CLI — no prices to configure |
+| Codex | Not reported | Not available |
+| opencode | Not reported | Not available |
+
+Claude's figures come from `claude --output-format json`, which Review Bot now passes on every run. Output that is not that envelope is read as the review itself, so a CLI that accepts the flag and prints plain text still reviews normally — but the flag is not optional and there is no fallback re-run, so a `claude` too old to accept it fails outright with the CLI's own error.
+
+A reviewer using its signed-in CLI is left out entirely: that cost is a flat subscription, so attributing dollars to one review would be misleading. That excludes opencode in every configuration, since it has no API-key mode. A cost that cannot be determined is shown as unknown rather than as `$0.00`.
 
 ## `REVIEW.md` policy
 
@@ -184,7 +199,7 @@ Use **History → Show data folder** to open this location.
 make test
 ```
 
-The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, and environment composition. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, API-key injection and session-mode key removal, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
+The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, environment composition, and token-usage arithmetic and formatting. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, API-key injection and session-mode key removal, usage reporting from Claude's JSON envelope and the plain-text fallback, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
 
 ## Roadmap
 
