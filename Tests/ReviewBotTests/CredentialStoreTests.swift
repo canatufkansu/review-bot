@@ -10,25 +10,25 @@ final class CredentialStoreTests: XCTestCase {
     func testEnvironmentOverrideSuppliesKeyWithoutKeychain() {
         let store = KeychainCredentialStore(
             service: unusedService,
-            environment: ["ANTHROPIC_API_KEY": "sk-from-environment"]
+            environment: ["DEEPSEEK_API_KEY": "sk-from-environment"]
         )
-        XCTAssertEqual(store.apiKey(for: .claude), "sk-from-environment")
+        XCTAssertEqual(store.apiKey(for: .deepseek), "sk-from-environment")
     }
 
     func testEnvironmentOverrideIsTrimmed() {
         let store = KeychainCredentialStore(
             service: unusedService,
-            environment: ["OPENAI_API_KEY": "  sk-padded\n"]
+            environment: ["DEEPSEEK_API_KEY": "  sk-padded\n"]
         )
-        XCTAssertEqual(store.apiKey(for: .codex), "sk-padded")
+        XCTAssertEqual(store.apiKey(for: .deepseek), "sk-padded")
     }
 
     func testBlankEnvironmentValueIsIgnored() {
         let store = KeychainCredentialStore(
             service: unusedService,
-            environment: ["ANTHROPIC_API_KEY": "   "]
+            environment: ["DEEPSEEK_API_KEY": "   "]
         )
-        XCTAssertNil(store.apiKey(for: .claude))
+        XCTAssertNil(store.apiKey(for: .deepseek))
     }
 
     func testOverrideAppliesOnlyToItsOwnReviewer() {
@@ -37,6 +37,7 @@ final class CredentialStoreTests: XCTestCase {
             environment: ["ANTHROPIC_API_KEY": "sk-anthropic"]
         )
         XCTAssertEqual(store.apiKey(for: .claude), "sk-anthropic")
+        XCTAssertNil(store.apiKey(for: .deepseek))
         XCTAssertNil(store.apiKey(for: .codex))
     }
 
@@ -44,13 +45,13 @@ final class CredentialStoreTests: XCTestCase {
         let store = KeychainCredentialStore(service: unusedService, environment: [:])
         // Nothing is stored under this service, so the Keychain path returns nil rather than
         // throwing or prompting.
-        XCTAssertNil(store.apiKey(for: .claude))
+        XCTAssertNil(store.apiKey(for: .deepseek))
     }
 
-    /// Every reviewer needs an inbound variable — this is the part of the "adding a reviewer"
-    /// checklist a new case is most likely to miss. The exact names are asserted in
-    /// `ConfigurationAndPromptTests`; what matters here is that no two reviewers can be
-    /// credentialed from the same variable and none is silently blank.
+    /// Every reviewer needs an inbound variable, including ones with no CLI — this is the part
+    /// of the "adding a reviewer" checklist a new case is most likely to miss. The exact names
+    /// are asserted in `ConfigurationAndPromptTests`; what matters here is that no two reviewers
+    /// can be credentialed from the same variable and none is silently blank.
     func testEveryReviewerHasADistinctOverrideVariable() {
         let variables = ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable)
         XCTAssertFalse(variables.contains { $0.isEmpty })
@@ -83,8 +84,8 @@ final class CredentialStoreTests: XCTestCase {
     }
 
     /// The outbound variable is handed to a CLI child; the inbound one is read by Review Bot.
-    /// Where both exist they must name the same variable, or a key saved in the app would be
-    /// read from one name and forwarded under another.
+    /// For the CLI reviewers they must name the same variable, or a key saved in the app would
+    /// be read from one name and forwarded under another.
     func testOutboundAndInboundVariablesAgreeForCLIReviewers() {
         for reviewer in ReviewerName.allCases {
             guard let outbound = reviewer.apiKeyEnvironmentVariable else { continue }
@@ -93,8 +94,8 @@ final class CredentialStoreTests: XCTestCase {
     }
 
     func testInMemoryStoreRemovesKeyWhenSetToBlank() throws {
-        let store = InMemoryCredentialStore(keys: [.claude: "sk-existing"])
-        try store.setAPIKey("   ", for: .claude)
-        XCTAssertNil(store.apiKey(for: .claude))
+        let store = InMemoryCredentialStore(keys: [.deepseek: "sk-existing"])
+        try store.setAPIKey("   ", for: .deepseek)
+        XCTAssertNil(store.apiKey(for: .deepseek))
     }
 }

@@ -45,8 +45,7 @@ struct TokenUsage: Codable, Equatable {
     /// Input tokens served from the provider's prompt cache; billed at a lower rate.
     var cachedInputTokens: Int
     var outputTokens: Int
-    /// Number of provider calls this usage covers. More than one when a reviewer was run
-    /// again inside the same review, or when the reconciliation pass is added in.
+    /// Number of provider calls. DeepSeek's agent loop makes many per review.
     var requests: Int
     /// `nil` when the provider does not report cost — a missing cost must never be shown
     /// as `$0.00`.
@@ -84,7 +83,7 @@ struct TokenUsage: Codable, Equatable {
     /// which is the figure that matters for pricing but not the one a reader expects to see.
     var totalInputTokens: Int { inputTokens + cachedInputTokens }
 
-    /// e.g. `24.1k in (11.0k cached) + 2.0k out over 2 calls`. The cached count is a subset of
+    /// e.g. `24.1k in (11.0k cached) + 2.0k out over 7 calls`. The cached count is a subset of
     /// the input count, matching how providers report it.
     var tokenSummary: String {
         var input = "\(Self.abbreviated(totalInputTokens)) in"
@@ -215,6 +214,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var claude: ReviewerConfiguration
     var codex: ReviewerConfiguration
     var opencode: ReviewerConfiguration
+    var deepseek: ReviewerConfiguration
     var customPrompt: String
     /// Whether the posted review reports what the API-key reviewers consumed.
     var includeUsageInReview: Bool
@@ -232,6 +232,14 @@ struct ReviewBotConfiguration: Codable, Equatable {
     /// them runs every enabled reviewer, so this bounds the fan-out of CLI processes
     /// (and the API traffic behind them); `1` restores the old one-at-a-time poll.
     var maxConcurrentReviews: Int
+
+    /// DeepSeek has no CLI to inherit a session from, so it is API-key-only and starts disabled.
+    static let defaultDeepSeek = ReviewerConfiguration(
+        enabled: false,
+        model: "deepseek-chat",
+        effort: .high,
+        authMode: .apiKey
+    )
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -256,6 +264,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
             effort: .max,
             authMode: .session
         ),
+        deepseek: defaultDeepSeek,
         customPrompt: "",
         includeUsageInReview: true,
         decisionPolicy: .default,
@@ -277,6 +286,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case claude
         case codex
         case opencode
+        case deepseek
         case customPrompt
         case includeUsageInReview
         case decisionPolicy
@@ -293,6 +303,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         claude: ReviewerConfiguration,
         codex: ReviewerConfiguration,
         opencode: ReviewerConfiguration,
+        deepseek: ReviewerConfiguration = ReviewBotConfiguration.defaultDeepSeek,
         customPrompt: String,
         includeUsageInReview: Bool = true,
         decisionPolicy: DecisionPolicy = .default,
@@ -307,6 +318,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.claude = claude
         self.codex = codex
         self.opencode = opencode
+        self.deepseek = deepseek
         self.customPrompt = customPrompt
         self.includeUsageInReview = includeUsageInReview
         self.decisionPolicy = decisionPolicy
@@ -339,6 +351,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
             ReviewerConfiguration.self,
             forKey: .opencode
         ) ?? ReviewBotConfiguration.default.opencode
+        deepseek = try values.decodeIfPresent(
+            ReviewerConfiguration.self,
+            forKey: .deepseek
+        ) ?? ReviewBotConfiguration.defaultDeepSeek
         if !ReviewEffort.claudeCases.contains(claude.effort) {
             claude.effort = .high
         }
@@ -358,8 +374,11 @@ struct ReviewBotConfiguration: Codable, Equatable {
         opencode.model = Self.model(opencode.model, or: Self.default.opencode.model)
         // opencode signs in through its own config directory and takes no key, so there is
         // nothing to hand it in API-key mode. Pinning the mode here keeps a hand-edited or
-        // migrated config from selecting one where Review Bot would inject nothing.
+        // migrated config from selecting one where Review Bot would inject nothing and still
+        // count the reviewer as metered.
         opencode.authMode = .session
+        // DeepSeek is reached over HTTP, so there is no CLI session to fall back on.
+        deepseek.authMode = .apiKey
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
         includeUsageInReview = try values.decodeIfPresent(
             Bool.self,
@@ -459,29 +478,37 @@ struct ReviewQueueItem: Equatable, Identifiable {
     }
 }
 
-enum ReviewerName: String, Codable, CaseIterable {
+/// Declaration order is load-bearing beyond this enum: `enabledReviewers` maps `allCases`,
+/// which fixes the order reviewers appear in the posted panel and the order
+/// `ReviewEngine.runReconciliation` prefers an adjudicator in (Claude, then Codex, then
+/// opencode). DeepSeek comes last deliberately, so the one reviewer that always bills a key
+/// never becomes the adjudicator while a session-backed CLI is available.
+enum ReviewerName: String, Codable, CaseIterable, Identifiable {
     case claude = "Claude"
     case codex = "Codex"
     case opencode = "opencode"
+    case deepseek = "DeepSeek"
 
-    /// The CLI this reviewer shells out to, or `nil` for a reviewer that is not backed by a
-    /// command at all.
+    var id: String { rawValue }
+
+    /// The CLI this reviewer shells out to, or `nil` when it is reached over HTTP.
     var commandName: String? {
         switch self {
         case .claude: "claude"
         case .codex: "codex"
         case .opencode: "opencode"
+        case .deepseek: nil
         }
     }
 
-    /// Only a CLI-backed reviewer can borrow a login that already exists on this machine.
+    /// Only CLI-backed reviewers can borrow an existing login session.
     var supportsSessionAuth: Bool { commandName != nil }
 
-    /// Whether a key of the developer's own can be pointed at this reviewer at all. That takes
-    /// a variable to deliver it through: opencode names none — it is credentialed through its
-    /// own config directory — so offering it an API-key mode would produce a reviewer Review Bot
-    /// cannot actually hand anything to.
-    var supportsAPIKeyAuth: Bool { apiKeyEnvironmentVariable != nil }
+    /// Whether a key of the developer's own can be pointed at this reviewer at all: either it
+    /// is a CLI that reads one from its environment, or it has no CLI and a key is the only way
+    /// to reach it. opencode is neither — it authenticates through its own config directory —
+    /// so offering it an API-key mode would produce a reviewer Review Bot cannot credential.
+    var supportsAPIKeyAuth: Bool { apiKeyEnvironmentVariable != nil || commandName == nil }
 
     /// The variable a CLI-backed reviewer reads its API key from, when the developer
     /// chooses key auth over the CLI's own session.
@@ -492,48 +519,84 @@ enum ReviewerName: String, Codable, CaseIterable {
         // opencode is credentialed through OPENCODE_CONFIG_DIR, not through an injected key,
         // so there is nothing to hand its child process.
         case .opencode: nil
+        case .deepseek: nil
         }
     }
 
     /// The variable Review Bot itself reads a key from, taking precedence over the Keychain.
     /// Unlike `apiKeyEnvironmentVariable` — which is outbound, handed to a CLI child process —
-    /// this is inbound, and every reviewer has one. It is how `make run`, a test, or a one-off
-    /// probe supplies a key without touching the developer's Keychain. Note that a GUI app
-    /// started from Finder or at login inherits launchd's environment, not a shell's, so this is
-    /// a development affordance: the packaged app still reads the Keychain. opencode's entry
-    /// exists only because the property is total; it is never consulted, since opencode is
-    /// pinned to session auth.
+    /// this is inbound, and every reviewer has one including DeepSeek, which has no CLI. It is
+    /// how `make run`, a test, or a one-off probe supplies a key without touching the
+    /// developer's Keychain. Note that a GUI app started from Finder or at login inherits
+    /// launchd's environment, not a shell's, so this is a development affordance: the packaged
+    /// app still reads the Keychain. opencode's entry exists only because the property is
+    /// total; it is never consulted, since opencode is pinned to session auth.
     var apiKeyOverrideEnvironmentVariable: String {
         switch self {
         case .claude: "ANTHROPIC_API_KEY"
         case .codex: "OPENAI_API_KEY"
         case .opencode: "OPENCODE_API_KEY"
+        case .deepseek: "DEEPSEEK_API_KEY"
         }
     }
 
+    /// DeepSeek is called through the chat-completions API, which has no effort control.
+    var usesEffortSetting: Bool { self != .deepseek }
+
     /// Whether the reviewer tells us what it spent. Claude's CLI reports both tokens and a
-    /// dollar figure under `--output-format json`; Codex and opencode print the review and
-    /// nothing else, so there is no usage envelope to read. Written as an explicit answer per
-    /// reviewer rather than as a negation of the two that report nothing today, so a reviewer
-    /// added later has to state which it is.
+    /// dollar figure under `--output-format json`; DeepSeek's API reports tokens, though never a
+    /// price; Codex and opencode print the review and nothing else, so there is no usage envelope
+    /// to read.
     var reportsTokenUsage: Bool {
         switch self {
         case .claude: true
         case .codex: false
         case .opencode: false
+        case .deepseek: true
+        }
+    }
+
+    var efforts: [ReviewEffort] {
+        switch self {
+        case .claude: ReviewEffort.claudeCases
+        case .codex: ReviewEffort.codexCases
+        case .opencode: ReviewEffort.opencodeCases
+        case .deepseek: []
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .claude: "brain.head.profile"
+        case .codex: "terminal.fill"
+        case .opencode: "chevron.left.forwardslash.chevron.right"
+        case .deepseek: "cloud.fill"
         }
     }
 }
 
+/// A reviewer paired with its settings, so the engine can treat all reviewers uniformly.
+struct ConfiguredReviewer {
+    let name: ReviewerName
+    let configuration: ReviewerConfiguration
+}
+
 extension ReviewBotConfiguration {
-    /// The stored settings for one reviewer. A total switch, so credential code can ask about a
-    /// reviewer it was handed rather than every caller repeating the mapping.
     func settings(for reviewer: ReviewerName) -> ReviewerConfiguration {
         switch reviewer {
         case .claude: claude
         case .codex: codex
         case .opencode: opencode
+        case .deepseek: deepseek
         }
+    }
+
+    /// Enabled reviewers in a stable order, so posted reviews and history read the same way
+    /// on every run.
+    var enabledReviewers: [ConfiguredReviewer] {
+        ReviewerName.allCases
+            .map { ConfiguredReviewer(name: $0, configuration: settings(for: $0)) }
+            .filter(\.configuration.enabled)
     }
 }
 
@@ -584,6 +647,12 @@ enum ReviewerFailureClass: Equatable {
             "please run `codex login`",
             "please run `claude login`",
             "credit balance is too low",
+            // DeepSeek answers a bad key with "Authentication Fails" and an empty account
+            // with "Insufficient Balance"; both arrive wrapped in `DeepSeek returned HTTP …`.
+            "authentication fails",
+            "insufficient balance",
+            "deepseek returned http 401",
+            "deepseek returned http 402",
             // Review Bot's own message for a reviewer set to API-key auth whose key is absent
             // or whose Keychain prompt was denied. Only Settings can fix that, so retrying
             // would spend the failure budget on a request that cannot start.
