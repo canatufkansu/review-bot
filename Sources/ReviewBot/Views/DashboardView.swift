@@ -305,6 +305,21 @@ private struct ReviewersSettingsView: View {
                     )
                 )
 
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle(
+                            "Include token usage and cost in the posted review",
+                            isOn: $settings.configuration.includeUsageInReview
+                        )
+                        Text("Usage is always recorded in the activity history, whether or not it is posted. Only reviewers billed per token appear — a reviewer using its signed-in CLI is covered by that subscription, so no dollar figure is attributed to it.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                } label: {
+                    Label("Usage and cost", systemImage: "chart.bar.doc.horizontal")
+                }
+
                 ToolStatusRow(
                     name: "GitHub CLI",
                     command: "gh",
@@ -481,6 +496,24 @@ private struct ReviewerCard: View {
                     if configuration.authMode == .apiKey {
                         APIKeyRow(model: model, reviewer: reviewer)
                             .disabled(!configuration.enabled)
+
+                        // A key-mode reviewer is metered, so say up front whether this review
+                        // will actually be able to report what it cost.
+                        if reviewer.reportsTokenUsage {
+                            Label(
+                                "The \(command) CLI reports its own tokens and cost, so this reviewer's spend appears in the usage report.",
+                                systemImage: "checkmark.seal"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        } else {
+                            Label(
+                                "This CLI does not report token usage, so its cost cannot be tracked.",
+                                systemImage: "questionmark.circle"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
                     }
                 } else {
                     // No picker to explain itself, so say where the credentials come from.
@@ -804,6 +837,12 @@ private struct HistoryRow: View {
                 Text(entry.date, format: .dateTime.month(.abbreviated).day().hour().minute())
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let usage = entry.usage {
+                    Text(usage.costSummary ?? "\(TokenUsage.abbreviated(usage.totalTokens)) tok")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .help("\(usage.tokenSummary) — metered reviewers only")
+                }
                 if let value = entry.pullRequestURL, let url = URL(string: value) {
                     Link("Open PR", destination: url)
                         .font(.caption)
