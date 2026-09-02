@@ -1105,6 +1105,421 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postArgument, "--approve")
     }
 
+    // MARK: - DeepSeek, per-reviewer credentials, and usage
+
+    func testDeepSeekReviewsOverHTTPAndPostsThroughTheSameWorkflow() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([
+            .message("## Summary\nDeepSeek found nothing.\n\nVERDICT: CLEAN\n"),
+        ])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.deepseek.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let postedBody = await runner.lastPostedBody()
+        let claudeCount = await runner.claudeCount()
+        let opencodeCount = await runner.opencodeCount()
+        XCTAssertEqual(postCount, 1)
+        XCTAssertEqual(claudeCount, 0, "No CLI reviewer is enabled")
+        // The fan-out runs `enabledReviewers`, not a fixed roster: a reviewer left switched off
+        // must not be spawned, least of all one whose configuration says it is disabled.
+        XCTAssertEqual(opencodeCount, 0, "No CLI reviewer is enabled")
+        XCTAssertEqual(events.last?.kind, .approved)
+        XCTAssertTrue(postedBody.contains("DeepSeek"))
+        XCTAssertTrue(postedBody.contains("DeepSeek found nothing."))
+        // DeepSeek always runs on a key, so what it spent is this review's cost rather than a
+        // subscription, and it belongs in the report however small the figure is.
+        XCTAssertTrue(postedBody.contains("Token usage and cost"))
+        XCTAssertTrue(postedBody.contains("`deepseek-test`"))
+        XCTAssertNotNil(events.last?.usage)
+    }
+
+    func testDeepSeekWithoutASavedKeyFailsAndPostsNothing() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(),
+            chatClient: chatClient
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.deepseek.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let requests = await chatClient.recordedRequests()
+        XCTAssertEqual(postCount, 0)
+        XCTAssertEqual(requests.count, 0, "A reviewer that cannot be credentialed must not be billed")
+        XCTAssertTrue(events.contains { $0.kind == .failed })
+        XCTAssertTrue(
+            events.contains { $0.message.contains("could not be read") },
+            "The failure should say what is missing"
+        )
+        // Nothing ran, so nothing was spent. Recorded explicitly so a later `emit(…, usage:)`
+        // refactor cannot start attributing a cost to a review that never happened.
+        XCTAssertNil(events.last?.usage)
+        // No reviewer reached a verdict, so this is a review-level failure and the request is
+        // counted towards the failure budget like any other. The terminal classification of a
+        // credential error governs the *in-review* retry, not this counter — see
+        // `testAMissingDeepSeekKeyShrinksThePanelWithoutSpendingTheRetryBudget` for the case
+        // where the panel survives and the count is cleared instead.
+        XCTAssertNotNil(
+            ReviewAttemptStore(paths: fixture.paths)
+                .attempt(for: "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z")
+        )
+    }
+
+    /// DeepSeek is the reviewer most likely to be misconfigured — the only one with no CLI
+    /// session to fall back on — and under the partial-panel rule its failure no longer
+    /// suppresses the review. Both halves of that have to hold: the author must be able to see
+    /// the panel was short, and a request whose review posted must not be left counting
+    /// failures towards the budget on account of a reviewer that never started.
+    func testAMissingDeepSeekKeyShrinksThePanelWithoutSpendingTheRetryBudget() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(),
+            chatClient: chatClient
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.deepseek.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        let requests = await chatClient.recordedRequests()
+        XCTAssertEqual(postCount, 1, "Claude finished, so its review posts without DeepSeek")
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+        XCTAssertEqual(requests.count, 0)
+        XCTAssertTrue(postedBody.contains("Partial panel"))
+        XCTAssertTrue(postedBody.contains("**DeepSeek**"))
+        XCTAssertTrue(postedBody.contains("could not be read"))
+        // A reviewer that never ran has nothing to report, and Claude is on its own session, so
+        // there is no metered spend at all — the report must not appear with an empty table.
+        XCTAssertFalse(postedBody.contains("Token usage and cost"))
+        // The review posted, so the request is cleared rather than accumulating failures: an
+        // unusable key must not walk an otherwise healthy request into being abandoned.
+        XCTAssertNil(
+            ReviewAttemptStore(paths: fixture.paths)
+                .attempt(for: "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z")
+        )
+    }
+
+    /// A reviewer that fails is run once more inside the same review, and for DeepSeek that
+    /// second run is a whole agent loop billed to the same key. A rejected credential answers
+    /// identically however many times it is asked, so the classifier has to recognise the
+    /// provider's own wording — and the proof is that the second scripted reply, which would
+    /// have produced a clean review, is never reached.
+    func testARejectedDeepSeekKeyIsNotRetriedInsideTheSameReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([
+            .failure(ChatCompletionError.http(status: 401, message: "Authentication Fails")),
+            .message("## Summary\nA second loop would have found nothing.\n\nVERDICT: CLEAN\n"),
+        ])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-rejected"]),
+            chatClient: chatClient
+        )
+        var configuration = fixture.configuration
+        configuration.deepseek.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let requests = await chatClient.recordedRequests()
+        let postCount = await runner.postCount()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(requests.count, 1, "A second call against a rejected key fails identically")
+        XCTAssertEqual(postCount, 1, "Claude finished, so the panel still posts")
+        XCTAssertTrue(postedBody.contains("Partial panel"))
+        XCTAssertTrue(postedBody.contains("HTTP 401"))
+        XCTAssertFalse(
+            postedBody.contains("A second loop would have found nothing."),
+            "the retry must not have happened, or this reply would be the review"
+        )
+    }
+
+    /// The mirror image, and the reason the classifier is conservative: a 5xx is exactly the
+    /// kind of failure a second call fixes, so DeepSeek must still get its retry rather than
+    /// dropping out of the panel over one bad response.
+    func testATransientDeepSeekFailureIsRetriedInsideTheSameReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([
+            .failure(ChatCompletionError.http(status: 503, message: "service unavailable")),
+            .message("## Summary\nThe second loop found nothing.\n\nVERDICT: CLEAN\n"),
+        ])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        var configuration = fixture.configuration
+        configuration.deepseek.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let requests = await chatClient.recordedRequests()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(requests.count, 2, "An unrecognised failure is still worth one more try")
+        XCTAssertTrue(postedBody.contains("The second loop found nothing."))
+        XCTAssertFalse(postedBody.contains("Partial panel"), "the retry restored the full panel")
+    }
+
+    /// A timeout is the one failure the in-review retry must not answer with a second attempt,
+    /// and DeepSeek is where that costs the most: a retried agent loop is a whole second review's
+    /// worth of paid rounds. The flag is what enforces it — `ReviewerFailureClass.classify` reads
+    /// a timeout's *wording* as transient, so `isWorthRetrying` says yes without it (see
+    /// `VerdictTests.testADeepSeekTimeoutIsExemptedByTheFlagRatherThanByItsWording`). Asserted
+    /// here rather than in a unit test because the flag has to survive two conversions —
+    /// `DeepSeekClient` turns a URLSession timeout into `ChatCompletionError.timedOut`, and
+    /// `DeepSeekReviewer` wraps that again once a round has been billed — and only the engine
+    /// sees the end of that chain.
+    func testADeepSeekTimeoutIsNotRetriedInsideTheSameReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient(
+            [
+                .toolCall(id: "call_1", name: "list_files", arguments: #"{"path":"."}"#),
+                .failure(ChatCompletionError.timedOut(seconds: 180)),
+                .message("## Summary\nA second loop would have found nothing.\n\nVERDICT: CLEAN\n"),
+            ],
+            usagePerReply: TokenUsage(inputTokens: 1_000, outputTokens: 100, requests: 1)
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.deepseek.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let requests = await chatClient.recordedRequests()
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(
+            requests.count,
+            2,
+            "the timed-out loop must not be answered with a second full agent loop"
+        )
+        XCTAssertFalse(
+            postedBody.contains("A second loop would have found nothing."),
+            "the retry must not have happened, or this reply would be the review"
+        )
+        XCTAssertTrue(postedBody.contains("Partial panel"))
+        // The round that completed before the timeout was billed all the same.
+        let usage = try XCTUnwrap(events.last?.usage, "an abandoned loop still spent what it spent")
+        XCTAssertEqual(usage.requests, 1)
+        XCTAssertEqual(usage.inputTokens, 1_000)
+    }
+
+    /// A DeepSeek loop can read for a dozen paid rounds and fail on the last call, and a thrown
+    /// error carries no usage of its own — so without `PartialSpendFailure` being unwrapped here
+    /// the review would be recorded as free, and the retry below would then spend it all again on
+    /// top of a total that never showed the first attempt.
+    func testADeepSeekFailureAfterPaidRoundsStillCountsTowardTheReportedSpend() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient(
+            [
+                .toolCall(id: "call_1", name: "list_files", arguments: #"{"path":"."}"#),
+                .failure(ChatCompletionError.http(status: 503, message: "service unavailable")),
+                .message("## Summary\nThe second loop found nothing.\n\nVERDICT: CLEAN\n"),
+            ],
+            usagePerReply: TokenUsage(inputTokens: 1_000, outputTokens: 100, requests: 1)
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.deepseek.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+        XCTAssertTrue(postedBody.contains("The second loop found nothing."), "the retry ran")
+        let usage = try XCTUnwrap(events.last?.usage)
+        XCTAssertEqual(
+            usage.requests,
+            2,
+            "the abandoned attempt's paid round plus the one the successful attempt spent"
+        )
+        XCTAssertEqual(usage.inputTokens, 2_000)
+        XCTAssertEqual(usage.outputTokens, 200)
+        XCTAssertNil(usage.costUSD, "DeepSeek's API reports tokens and no price")
+        XCTAssertTrue(postedBody.contains("| DeepSeek | `deepseek-test` |"))
+        XCTAssertTrue(postedBody.contains("not reported"))
+    }
+
+    /// The merge preview reaches a CLI reviewer as a file in the worktree, which is what the
+    /// tests above capture from `claude`'s working directory. DeepSeek never touches
+    /// `CommandRunning`, and on the tools-unsupported path it has no way to open a file at all —
+    /// so for it the preview either arrives inlined in the opening message or not at all, and
+    /// the contract's merge exception rests on evidence it cannot reach.
+    func testDeepSeekSeesTheMergePreviewWhenTheBaseHasMoved() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2)
+        let chatClient = StubChatClient([
+            .message("## Summary\nNothing to flag.\n\nVERDICT: CLEAN\n"),
+        ])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.deepseek.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        // Bound before asserting: XCTUnwrap takes an @autoclosure, which cannot carry an `await`.
+        let requests = await chatClient.recordedRequests()
+        let opening = try XCTUnwrap(
+            requests.first?.messages.last?.content,
+            "the opening user message is the evidence a tool-less attempt starts and ends with"
+        )
+        XCTAssertTrue(opening.contains("--- BEGIN .review-bot-diff.patch ---"))
+        XCTAssertTrue(opening.contains("--- BEGIN .review-bot-merge.md ---"))
+        XCTAssertTrue(opening.contains("`main` has moved 2 commits ahead"))
+    }
+
+    /// `enabledReviewers` maps `ReviewerName.allCases`, so the enum's declaration order is what
+    /// fixes the order the panel reads in — the task group yields in completion order and the
+    /// results are re-sorted afterwards. DeepSeek is last on purpose: the same order decides
+    /// which reviewer `runReconciliation` reaches for, and the one that always bills a key
+    /// should never be the first candidate.
+    func testAllFourReviewersRunAndAreListedInDeclarationOrder() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .clean,
+            opencodeVerdict: .clean
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: StubChatClient([
+                .message("## Summary\nDeepSeek found nothing.\n\nVERDICT: CLEAN\n"),
+            ])
+        )
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.opencode.enabled = true
+        configuration.deepseek.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let claudeCount = await runner.claudeCount()
+        let codexCount = await runner.codexCount()
+        let opencodeCount = await runner.opencodeCount()
+        let reconciliationCount = await runner.reconciliationCount()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(claudeCount, 1)
+        XCTAssertEqual(codexCount, 1)
+        XCTAssertEqual(opencodeCount, 1)
+        XCTAssertEqual(reconciliationCount, 0, "A unanimous panel has nothing to reconcile")
+        XCTAssertTrue(
+            postedBody.contains("Claude: `CLEAN`, Codex: `CLEAN`, opencode: `CLEAN`, DeepSeek: `CLEAN`"),
+            "the panel reads in ReviewerName order, whatever order the reviewers finished in"
+        )
+    }
+
+    /// DeepSeek writes its thinking and its answer into the same `content` field, and
+    /// `trimmedToContract` deliberately keeps a loose preamble rather than risk discarding a
+    /// whole review — so narration describing a merge blocker under a permissive verdict is the
+    /// shape it produces most readily. The approval gate has to cover it exactly as it covers a
+    /// CLI reviewer's prose.
+    func testDeepSeekProseContradictingItsVerdictDowngradesApproval() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: StubChatClient([
+                .message("## Summary\nThe migration cannot be merged as-is.\n\nVERDICT: CLEAN\n"),
+            ])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.deepseek.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(events.last?.kind, .commented)
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertTrue(postedBody.contains("contradicts its verdict"))
+    }
+
     func testReviewRoundCapSkipsPullRequestOnceLimitReached() async throws {
         let fixture = try FeatureFixture()
         // Two prior review rounds already recorded for PR #42.
@@ -1445,6 +1860,15 @@ private struct FeatureFixture {
             claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
             codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
             opencode: ReviewerConfiguration(enabled: false, model: "opencode-test", effort: .max),
+            // Spelled out rather than left to the initialiser's default, so the usage table a
+            // DeepSeek test asserts on carries the fixture's model instead of whatever the
+            // production default happens to be that week.
+            deepseek: ReviewerConfiguration(
+                enabled: false,
+                model: "deepseek-test",
+                effort: .high,
+                authMode: .apiKey
+            ),
             customPrompt: "Check public API compatibility."
         )
     }
