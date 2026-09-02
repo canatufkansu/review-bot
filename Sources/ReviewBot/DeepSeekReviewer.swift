@@ -31,23 +31,58 @@ struct DeepSeekReviewer {
     /// keeps the two from drifting back into a tie.
     static let defaultReviewSeconds: TimeInterval = 900
 
+    /// A running spend: the tokens billed so far, and whether the provider actually reported
+    /// them for every round.
+    ///
+    /// The second half is what keeps cost honest. DeepSeek reports tokens and never a price, so
+    /// cost here is token counts multiplied by configured rates — and a round the key was billed
+    /// for but that came back with no `usage` object contributes nothing to those counts. Priced
+    /// anyway, it would render as `$0.0000`, i.e. an unmeasured review would read as a free one,
+    /// which is the single outcome cost reporting exists to prevent. So one unreported round
+    /// makes the whole review's cost unknown rather than quietly understated.
+    struct Spend {
+        private(set) var usage = TokenUsage()
+        private(set) var measured = true
+
+        /// `reported` is the response's own `usage`, or `nil` when it carried none — that round
+        /// is still counted as a billed call, but its tokens are unknown.
+        mutating func record(_ reported: TokenUsage?) {
+            usage = usage + (reported ?? TokenUsage(requests: 1))
+            if reported == nil { measured = false }
+        }
+
+        /// The accumulated usage with cost applied, or with `costUSD` left `nil` when no rates
+        /// are configured or a round went unreported.
+        func priced(with pricing: TokenPricing?) -> TokenUsage {
+            var usage = usage
+            usage.costUSD = measured ? pricing?.cost(for: usage) : nil
+            return usage
+        }
+    }
+
     /// What a review has been billed so far, updated as the loop goes.
     ///
     /// A thrown failure carries its spend out in `PartialSpendFailure`, but a loop the caller
     /// *cancels* never returns anything at all — and by then it may have spent a dozen paid
     /// rounds. This is how those rounds are still counted: the caller holds the meter, so it can
-    /// read the running figure whatever became of the task.
+    /// read the running figure whatever became of the task. It holds the rates too, so the
+    /// figure it hands back is priced exactly like one the loop returned itself.
     actor SpendMeter {
-        private var usage = TokenUsage()
+        private let pricing: TokenPricing?
+        private var spend = Spend()
 
-        func record(_ spent: TokenUsage) {
-            usage = usage + spent
+        init(pricing: TokenPricing? = nil) {
+            self.pricing = pricing
+        }
+
+        func record(_ reported: TokenUsage?) {
+            spend.record(reported)
         }
 
         /// `nil` when nothing has been billed, so a caller can hand it straight to a result whose
         /// `usage` means "this cost something".
         func total() -> TokenUsage? {
-            usage.requests > 0 ? usage : nil
+            spend.usage.requests > 0 ? spend.priced(with: pricing) : nil
         }
     }
 
@@ -68,7 +103,7 @@ struct DeepSeekReviewer {
     /// know about it is no worse off than before.
     struct PartialSpendFailure: LocalizedError {
         let underlying: Error
-        /// Counted exactly as a completed review's usage is.
+        /// Priced with the same rates a successful review would have used.
         let usage: TokenUsage
 
         var errorDescription: String? { underlying.localizedDescription }
@@ -84,17 +119,20 @@ struct DeepSeekReviewer {
 
     private let client: any ChatCompleting
     private let model: String
+    private let pricing: TokenPricing?
     private let toolRounds: Int
     private let reviewSeconds: TimeInterval
 
     init(
         client: any ChatCompleting,
         model: String,
+        pricing: TokenPricing? = nil,
         toolRounds: Int = Limits.toolRounds,
         reviewSeconds: TimeInterval = Self.defaultReviewSeconds
     ) {
         self.client = client
         self.model = model
+        self.pricing = pricing
         self.toolRounds = max(1, toolRounds)
         self.reviewSeconds = max(0, reviewSeconds)
     }
@@ -153,7 +191,7 @@ struct DeepSeekReviewer {
     ) async throws -> Generated {
         let worktreeTools = WorktreeTools(root: worktree)
         var messages = messages
-        var usage = TokenUsage()
+        var spend = Spend()
 
         for round in 0..<toolRounds {
             // Out of time: stop investigating and ask for the review, the same exit the round cap
@@ -163,7 +201,7 @@ struct DeepSeekReviewer {
             if round > 0, Date() >= deadline {
                 return try await requestFinalReview(
                     after: messages,
-                    accumulated: usage,
+                    accumulated: spend,
                     apiKey: apiKey,
                     meter: meter
                 )
@@ -176,11 +214,10 @@ struct DeepSeekReviewer {
                     apiKey: apiKey
                 )
             } catch {
-                throw failure(error, spent: usage)
+                throw failure(error, spent: spend)
             }
-            let spent = completion.usage ?? TokenUsage(requests: 1)
-            usage = usage + spent
-            await meter?.record(spent)
+            spend.record(completion.usage)
+            await meter?.record(completion.usage)
             let reply = completion.message
             messages.append(reply)
 
@@ -206,19 +243,19 @@ struct DeepSeekReviewer {
                 // paused to think. Only accept this turn as the review when it actually is one.
                 let candidate = Self.trimmedToContract(content)
                 if Self.followsContract(candidate) {
-                    return Generated(text: candidate, usage: usage)
+                    return Generated(text: candidate, usage: spend.priced(with: pricing))
                 }
             }
 
             return try await requestFinalReview(
                 after: messages,
-                accumulated: usage,
+                accumulated: spend,
                 apiKey: apiKey,
                 meter: meter
             )
         }
 
-        throw failure(ChatCompletionError.emptyResponse, spent: usage)
+        throw failure(ChatCompletionError.emptyResponse, spent: spend)
     }
 
     /// Attaches what the key has already been billed to a failure, so the engine can report a
@@ -228,20 +265,20 @@ struct DeepSeekReviewer {
     /// for a review, and `review(_:)` matches on that case to retry without them — a wrapper
     /// would silently defeat the fallback. And a failure that already carries a spend keeps the
     /// deeper, larger figure rather than being re-wrapped around a partial one.
-    private func failure(_ error: Error, spent usage: TokenUsage) -> Error {
+    private func failure(_ error: Error, spent: Spend) -> Error {
         if let chatError = error as? ChatCompletionError, case .toolsUnsupported = chatError {
             return error
         }
         if error is PartialSpendFailure { return error }
-        guard usage.requests > 0 else { return error }
-        return PartialSpendFailure(underlying: error, usage: usage)
+        guard spent.usage.requests > 0 else { return error }
+        return PartialSpendFailure(underlying: error, usage: spent.priced(with: pricing))
     }
 
     /// Asks explicitly for the review, with the structure restated and no tools offered, and uses
     /// that reply — discarding whatever narration preceded it.
     private func requestFinalReview(
         after messages: [ChatMessage],
-        accumulated: TokenUsage,
+        accumulated: Spend,
         apiKey: String,
         meter: SpendMeter? = nil
     ) async throws -> Generated {
@@ -257,15 +294,15 @@ struct DeepSeekReviewer {
         } catch {
             throw failure(error, spent: accumulated)
         }
-        let spent = completion.usage ?? TokenUsage(requests: 1)
-        await meter?.record(spent)
-        let usage = accumulated + spent
+        var spend = accumulated
+        spend.record(completion.usage)
+        await meter?.record(completion.usage)
         guard let content = completion.message.content, !content.isEmpty else {
             // Every round before this one was still billed, and this is the likeliest place a
             // long, expensive loop ends with nothing to post.
-            throw failure(ChatCompletionError.emptyResponse, spent: usage)
+            throw failure(ChatCompletionError.emptyResponse, spent: spend)
         }
-        return Generated(text: Self.trimmedToContract(content), usage: usage)
+        return Generated(text: Self.trimmedToContract(content), usage: spend.priced(with: pricing))
     }
 
     /// The contract's first heading, in the typographic variants models actually emit: `## Summary`,

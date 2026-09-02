@@ -269,9 +269,9 @@ struct ChatCompletionResponse: Decodable {
         let message: ChatMessage
     }
 
-    /// DeepSeek reports tokens but never a price, so a review's cost stays unknown while its
-    /// token counts do not. `prompt_tokens` *includes* the cached hits, so the uncached figure
-    /// is the difference — counting both would report the same tokens twice.
+    /// DeepSeek reports tokens but never a price, so cost is applied downstream from the
+    /// configured rates. `prompt_tokens` *includes* the cached hits, so the uncached figure is
+    /// the difference — counting both would bill the same tokens twice.
     struct Usage: Decodable {
         let promptTokens: Int?
         let completionTokens: Int?

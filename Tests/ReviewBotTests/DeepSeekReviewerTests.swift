@@ -267,7 +267,11 @@ final class DeepSeekReviewerTests: XCTestCase {
             ],
             usagePerReply: TokenUsage(inputTokens: 1_000, outputTokens: 100, requests: 1)
         )
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = DeepSeekReviewer(
+            client: client,
+            model: "deepseek-chat",
+            pricing: TokenPricing.deepSeekDefault
+        )
 
         do {
             _ = try await reviewer.review(
@@ -286,6 +290,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             let spent = try XCTUnwrap(outcome.usage, "the paid round must survive the failure")
             XCTAssertEqual(spent.requests, 1)
             XCTAssertEqual(spent.inputTokens, 1_000)
+            XCTAssertNotNil(spent.costUSD, "partial spend is priced like a completed review")
         }
     }
 
@@ -449,12 +454,26 @@ final class DeepSeekReviewerTests: XCTestCase {
         XCTAssertEqual(usage.totalTokens, 300)
     }
 
-    func testCostIsUnknownRatherThanZeroBecauseTheAPIReportsNoPrice() async throws {
+    func testCostIsComputedFromConfiguredPricing() async throws {
         let client = StubChatClient(
             [.message(finalReview)],
-            usagePerReply: TokenUsage(inputTokens: 500, outputTokens: 50, requests: 1)
+            usagePerReply: TokenUsage(
+                inputTokens: 1_000_000,
+                cachedInputTokens: 1_000_000,
+                outputTokens: 1_000_000,
+                requests: 1
+            )
         )
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let pricing = TokenPricing(
+            inputPerMillion: 1,
+            cachedInputPerMillion: 0.25,
+            outputPerMillion: 4
+        )
+        let reviewer = DeepSeekReviewer(
+            client: client,
+            model: "deepseek-chat",
+            pricing: pricing
+        )
 
         let usage = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -462,11 +481,52 @@ final class DeepSeekReviewerTests: XCTestCase {
             apiKey: "sk-test"
         ).usage
 
-        // DeepSeek's responses carry token counts and nothing else, and reporting "$0.00" for
-        // a review that was billed would understate real spend.
+        XCTAssertEqual(usage.costUSD ?? 0, 5.25, accuracy: 0.0001)
+        XCTAssertEqual(usage.costSummary, "$5.25")
+    }
+
+    func testCostIsUnknownRatherThanZeroWhenNoPriceIsConfigured() async throws {
+        let client = StubChatClient(
+            [.message(finalReview)],
+            usagePerReply: TokenUsage(inputTokens: 500, outputTokens: 50, requests: 1)
+        )
+        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat", pricing: nil)
+
+        let usage = try await reviewer.review(
+            prompt: "REVIEW CONTRACT",
+            worktree: worktree,
+            apiKey: "sk-test"
+        ).usage
+
+        // Reporting "$0.00" for an unpriced model would understate real spend.
         XCTAssertNil(usage.costUSD)
         XCTAssertNil(usage.costSummary)
         XCTAssertEqual(usage.totalTokens, 550)
+    }
+
+    func testZeroPricingReportsTokensWithoutACost() async throws {
+        let client = StubChatClient(
+            [.message(finalReview)],
+            usagePerReply: TokenUsage(inputTokens: 500, outputTokens: 50, requests: 1)
+        )
+        let reviewer = DeepSeekReviewer(
+            client: client,
+            model: "deepseek-chat",
+            pricing: TokenPricing(
+                inputPerMillion: 0,
+                cachedInputPerMillion: 0,
+                outputPerMillion: 0
+            )
+        )
+
+        let usage = try await reviewer.review(
+            prompt: "REVIEW CONTRACT",
+            worktree: worktree,
+            apiKey: "sk-test"
+        ).usage
+
+        XCTAssertNil(usage.costUSD)
+        XCTAssertEqual(usage.inputTokens, 500)
     }
 
     func testUsageStillCountsCallsWhenTheProviderReportsNone() async throws {
@@ -481,6 +541,125 @@ final class DeepSeekReviewerTests: XCTestCase {
 
         XCTAssertEqual(usage.requests, 1)
         XCTAssertEqual(usage.totalTokens, 0)
+    }
+
+    /// Pricing multiplies token counts, so a billed round that reported no tokens contributes
+    /// nothing and prices out at exactly zero. Rendered, that is `$0.0000` — an unknown cost
+    /// reading as a free review, which is the one outcome cost reporting exists to prevent.
+    func testCostIsUnknownRatherThanZeroWhenTheProviderReportsNoTokens() async throws {
+        let client = StubChatClient([.message(finalReview)], usagePerReply: nil)
+        let reviewer = DeepSeekReviewer(
+            client: client,
+            model: "deepseek-chat",
+            pricing: .deepSeekDefault
+        )
+
+        let usage = try await reviewer.review(
+            prompt: "REVIEW CONTRACT",
+            worktree: worktree,
+            apiKey: "sk-test"
+        ).usage
+
+        XCTAssertEqual(usage.requests, 1, "the call was still billed")
+        XCTAssertNil(usage.costUSD, "rates times unknown tokens is unknown, not zero")
+        XCTAssertNil(usage.costSummary)
+    }
+
+    /// The same defect in its quieter form: one silent round among several would understate the
+    /// total rather than obviously zero it, which is worse because the figure still looks real.
+    func testCostIsUnknownWhenOnlySomeRoundsReportTokens() async throws {
+        let client = StubChatClient(
+            [
+                .toolCall(id: "c1", name: "read_file", arguments: #"{"path": "Widget.swift"}"#),
+                .message(finalReview),
+            ],
+            usagePerReply: [
+                TokenUsage(inputTokens: 1_000, outputTokens: 100, requests: 1),
+                nil,
+            ]
+        )
+        let reviewer = DeepSeekReviewer(
+            client: client,
+            model: "deepseek-chat",
+            pricing: .deepSeekDefault
+        )
+
+        let usage = try await reviewer.review(
+            prompt: "REVIEW CONTRACT",
+            worktree: worktree,
+            apiKey: "sk-test"
+        ).usage
+
+        XCTAssertEqual(usage.requests, 2)
+        XCTAssertEqual(usage.inputTokens, 1_000, "what was reported is still counted")
+        XCTAssertNil(usage.costUSD, "a partial measurement must not be priced as the whole")
+    }
+
+    /// The meter is the only figure a cancelled loop leaves behind, so it has to be priced the
+    /// same way a returned review is — otherwise an abandoned review reports tokens and no cost
+    /// even though the rates were right there.
+    func testTheSpendMeterPricesTheRoundsItSaw() async throws {
+        let client = StubChatClient(
+            [
+                .toolCall(id: "c1", name: "read_file", arguments: #"{"path": "Widget.swift"}"#),
+                .failure(ChatCompletionError.timedOut(seconds: 180)),
+            ],
+            usagePerReply: TokenUsage(
+                inputTokens: 1_000_000,
+                cachedInputTokens: 1_000_000,
+                outputTokens: 1_000_000,
+                requests: 1
+            )
+        )
+        let meter = DeepSeekReviewer.SpendMeter(
+            pricing: TokenPricing(
+                inputPerMillion: 1,
+                cachedInputPerMillion: 0.25,
+                outputPerMillion: 4
+            )
+        )
+        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+
+        do {
+            _ = try await reviewer.review(
+                prompt: "REVIEW CONTRACT",
+                worktree: worktree,
+                apiKey: "sk-test",
+                meter: meter
+            )
+            XCTFail("The timeout should not be swallowed")
+        } catch {
+            let total = await meter.total()
+            let spent = try XCTUnwrap(total, "the completed round was billed")
+            XCTAssertEqual(spent.costUSD ?? 0, 5.25, accuracy: 0.0001)
+        }
+    }
+
+    func testTheSpendMeterReportsNoCostForRoundsTheProviderDidNotMeasure() async throws {
+        let client = StubChatClient(
+            [
+                .toolCall(id: "c1", name: "read_file", arguments: #"{"path": "Widget.swift"}"#),
+                .failure(ChatCompletionError.timedOut(seconds: 180)),
+            ],
+            usagePerReply: nil
+        )
+        let meter = DeepSeekReviewer.SpendMeter(pricing: .deepSeekDefault)
+        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+
+        do {
+            _ = try await reviewer.review(
+                prompt: "REVIEW CONTRACT",
+                worktree: worktree,
+                apiKey: "sk-test",
+                meter: meter
+            )
+            XCTFail("The timeout should not be swallowed")
+        } catch {
+            let total = await meter.total()
+            let spent = try XCTUnwrap(total, "the round was billed even though it went unreported")
+            XCTAssertEqual(spent.requests, 1)
+            XCTAssertNil(spent.costUSD, "an unmeasured round must not price out as free")
+        }
     }
 
     func testNarrationBeforeTheContractHeadingIsStripped() {
@@ -565,12 +744,31 @@ actor StubChatClient: ChatCompleting {
     /// Usage attached to every successful reply, so accumulation across the loop can be asserted.
     var usagePerReply: TokenUsage?
 
+    /// Usage per reply in order, for the case `usagePerReply` cannot express: a provider that
+    /// reports tokens for some rounds and not others.
+    private var usageScript: [TokenUsage?]?
+
     private var replies: [Reply]
     private var requests: [ChatCompletionRequest] = []
 
     init(_ replies: [Reply], usagePerReply: TokenUsage? = nil) {
         self.replies = replies
         self.usagePerReply = usagePerReply
+    }
+
+    init(_ replies: [Reply], usagePerReply: [TokenUsage?]) {
+        self.replies = replies
+        self.usageScript = usagePerReply
+    }
+
+    /// The next reply's usage: the script when one was given, otherwise the fixed value. A script
+    /// that runs out reports nothing, matching a provider that stopped sending the object.
+    private func nextUsage() -> TokenUsage? {
+        guard var script = usageScript else { return usagePerReply }
+        guard !script.isEmpty else { return nil }
+        let next = script.removeFirst()
+        usageScript = script
+        return next
     }
 
     func complete(
@@ -586,7 +784,7 @@ actor StubChatClient: ChatCompleting {
         case let .message(text):
             return ChatCompletionResult(
                 message: ChatMessage(role: .assistant, content: text),
-                usage: usagePerReply
+                usage: nextUsage()
             )
         case let .toolCall(id, name, arguments):
             return ChatCompletionResult(
@@ -599,7 +797,7 @@ actor StubChatClient: ChatCompleting {
                         ),
                     ]
                 ),
-                usage: usagePerReply
+                usage: nextUsage()
             )
         case let .failure(error):
             throw error

@@ -412,18 +412,6 @@ private struct ReviewerCard: View {
             && (configuration.authMode == .apiKey || !reviewer.supportsSessionAuth)
     }
 
-    /// What the usage report will be able to say about this reviewer. A CLI that prints its own
-    /// envelope reports both figures; DeepSeek's API returns token counts and no price at all, so
-    /// promising a dollar figure for it would be a promise nothing can keep.
-    private var usageNote: String {
-        guard let command = reviewer.commandName else {
-            return "\(reviewer.rawValue)'s API reports the tokens each review consumes, but no "
-                + "price, so its spend appears as a token count with no cost."
-        }
-        return "The \(command) CLI reports its own tokens and cost, so this reviewer's spend "
-            + "appears in the usage report."
-    }
-
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
@@ -507,12 +495,17 @@ private struct ReviewerCard: View {
                     APIKeyRow(model: model, reviewer: reviewer)
                         .disabled(!configuration.enabled)
 
-                    // A key-mode reviewer is metered, so say up front whether this review will
-                    // be able to report what it cost.
-                    if reviewer.reportsTokenUsage {
-                        Label(usageNote, systemImage: "checkmark.seal")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    if reviewer.needsConfiguredPricing {
+                        PricingRow(reviewer: reviewer, configuration: $configuration)
+                            .disabled(!configuration.enabled)
+                    } else if reviewer.reportsTokenUsage {
+                        Label(
+                            "\(reviewer.rawValue) reports its own tokens and cost, so there are "
+                                + "no prices to configure.",
+                            systemImage: "checkmark.seal"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     } else {
                         Label(
                             "This CLI does not report token usage, so its cost cannot be tracked.",
@@ -539,6 +532,104 @@ private struct ReviewerCard: View {
         }
         .onChange(of: configuration.authMode) { _, _ in
             Task { await model.refreshSavedKeys() }
+        }
+    }
+}
+
+/// Prices for providers that report tokens but not cost. Editable because published rates change
+/// and a stale built-in number would report the wrong spend without saying so.
+private struct PricingRow: View {
+    let reviewer: ReviewerName
+    @Binding var configuration: ReviewerConfiguration
+
+    private var pricing: Binding<TokenPricing> {
+        Binding(
+            // Show what is actually stored. Falling back to the defaults here made an unpriced
+            // reviewer look configured while it reported no cost at all.
+            get: { configuration.pricing ?? .unpriced },
+            set: { configuration.pricing = $0 }
+        )
+    }
+
+    private var isPriced: Bool {
+        !(configuration.pricing ?? .unpriced).isUnpriced
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Prices")
+                    .frame(width: 70, alignment: .leading)
+                PriceField(label: "Input", value: pricing.inputPerMillion)
+                PriceField(label: "Cached", value: pricing.cachedInputPerMillion)
+                PriceField(label: "Output", value: pricing.outputPerMillion)
+                // The reviewer's own rates, not DeepSeek's: this row is reached through
+                // `needsConfiguredPricing`, which a second such provider would also satisfy.
+                if let defaults = reviewer.defaultPricing {
+                    Button("Reset") { configuration.pricing = defaults }
+                        .disabled(configuration.pricing == defaults)
+                }
+            }
+
+            Text("USD per million tokens, written with a dot or a comma. \(reviewer.rawValue) reports tokens but not cost, so these rates are what turn them into a dollar figure — check them against your provider's current pricing. Set all three to 0 to report tokens only.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if !isPriced {
+                Label(
+                    "No rates set, so reviews will report tokens with no cost.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+        }
+    }
+}
+
+/// A rate field that keeps its own text so a partially typed value is not clobbered, and that
+/// accepts either decimal separator — see `TokenPricing.parseRate`.
+private struct PriceField: View {
+    let label: String
+    @Binding var value: Double
+    @State private var draft = ""
+    @FocusState private var isFocused: Bool
+
+    /// True while the field shows something that is not the stored rate, so the field can say
+    /// so rather than leave the two silently out of step.
+    private var isDraftInvalid: Bool { TokenPricing.parseRate(draft) == nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            TextField(label, text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 80)
+                .font(.body.monospaced())
+                .foregroundStyle(isDraftInvalid ? Color.red : Color.primary)
+                .focused($isFocused)
+                .onAppear { draft = TokenPricing.renderRate(value) }
+                .onChange(of: draft) { _, typed in
+                    if let parsed = TokenPricing.parseRate(typed) { value = parsed }
+                }
+                .onChange(of: value) { _, updated in
+                    // Reset and similar external writes need to reach the field, but must not
+                    // fight the user mid-keystroke.
+                    if TokenPricing.parseRate(draft) != updated {
+                        draft = TokenPricing.renderRate(updated)
+                    }
+                }
+                .onChange(of: isFocused) { _, focused in
+                    // Text that does not parse never reached `value`, and nothing else would
+                    // ever put the two back in step — the re-sync above only fires when `value`
+                    // changes, and Reset is disabled while the stored rates are the defaults.
+                    // So an abandoned edit snaps back to what is actually stored on the way out.
+                    if !focused, isDraftInvalid {
+                        draft = TokenPricing.renderRate(value)
+                    }
+                }
         }
     }
 }
