@@ -1148,6 +1148,12 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(postedBody.contains("Token usage and cost"))
         XCTAssertTrue(postedBody.contains("`deepseek-test`"))
         XCTAssertNotNil(events.last?.usage)
+        // This stub attaches no `usage` object, which is what a provider that stops sending one
+        // looks like. The fixture *does* configure rates, so pricing the resulting zero token
+        // counts would print `$0.0000` — an unmeasured review reading as a free one.
+        XCTAssertNil(events.last?.usage?.costUSD)
+        XCTAssertTrue(postedBody.contains("not reported"))
+        XCTAssertFalse(postedBody.contains("$0.0000"))
     }
 
     func testDeepSeekWithoutASavedKeyFailsAndPostsNothing() async throws {
@@ -1404,9 +1410,11 @@ final class ReviewEngineFeatureTests: XCTestCase {
         )
         XCTAssertEqual(usage.inputTokens, 2_000)
         XCTAssertEqual(usage.outputTokens, 200)
-        XCTAssertNil(usage.costUSD, "DeepSeek's API reports tokens and no price")
+        // Both attempts are priced from the fixture's rates: 2,000 input at $0.27/M plus 200
+        // output at $1.10/M. The abandoned attempt's share is the point — it was billed too.
+        XCTAssertEqual(usage.costUSD ?? 0, 0.00076, accuracy: 0.000001)
         XCTAssertTrue(postedBody.contains("| DeepSeek | `deepseek-test` |"))
-        XCTAssertTrue(postedBody.contains("not reported"))
+        XCTAssertTrue(postedBody.contains("$0.0008"))
     }
 
     /// The merge preview reaches a CLI reviewer as a file in the worktree, which is what the
@@ -1861,13 +1869,14 @@ private struct FeatureFixture {
             codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
             opencode: ReviewerConfiguration(enabled: false, model: "opencode-test", effort: .max),
             // Spelled out rather than left to the initialiser's default, so the usage table a
-            // DeepSeek test asserts on carries the fixture's model instead of whatever the
-            // production default happens to be that week.
+            // DeepSeek test asserts on carries the fixture's model and prices instead of
+            // whatever the production defaults happen to be that week.
             deepseek: ReviewerConfiguration(
                 enabled: false,
                 model: "deepseek-test",
                 effort: .high,
-                authMode: .apiKey
+                authMode: .apiKey,
+                pricing: .deepSeekDefault
             ),
             customPrompt: "Check public API compatibility."
         )

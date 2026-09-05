@@ -1392,9 +1392,9 @@ actor ReviewEngine {
     /// `--output-format json` is passed unconditionally, so a `claude` old enough to *reject*
     /// the flag exits non-zero and the reviewer fails rather than being re-run as text — there
     /// is no capability probe, and a probing re-run would spend a second billed call on every
-    /// review to guard against a CLI nobody has reported. Cost comes straight from the CLI,
-    /// which is the only place a dollar figure is reported at all — DeepSeek's API returns
-    /// tokens and no price — so there is no price table to keep current.
+    /// review to guard against a CLI nobody has reported. Cost comes straight from the CLI, so
+    /// unlike DeepSeek — whose API reports tokens and no price, and so has to be priced from
+    /// rates kept in settings — there is no rate table to keep current here.
     private func claudeOutput(_ stdout: String) -> CLIReviewOutput {
         guard let envelope = try? JSONDecoder().decode(
             ClaudeResultEnvelope.self,
@@ -1627,9 +1627,11 @@ actor ReviewEngine {
         }
         let client = chatClient
         let model = configuration.model
+        let pricing = configuration.pricing
         // Held by the engine rather than the loop, because a cancelled loop returns nothing at
-        // all: this is the only way the rounds it had already paid for are still counted.
-        let meter = DeepSeekReviewer.SpendMeter()
+        // all: this is the only way the rounds it had already paid for are still counted. It
+        // carries the rates so an abandoned review is priced like a finished one.
+        let meter = DeepSeekReviewer.SpendMeter(pricing: pricing)
         do {
             // A sleeping task rather than a deadline handed to the reviewer, because this is
             // the *hard* stop: the loop is cancelled where it suspends, with no chance to
@@ -1639,7 +1641,7 @@ actor ReviewEngine {
                 of: DeepSeekReviewer.Generated?.self
             ) { group -> DeepSeekReviewer.Generated? in
                 group.addTask {
-                    try await DeepSeekReviewer(client: client, model: model)
+                    try await DeepSeekReviewer(client: client, model: model, pricing: pricing)
                         .review(
                             prompt: prompt,
                             worktree: worktree,
@@ -1817,6 +1819,10 @@ actor ReviewEngine {
             let label = entry.isAdjudicator
                 ? "\(entry.reviewer.rawValue) (reconciliation)"
                 : entry.reviewer.rawValue
+            // Never a dollar figure when the cost is unknown: `costSummary` is `nil` when no
+            // rates are configured *or* when the provider left a billed round's tokens
+            // unreported, and either way "not reported" is the honest cell. Rendering an
+            // unknown cost as `$0.0000` would read as free.
             let cost = entry.usage.costSummary ?? "not reported"
             return "| \(label) | `\(entry.model)` | \(entry.usage.tokenSummary) | \(cost) |"
         }.joined(separator: "\n")
@@ -1831,9 +1837,9 @@ actor ReviewEngine {
         | --- | --- | --- | --- |
         \(rows)
 
-        \(TokenUsage.abbreviated(total.totalTokens)) tokens in total, as reported by the \
-        reviewers themselves. Only reviewers billed per token are listed; reviewers using a \
-        signed-in CLI are covered by its subscription.
+        \(TokenUsage.abbreviated(total.totalTokens)) tokens in total. Only reviewers billed per \
+        token are listed; reviewers using a signed-in CLI are covered by its subscription. \
+        DeepSeek prices come from Review Bot's settings and may not match your current plan.
 
         </details>
         """

@@ -13,7 +13,7 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
 - Run an immediate manual check even while monitoring is paused.
 - Independently enable Claude, Codex, opencode, and DeepSeek and configure each model and effort level.
 - Choose per reviewer whether to use its signed-in CLI or an API key held in the macOS Keychain (Claude and Codex; DeepSeek is key-only, and opencode authenticates through its own configuration).
-- Track tokens and cost per review for the reviewers billed per token, and optionally publish that in the review.
+- Track tokens and cost per review for the reviewers billed per token — including DeepSeek, priced from editable per-million rates — and optionally publish that in the review.
 - Append a small developer-specific instruction prompt to every review.
 - Enforce repository-specific rules from `REVIEW.md`.
 - Run enabled reviewers independently in a read-only worktree.
@@ -100,13 +100,15 @@ Reviews are metered for the reviewers you pay per token. Every provider call a r
 | Reviewer | Tokens | Cost |
 | --- | --- | --- |
 | Claude | Reported by the CLI | Reported by the CLI — no prices to configure |
-| DeepSeek | Reported by the API | Not reported by the API |
+| DeepSeek | Reported by the API | Computed from prices you set on its card |
 | Codex | Not reported | Not available |
 | opencode | Not reported | Not available |
 
 Claude's figures come from `claude --output-format json`, which Review Bot now passes on every run. Output that is not that envelope is read as the review itself, so a CLI that accepts the flag and prints plain text still reviews normally — but the flag is not optional and there is no fallback re-run, so a `claude` too old to accept it fails outright with the CLI's own error. DeepSeek's come from each response's `usage` object, which reports tokens and no price.
 
-A reviewer using its signed-in CLI is left out entirely: that cost is a flat subscription, so attributing dollars to one review would be misleading. That excludes opencode in every configuration, since it has no API-key mode. A cost that cannot be determined is shown as unknown rather than as `$0.00`, which would understate real spend.
+**DeepSeek prices.** Because its API sends no price, DeepSeek's cost is its token counts multiplied by rates you keep on its reviewer card — input, cached input, and output, in USD per million tokens. They are settings rather than built-in constants because published prices drift, and a stale number would report the wrong spend without ever saying so; check them against DeepSeek's current pricing, and use **Reset** to restore the shipped defaults. A cached input token is charged at its own rate, matching how the provider bills and reports it. Set all three to zero to report tokens and no cost at all. Rates are written with a dot or a comma — a comma-decimal locale would otherwise read a pasted `0.27` as `27` — and a negative rate is refused. A `config.json` written before prices existed is given the defaults when it loads. Because these numbers come from your settings rather than from the provider, the posted usage table says so.
+
+A reviewer using its signed-in CLI is left out entirely: that cost is a flat subscription, so attributing dollars to one review would be misleading. That excludes opencode in every configuration, since it has no API-key mode. A cost that cannot be determined is shown as unknown rather than as `$0.00`, which would understate real spend — including a DeepSeek review whose responses carried no token counts, since a rate multiplied by unknown tokens is unknown and not zero.
 
 ## `REVIEW.md` policy
 
