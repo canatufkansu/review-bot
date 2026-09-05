@@ -1174,6 +1174,115 @@ final class ReviewEngineFeatureTests: XCTestCase {
     }
 
     // MARK: - DeepSeek, per-reviewer credentials, and usage
+    func testAReviewerThatCouldNotAssessDoesNotProduceAnApproval() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        // Verbatim in shape from the review that made this necessary: the model reported it never
+        // read the diff, then signed off with the most permissive verdict the contract allows.
+        // Read literally that is an approval on a pull request nobody looked at.
+        let chatClient = StubChatClient([
+            .message("""
+            ## Summary
+            This PR could not be reviewed: the required `.review-bot-diff.patch` exists in the \
+            worktree listing but is not readable by the available tools.
+
+            ## Merge gate
+            Unable to assess.
+
+            VERDICT: NITS_ONLY
+            """),
+        ])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.deepseek.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        let postCount = await runner.postCount()
+
+        XCTAssertNotEqual(postArgument, "--approve", "an unread pull request must never be approved")
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertNotEqual(events.last?.kind, .approved)
+        // Silence is the other wrong answer: the author would wait through the whole failure
+        // budget and never be told why no review arrived.
+        XCTAssertEqual(postCount, 1, "the reason has to reach the pull request")
+        XCTAssertTrue(
+            postedBody.contains("No reviewer was able to assess this pull request"),
+            postedBody
+        )
+        XCTAssertTrue(postedBody.contains("could not assess the pull request"), postedBody)
+        // The reviewer's own account is the entire value of this comment, so it must be shown.
+        XCTAssertTrue(postedBody.contains("is not readable by the available tools"), postedBody)
+    }
+
+    func testAReviewerThatCouldNotAssessIsNotRunAgainInsideTheSameReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([
+            .message("## Summary\nUnable to assess.\n\nVERDICT: CLEAN\n"),
+            .message("## Summary\nUnable to assess.\n\nVERDICT: CLEAN\n"),
+        ])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.deepseek.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        // Withdrawing the verdict leaves the result looking like "no verdict", which is normally
+        // retried in place. It must not be here: the second pass re-reads the same unreadable
+        // evidence and reaches the same conclusion, and for a reviewer on a key that is a second
+        // full bill for the same non-answer.
+        let calls = await chatClient.recordedRequests().count
+        XCTAssertEqual(calls, 1, "a reviewer that reported it could not assess must not be re-run")
+    }
+
+    func testASurvivingReviewerStillDecidesWhenTheOtherCouldNotAssess() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeVerdict: .shouldFix)
+        let chatClient = StubChatClient([
+            .message("## Summary\nUnable to assess.\n\nVERDICT: CLEAN\n"),
+        ])
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.deepseek: "sk-deepseek"]),
+            chatClient: chatClient
+        )
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.deepseek.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        // The withdrawn verdict must not dilute the reviewer that did the work — a CLEAN that was
+        // never earned used to be able to straddle the gate and trigger a reconciliation.
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertTrue(postedBody.contains("Partial panel"), postedBody)
+        XCTAssertTrue(postedBody.contains("could not assess the pull request"), postedBody)
+    }
+
 
     func testDeepSeekReviewsOverHTTPAndPostsThroughTheSameWorkflow() async throws {
         let fixture = try FeatureFixture()

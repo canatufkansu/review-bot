@@ -202,4 +202,58 @@ final class WorktreeToolsTests: XCTestCase {
             tools.execute(name: "read_file", argumentsJSON: "not json").hasPrefix("Error:")
         )
     }
+
+    // MARK: - Large files
+
+    func testAFileLargerThanTheOldCapIsStillReadableAPageAtATime() throws {
+        // The regression that made this necessary: a 1.5 MB diff — valid UTF-8 throughout — was
+        // refused outright by a 1 MB file cap, and the refusal said "not a readable UTF-8 text
+        // file". The reviewer believed it, reported the pull request could not be reviewed, and
+        // the panel approved anyway. Size must bound what a read *returns*, never whether the
+        // file can be opened.
+        let big = (1...40_000).map { "line \($0) of a very large diff" }.joined(separator: "\n")
+        XCTAssertGreaterThan(big.utf8.count, 1_000_000, "the fixture has to exceed the old cap")
+        try write(big, to: "huge.patch")
+
+        let head = tools.execute(name: "read_file", argumentsJSON: #"{"path":"huge.patch"}"#)
+        XCTAssertTrue(head.contains("1\tline 1 of a very large diff"), head)
+        XCTAssertFalse(head.contains("Error:"), head)
+        XCTAssertTrue(
+            head.contains("Read again with offset"),
+            "a paged read has to say how to continue, or the reader stops at the first page"
+        )
+
+        let later = tools.execute(
+            name: "read_file",
+            argumentsJSON: #"{"path":"huge.patch","offset":39990,"limit":3}"#
+        )
+        XCTAssertTrue(later.contains("39990\tline 39990 of a very large diff"), later)
+
+        // `search` used to skip the same files it could not read whole, so a large diff answered
+        // "No matches" for text plainly inside it — evidence of absence, manufactured.
+        let found = tools.execute(
+            name: "search",
+            argumentsJSON: #"{"pattern":"line 39999 of"}"#
+        )
+        XCTAssertTrue(found.contains("huge.patch:39999:"), found)
+
+        XCTAssertNotNil(
+            tools.rawContents(of: "huge.patch"),
+            "inlining the diff must not be blocked by size either; the caller clips it"
+        )
+    }
+
+    func testEachReasonAFileCannotBeReadSaysWhichOneItIs() throws {
+        try Data([0x00, 0x01, 0x02]).write(to: root.appendingPathComponent("blob.bin"))
+        try Data([0xFF, 0xFE, 0xFD]).write(to: root.appendingPathComponent("bad.txt"))
+
+        let binary = tools.execute(name: "read_file", argumentsJSON: #"{"path":"blob.bin"}"#)
+        let invalid = tools.execute(name: "read_file", argumentsJSON: #"{"path":"bad.txt"}"#)
+
+        // Three distinct causes used to share one message, and the message named the cause that
+        // was usually wrong. A reader told "binary" stops; told "too large" it pages.
+        XCTAssertTrue(binary.contains("binary"), binary)
+        XCTAssertFalse(binary.contains("UTF-8"), "a binary file is not a UTF-8 problem: \(binary)")
+        XCTAssertTrue(invalid.contains("not valid UTF-8"), invalid)
+    }
 }

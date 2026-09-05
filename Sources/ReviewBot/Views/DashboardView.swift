@@ -400,6 +400,20 @@ private struct ReviewerCard: View {
     /// thread content (see the prompt-injection spike in issue #3).
     private static let smallModelMarkers = ["mimo", "laguna", "lightning", "big-pickle", "hy3", "mini"]
 
+    /// Says what the number costs, which differs by how the reviewer is billed. A run that is cut
+    /// off produces nothing, so the honest advice on a large pull request is "raise it" — but for
+    /// a reviewer on your own key the whole window is billable, and that has to be said next to
+    /// the control rather than discovered on an invoice.
+    private var timeLimitCaption: String {
+        let base = "How long \(reviewer.rawValue) may spend on one review before it is cut off. "
+            + "A review that runs out of time contributes nothing, so a large pull request may "
+            + "need more than the default."
+        return configuration.authMode == .apiKey
+            ? base + " This reviewer is billed to your own key, so a longer limit is also a "
+                + "larger bill for a review that may still not finish."
+            : base
+    }
+
     private func isSmallModel(_ model: String) -> Bool {
         let name = model.lowercased()
         return Self.smallModelMarkers.contains { name.contains($0) }
@@ -462,6 +476,23 @@ private struct ReviewerCard: View {
                     }
                     .disabled(!configuration.enabled)
                 }
+
+                HStack {
+                    Text("Time limit")
+                        .frame(width: 70, alignment: .leading)
+                    Stepper(
+                        value: $configuration.timeoutMinutes,
+                        in: ReviewerConfiguration.timeoutMinutesRange
+                    ) {
+                        Text("\(configuration.timeoutMinutes) min")
+                            .font(.body.monospaced())
+                    }
+                }
+                .disabled(!configuration.enabled)
+
+                Text(timeLimitCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 Divider()
 

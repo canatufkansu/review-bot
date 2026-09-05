@@ -195,19 +195,36 @@ struct ReviewerConfiguration: Codable, Equatable {
     var authMode: ReviewerAuthMode
     /// Only used by providers that report tokens but not cost. `nil` means "don't compute cost".
     var pricing: TokenPricing?
+    /// How long this reviewer may spend on one review before it is cut off.
+    ///
+    /// Per reviewer rather than global because they do not cost the same: a signed-in CLI on a
+    /// flat subscription can be given an hour on a large pull request, while a reviewer billed to
+    /// your own key spends the whole time being charged. The default matches what every reviewer
+    /// used before this was configurable.
+    var timeoutMinutes: Int
+
+    static let defaultTimeoutMinutes = 15
+    /// Below a minute nothing finishes; the upper bound is a guard against a typo pinning a
+    /// reviewer — and a metered bill — for a day.
+    static let timeoutMinutesRange = 1...240
+
+    /// The timeout as `ProcessRunner` and the DeepSeek budget want it.
+    var timeoutSeconds: Int { timeoutMinutes * 60 }
 
     init(
         enabled: Bool,
         model: String,
         effort: ReviewEffort,
         authMode: ReviewerAuthMode = .session,
-        pricing: TokenPricing? = nil
+        pricing: TokenPricing? = nil,
+        timeoutMinutes: Int = ReviewerConfiguration.defaultTimeoutMinutes
     ) {
         self.enabled = enabled
         self.model = model
         self.effort = effort
         self.authMode = authMode
         self.pricing = pricing
+        self.timeoutMinutes = Self.clampedTimeout(timeoutMinutes)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -216,6 +233,7 @@ struct ReviewerConfiguration: Codable, Equatable {
         case effort
         case authMode
         case pricing
+        case timeoutMinutes
     }
 
     init(from decoder: Decoder) throws {
@@ -225,6 +243,16 @@ struct ReviewerConfiguration: Codable, Equatable {
         effort = try values.decodeIfPresent(ReviewEffort.self, forKey: .effort) ?? .high
         authMode = try values.decodeIfPresent(ReviewerAuthMode.self, forKey: .authMode) ?? .session
         pricing = try values.decodeIfPresent(TokenPricing.self, forKey: .pricing)
+        // Clamped rather than trusted: this one bounds a running process, and a config written by
+        // hand with `0` would otherwise cut every review off before it started.
+        timeoutMinutes = Self.clampedTimeout(
+            try values.decodeIfPresent(Int.self, forKey: .timeoutMinutes)
+                ?? Self.defaultTimeoutMinutes
+        )
+    }
+
+    private static func clampedTimeout(_ minutes: Int) -> Int {
+        min(max(minutes, timeoutMinutesRange.lowerBound), timeoutMinutesRange.upperBound)
     }
 }
 
@@ -738,6 +766,11 @@ enum ReviewerFailureClass: Equatable {
             // or whose Keychain prompt was denied. Only Settings can fix that, so retrying
             // would spend the failure budget on a request that cannot start.
             "key could not be read",
+            // A reviewer that reported it could not assess the pull request. Not a provider
+            // failure at all — the call succeeded — but a second call re-reads the same
+            // unreadable evidence and reaches the same conclusion, and for a metered reviewer
+            // that is another full bill for the same non-answer.
+            "could not assess this pull request",
         ]
         return terminalMarkers.contains { haystack.contains($0) } ? .terminal : .transient
     }
@@ -762,6 +795,14 @@ struct ReviewerResult: Equatable {
     var failureClass: ReviewerFailureClass? {
         guard let failure else { return nil }
         return ReviewerFailureClass.classify(failure)
+    }
+
+    /// Whether this reviewer withdrew its own verdict by reporting it could not assess the pull
+    /// request. Distinct from a failure: the call succeeded and the reviewer answered honestly,
+    /// which is why a panel of nothing but these is still worth posting — the author is told why
+    /// no review happened instead of being left with silence.
+    var couldNotAssess: Bool {
+        verdict == nil && (failure?.contains("could not assess this pull request") ?? false)
     }
 
     /// Whether running this reviewer again right now is worth the wall time: a crash,

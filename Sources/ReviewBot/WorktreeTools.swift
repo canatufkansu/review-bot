@@ -9,7 +9,11 @@ import Foundation
 struct WorktreeTools {
     /// Guard rails so a runaway tool loop cannot exhaust the model's context.
     private enum Limits {
-        static let maxFileBytes = 1_000_000
+        /// The ceiling on holding a whole file in memory — not on serving it. `read_file` pages
+        /// with `offset`/`limit` and `search` matches line by line, so anything under this is
+        /// readable a piece at a time however big it is. It exists only so a stray multi-gigabyte
+        /// artefact in a worktree cannot exhaust memory.
+        static let maxLoadableBytes = 64_000_000
         static let maxReadLines = 600
         static let maxOutputCharacters = 40_000
         static let maxSearchResults = 60
@@ -103,11 +107,12 @@ struct WorktreeTools {
     ]
 
     /// A file's raw text, without the line numbering and per-read limits the `read_file` tool
-    /// applies. Used to inline the diff and PR thread in the opening message, which has its own
-    /// larger budget. Still refuses anything outside the worktree.
+    /// applies. Used to inline the diff and PR thread in the opening message, which clips them to
+    /// its own budget — so this deliberately imposes no size limit of its own beyond what can be
+    /// held in memory. Still refuses anything outside the worktree.
     func rawContents(of relativePath: String) -> String? {
         guard let url = resolve(relativePath) else { return nil }
-        return textContents(of: url)
+        return try? textContents(of: url).get()
     }
 
     /// Runs one tool call. Never throws: a failure is returned as text so the model can correct
@@ -132,8 +137,10 @@ struct WorktreeTools {
 
     private func readFile(path: String, offset: Int?, limit: Int?) -> String {
         guard let url = resolve(path) else { return refusal(path) }
-        guard let contents = textContents(of: url) else {
-            return "Error: `\(path)` is not a readable UTF-8 text file."
+        let contents: String
+        switch textContents(of: url) {
+        case let .success(text): contents = text
+        case let .failure(reason): return explain(reason, for: path)
         }
 
         let lines = contents.components(separatedBy: .newlines)
@@ -167,7 +174,7 @@ struct WorktreeTools {
                 break
             }
             scanned += 1
-            guard let contents = textContents(of: file) else { continue }
+            guard let contents = try? textContents(of: file).get() else { continue }
             let relative = relativePath(of: file)
             for (index, line) in contents.components(separatedBy: .newlines).enumerated() {
                 guard results.count < Limits.maxSearchResults else { break }
@@ -284,13 +291,42 @@ struct WorktreeTools {
         return collected
     }
 
-    /// The file's text, or `nil` when it is too large, binary, or not valid UTF-8.
-    private func textContents(of url: URL) -> String? {
+    /// Why a file could not be turned into text. The distinction matters to the reader: a model
+    /// told "not readable UTF-8" concludes the file is corrupt and stops, while "too large, page
+    /// through it" is an instruction it can act on. Reporting all three as the first one is how a
+    /// 1.5 MB diff — perfectly valid UTF-8 — got a review that said the pull request could not be
+    /// reviewed at all.
+    private enum TextRefusal: Error {
+        case tooLargeToLoad(bytes: Int)
+        case binary
+        case notUTF8
+    }
+
+    /// The file's full text, or why it cannot be read as text.
+    ///
+    /// Size is deliberately *not* a reason on its own. `readFile` slices what it returns and
+    /// `search` matches line by line, so a large file is served a piece at a time rather than
+    /// refused; only a file too big to hold in memory at all is turned away, and it says so.
+    private func textContents(of url: URL) -> Result<String, TextRefusal> {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-        guard size <= Limits.maxFileBytes else { return nil }
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        guard !data.prefix(8_000).contains(0) else { return nil }
-        return String(data: data, encoding: .utf8)
+        guard size <= Limits.maxLoadableBytes else { return .failure(.tooLargeToLoad(bytes: size)) }
+        guard let data = try? Data(contentsOf: url) else { return .failure(.notUTF8) }
+        guard !data.prefix(8_000).contains(0) else { return .failure(.binary) }
+        guard let text = String(data: data, encoding: .utf8) else { return .failure(.notUTF8) }
+        return .success(text)
+    }
+
+    private func explain(_ refusal: TextRefusal, for path: String) -> String {
+        switch refusal {
+        case let .tooLargeToLoad(bytes):
+            let megabytes = Double(bytes) / 1_000_000
+            return "Error: `\(path)` is \(String(format: "%.1f", megabytes)) MB, too large to open. "
+                + "Use `search` to find the parts you need."
+        case .binary:
+            return "Error: `\(path)` is a binary file, not text."
+        case .notUTF8:
+            return "Error: `\(path)` is not valid UTF-8 text."
+        }
     }
 
     private func truncated(_ value: String) -> String {
