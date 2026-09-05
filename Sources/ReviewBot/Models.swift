@@ -47,8 +47,10 @@ struct TokenUsage: Codable, Equatable {
     var outputTokens: Int
     /// Number of provider calls. DeepSeek's agent loop makes many per review.
     var requests: Int
-    /// `nil` when the provider does not report cost — a missing cost must never be shown
-    /// as `$0.00`.
+    /// `nil` whenever the cost is unknown — the provider reported none and no rates are
+    /// configured, or rates are configured but a billed call's tokens went unreported, so
+    /// multiplying them out would understate the spend. A missing cost must never be shown as
+    /// `$0.00`: reading unknown as free is the failure cost reporting exists to prevent.
     var costUSD: Double?
 
     init(
@@ -109,6 +111,65 @@ struct TokenUsage: Codable, Equatable {
     }
 }
 
+/// USD per million tokens, for providers that report tokens but not cost.
+///
+/// These are settings rather than constants on purpose: published prices change, and a stale
+/// hardcoded rate would silently report the wrong number.
+struct TokenPricing: Codable, Equatable {
+    var inputPerMillion: Double
+    var cachedInputPerMillion: Double
+    var outputPerMillion: Double
+
+    var isUnpriced: Bool {
+        inputPerMillion <= 0 && cachedInputPerMillion <= 0 && outputPerMillion <= 0
+    }
+
+    func cost(for usage: TokenUsage) -> Double? {
+        guard !isUnpriced else { return nil }
+        return Double(usage.inputTokens) / 1_000_000 * inputPerMillion
+            + Double(usage.cachedInputTokens) / 1_000_000 * cachedInputPerMillion
+            + Double(usage.outputTokens) / 1_000_000 * outputPerMillion
+    }
+
+    /// DeepSeek's published `deepseek-chat` rates as of July 2026. Confirm against
+    /// api-docs.deepseek.com — they are editable in Settings precisely because they drift.
+    static let deepSeekDefault = TokenPricing(
+        inputPerMillion: 0.27,
+        cachedInputPerMillion: 0.07,
+        outputPerMillion: 1.10
+    )
+
+    /// All rates zero: report tokens, no cost.
+    static let unpriced = TokenPricing(
+        inputPerMillion: 0,
+        cachedInputPerMillion: 0,
+        outputPerMillion: 0
+    )
+
+    /// Parses a rate typed or pasted into the settings field.
+    ///
+    /// Accepts both `0.27` and `0,27`. Providers publish rates with a dot, but a
+    /// comma-decimal locale reads a pasted `0.27` as `27` — a hundredfold overstatement of
+    /// spend — so the separator is normalised rather than left to the locale.
+    static func parseRate(_ text: String) -> Double? {
+        let normalized = text
+            .trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: ",", with: ".")
+        guard !normalized.isEmpty,
+              let value = Double(normalized),
+              value.isFinite,
+              value >= 0 else {
+            return nil
+        }
+        return value
+    }
+
+    /// Renders a rate for editing, always with a dot so it matches published pricing.
+    static func renderRate(_ value: Double) -> String {
+        String(format: "%g", value)
+    }
+}
+
 /// Where a reviewer gets its provider credentials.
 enum ReviewerAuthMode: String, Codable, CaseIterable, Identifiable {
     /// Use whatever the reviewer's CLI is already signed in as. Review Bot passes no key.
@@ -132,17 +193,21 @@ struct ReviewerConfiguration: Codable, Equatable {
     var effort: ReviewEffort
     /// Never holds the key itself — only which source to use. Keys live in the Keychain.
     var authMode: ReviewerAuthMode
+    /// Only used by providers that report tokens but not cost. `nil` means "don't compute cost".
+    var pricing: TokenPricing?
 
     init(
         enabled: Bool,
         model: String,
         effort: ReviewEffort,
-        authMode: ReviewerAuthMode = .session
+        authMode: ReviewerAuthMode = .session,
+        pricing: TokenPricing? = nil
     ) {
         self.enabled = enabled
         self.model = model
         self.effort = effort
         self.authMode = authMode
+        self.pricing = pricing
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -150,6 +215,7 @@ struct ReviewerConfiguration: Codable, Equatable {
         case model
         case effort
         case authMode
+        case pricing
     }
 
     init(from decoder: Decoder) throws {
@@ -158,6 +224,7 @@ struct ReviewerConfiguration: Codable, Equatable {
         model = try values.decodeIfPresent(String.self, forKey: .model) ?? ""
         effort = try values.decodeIfPresent(ReviewEffort.self, forKey: .effort) ?? .high
         authMode = try values.decodeIfPresent(ReviewerAuthMode.self, forKey: .authMode) ?? .session
+        pricing = try values.decodeIfPresent(TokenPricing.self, forKey: .pricing)
     }
 }
 
@@ -234,7 +301,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         enabled: false,
         model: "deepseek-chat",
         effort: .high,
-        authMode: .apiKey
+        authMode: .apiKey,
+        pricing: ReviewerName.deepseek.defaultPricing
     )
 
     static let `default` = ReviewBotConfiguration(
@@ -371,6 +439,13 @@ struct ReviewBotConfiguration: Codable, Equatable {
         opencode.authMode = .session
         // DeepSeek is reached over HTTP, so there is no CLI session to fall back on.
         deepseek.authMode = .apiKey
+        // A config saved before per-token pricing existed has no rates, and leaving that as
+        // `nil` would leave an upgraded install permanently unable to report DeepSeek's cost.
+        // Backfilling here rather than writing the file back on load means an unrecognised key
+        // someone added by hand survives until the next real settings change, as it always has.
+        if deepseek.pricing == nil {
+            deepseek.pricing = ReviewerName.deepseek.defaultPricing
+        }
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
         includeUsageInReview = try values.decodeIfPresent(
             Bool.self,
@@ -532,9 +607,9 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
     var usesEffortSetting: Bool { self != .deepseek }
 
     /// Whether the reviewer tells us what it spent. Claude's CLI reports both tokens and a
-    /// dollar figure under `--output-format json`; DeepSeek's API reports tokens, though never a
-    /// price; Codex and opencode print the review and nothing else, so there is no usage envelope
-    /// to read.
+    /// dollar figure under `--output-format json`; DeepSeek's API reports tokens only, so its
+    /// cost is derived from configured prices; Codex and opencode print the review and nothing
+    /// else, so there is no usage envelope to read.
     var reportsTokenUsage: Bool {
         switch self {
         case .claude: true
@@ -543,6 +618,24 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
         case .deepseek: true
         }
     }
+
+    /// The rates a reviewer starts with, and `nil` for one that needs none — a CLI that reports
+    /// its own dollar figure, or one that reports no usage at all.
+    ///
+    /// It lives on the case rather than in the settings view so that a second provider priced
+    /// this way cannot be given DeepSeek's rates by a Reset button that was only ever written
+    /// for DeepSeek.
+    var defaultPricing: TokenPricing? {
+        switch self {
+        case .claude: nil
+        case .codex: nil
+        case .opencode: nil
+        case .deepseek: .deepSeekDefault
+        }
+    }
+
+    /// True when cost can only be computed from `ReviewerConfiguration.pricing`.
+    var needsConfiguredPricing: Bool { defaultPricing != nil }
 
     var efforts: [ReviewEffort] {
         switch self {

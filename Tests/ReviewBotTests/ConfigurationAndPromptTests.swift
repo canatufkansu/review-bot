@@ -280,6 +280,17 @@ final class ConfigurationAndPromptTests: XCTestCase {
         // opencode print the review and nothing else, so claiming otherwise would promise the
         // usage report a figure nothing collects.
         XCTAssertEqual(ReviewerName.allCases.map(\.reportsTokenUsage), [true, false, false, true])
+        XCTAssertEqual(
+            ReviewerName.allCases.map(\.needsConfiguredPricing),
+            [false, false, false, true],
+            "only a provider that reports tokens but no price needs configured rates"
+        )
+        // The rates belong to the case, not to the settings row: a Reset button written against
+        // a hardcoded `.deepSeekDefault` would hand a second such provider DeepSeek's prices.
+        XCTAssertEqual(
+            ReviewerName.allCases.map(\.defaultPricing),
+            [nil, nil, nil, .deepSeekDefault]
+        )
         XCTAssertEqual(ReviewerName.allCases.map(\.usesEffortSetting), [true, true, true, false])
 
         for reviewer in ReviewerName.allCases {
@@ -326,6 +337,26 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertNil(neither.costUSD, "two unknowns must stay unknown, not become $0.00")
     }
 
+    func testPricingChargesCachedInputAtItsOwnRate() {
+        let pricing = TokenPricing(
+            inputPerMillion: 1,
+            cachedInputPerMillion: 0.25,
+            outputPerMillion: 4
+        )
+        let usage = TokenUsage(
+            inputTokens: 1_000_000,
+            cachedInputTokens: 1_000_000,
+            outputTokens: 1_000_000
+        )
+
+        XCTAssertEqual(pricing.cost(for: usage) ?? 0, 5.25, accuracy: 0.0001)
+        XCTAssertNil(
+            TokenPricing(inputPerMillion: 0, cachedInputPerMillion: 0, outputPerMillion: 0)
+                .cost(for: usage),
+            "an unpriced model reports no cost rather than free"
+        )
+    }
+
     func testCostFormattingKeepsSmallAmountsLegible() {
         XCTAssertEqual(TokenUsage(costUSD: 0.006453).costSummary, "$0.0065")
         XCTAssertEqual(TokenUsage(costUSD: 12.5).costSummary, "$12.50")
@@ -348,6 +379,77 @@ final class ConfigurationAndPromptTests: XCTestCase {
         )
 
         XCTAssertTrue(configuration.includeUsageInReview)
+        XCTAssertEqual(configuration.deepseek.pricing, .deepSeekDefault)
+        XCTAssertNil(configuration.claude.pricing, "Claude's CLI reports its own cost")
+    }
+
+    func testDeepSeekPricingIsBackfilledForConfigsWrittenBeforeItExisted() throws {
+        // A real config saved by the build that added DeepSeek but not pricing. Leaving `pricing`
+        // nil meant cost could never be reported, while the settings panel still displayed the
+        // default rates — so it looked configured and silently was not.
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high", "authMode": "session" },
+          "codex": { "enabled": false, "model": "codex", "effort": "high", "authMode": "session" },
+          "deepseek": { "enabled": true, "model": "deepseek-chat", "effort": "high", "authMode": "apiKey" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.deepseek.pricing, .deepSeekDefault)
+        XCTAssertNotNil(
+            configuration.deepseek.pricing?.cost(
+                for: TokenUsage(inputTokens: 1_000_000)
+            )
+        )
+    }
+
+    func testExplicitlyZeroedPricingIsNotOverwrittenByTheBackfill() throws {
+        // Zero rates are a deliberate "tokens only" choice, not a missing value.
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "high" },
+          "deepseek": {
+            "enabled": true, "model": "deepseek-chat", "effort": "high", "authMode": "apiKey",
+            "pricing": { "inputPerMillion": 0, "cachedInputPerMillion": 0, "outputPerMillion": 0 }
+          },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.deepseek.pricing, .unpriced)
+    }
+
+    func testRateParsingAcceptsEitherDecimalSeparator() {
+        // Providers publish `0.27`; a comma-decimal locale would read that pasted value as 27,
+        // overstating spend a hundredfold.
+        XCTAssertEqual(TokenPricing.parseRate("0.27"), 0.27)
+        XCTAssertEqual(TokenPricing.parseRate("0,27"), 0.27)
+        XCTAssertEqual(TokenPricing.parseRate(" 1,1 "), 1.1)
+        XCTAssertEqual(TokenPricing.parseRate("0"), 0)
+
+        XCTAssertNil(TokenPricing.parseRate(""))
+        XCTAssertNil(TokenPricing.parseRate("abc"))
+        XCTAssertNil(TokenPricing.parseRate("-1"), "a negative rate would credit spend")
+    }
+
+    func testRateRenderingAlwaysUsesADot() {
+        XCTAssertEqual(TokenPricing.renderRate(0.27), "0.27")
+        XCTAssertEqual(TokenPricing.renderRate(1.1), "1.1")
+        XCTAssertEqual(TokenPricing.renderRate(0), "0")
     }
 
     func testLastReviewedStoreRoundTripsHeadPerPullRequest() throws {
