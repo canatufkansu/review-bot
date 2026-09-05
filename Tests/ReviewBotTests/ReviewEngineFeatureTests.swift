@@ -553,6 +553,74 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(usedGhDiff, "First review of a PR should use the full PR diff")
     }
 
+    func testADiffTooLargeForTheAPIIsComputedFromTheCloneInstead() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(ghPrDiffFails: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let posts = await runner.postCount()
+        let range = await runner.localDiffInvocation()
+        let patch = await runner.preparedDiffDuringReview()
+
+        // GitHub refuses the diff of any pull request over 20,000 lines with a 406. Nothing about
+        // that is retryable and nothing about it is the pull request's fault, so the review has to
+        // continue on the copy already in the clone rather than burn the failure budget.
+        XCTAssertEqual(
+            range,
+            "trackedbaseoid00...1234567890abcdef",
+            "The fallback must diff the freshly fetched base against the head, three-dot, which is "
+                + "the same range `gh pr diff` asks the API to render"
+        )
+        XCTAssertEqual(
+            patch,
+            "diff --git a/huge.swift b/huge.swift\n+let fromTheClone = 1\n",
+            "The reviewers must read the locally computed patch, not an empty or stale one"
+        )
+        XCTAssertEqual(posts, 1, "The review should post exactly as it would have via the API")
+        XCTAssertEqual(events.last?.kind, .approved)
+        XCTAssertFalse(
+            events.contains { $0.kind == .failed },
+            "An API ceiling the fallback absorbed is not a failure and must not be recorded as one"
+        )
+    }
+
+    func testTheReviewOnlyFailsWhenTheCloneCannotProduceTheDiffEither() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(ghPrDiffFails: true, localDiffFails: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let posts = await runner.postCount()
+        let failure = try XCTUnwrap(events.last { $0.kind == .failed })
+
+        XCTAssertEqual(posts, 0, "With no diff at all there is nothing to review, so nothing is posted")
+        // The message has to name both routes. Reporting only the 406 sent someone looking at
+        // GitHub's limits when the actual reason the review stopped was the clone.
+        XCTAssertTrue(
+            failure.message.contains("Could not download the PR diff"),
+            "Expected the API failure to be reported, got: \(failure.message)"
+        )
+        XCTAssertTrue(
+            failure.message.contains("local clone"),
+            "Expected the fallback's failure to be reported too, got: \(failure.message)"
+        )
+    }
+
     // MARK: - Per-reviewer credentials
 
     func testAPIKeyAuthInjectsTheSavedKeyIntoTheReviewerProcess() async throws {
@@ -1967,9 +2035,16 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var postArgument = ""
     private var claudePrompt = ""
     private var preparedDiffSeen = false
+    /// The patch the reviewer actually read, so a test can tell which route produced it.
+    private var preparedDiffText: String?
     private var ghPrDiffCalled = false
     private var timelineCalls = 0
     private var incrementalDiffArgs: [String]?
+    private let ghPrDiffFails: Bool
+    private let localDiffFails: Bool
+    /// The revision range the local three-dot fallback asked for, so a test can prove it diffed
+    /// the fetched base against the head rather than some other pair of commits.
+    private var localDiffRange: String?
     /// The merge preview as the reviewer saw it, captured at the moment `claude` was invoked —
     /// non-`nil` only when the file was actually present in the worktree by then.
     private var mergePreviewText: String?
@@ -2040,6 +2115,12 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// What `rev-parse refs/remotes/origin/main` resolves to. `nil` makes it fail the way git
         /// does for an unresolvable ref, which is the only case that may fall back to the snapshot.
         trackedBaseOid: String? = "trackedbaseoid00",
+        /// Makes `gh pr diff` fail the way GitHub's API does for a pull request whose diff exceeds
+        /// its 20,000-line ceiling: an HTTP 406 that no number of retries can get past.
+        ghPrDiffFails: Bool = false,
+        /// Makes the local `git diff base...head` fallback fail too, so the compound failure can
+        /// be distinguished from the API failure the fallback is supposed to absorb.
+        localDiffFails: Bool = false,
         spawnClock: ReviewerSpawnClock? = nil
     ) {
         self.spawnClock = spawnClock
@@ -2061,6 +2142,8 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.claudeFailingRuns = claudeFailingRuns
         self.baseCommitsAhead = baseCommitsAhead
         self.trackedBaseOid = trackedBaseOid
+        self.ghPrDiffFails = ghPrDiffFails
+        self.localDiffFails = localDiffFails
     }
 
     /// Must not be deleted in favour of the four-argument form below. `CommandRunning` supplies
@@ -2170,12 +2253,30 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: "diff --git a/shared.swift b/shared.swift\n+let addedOnBase = 1\n")
         }
 
+        // Must precede the incremental branch below: the fallback is also a `git diff`, and the
+        // three-dot range is the only thing that tells them apart. Matching the other way round
+        // would answer the fallback with the incremental stub and quietly pass.
+        if executable == "git", arguments.contains("diff"),
+           let range = arguments.first(where: { $0.contains("...") }) {
+            localDiffRange = range
+            if localDiffFails {
+                return result(exitCode: 128, stderr: "fatal: bad revision")
+            }
+            return result(stdout: "diff --git a/huge.swift b/huge.swift\n+let fromTheClone = 1\n")
+        }
         if executable == "git", arguments.contains("diff") {
             incrementalDiffArgs = arguments
             return result(stdout: "diff --git a/incremental.swift b/incremental.swift\n")
         }
         if executable == "gh", arguments.starts(with: ["pr", "diff", "42"]) {
             ghPrDiffCalled = true
+            if ghPrDiffFails {
+                return result(
+                    exitCode: 1,
+                    stderr: "could not find pull request diff: HTTP 406: Sorry, the diff exceeded "
+                        + "the maximum number of lines (20000)"
+                )
+            }
             return result(stdout: "diff --git a/a.swift b/a.swift\n")
         }
         if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
@@ -2207,6 +2308,10 @@ private actor ReviewWorkflowMock: CommandRunning {
             if let currentDirectory {
                 preparedDiffSeen = FileManager.default.fileExists(
                     atPath: currentDirectory.appendingPathComponent(".review-bot-diff.patch").path
+                )
+                preparedDiffText = try? String(
+                    contentsOf: currentDirectory.appendingPathComponent(".review-bot-diff.patch"),
+                    encoding: .utf8
                 )
                 mergePreviewText = try? String(
                     contentsOf: currentDirectory.appendingPathComponent(".review-bot-merge.md"),
@@ -2307,10 +2412,12 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastPostArgument() -> String { postArgument }
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
+    func preparedDiffDuringReview() -> String? { preparedDiffText }
     func mergePreviewDuringReview() -> String? { mergePreviewText }
     func fetchInvocation() -> [String]? { fetchArgs }
     func revParseInvocation() -> [String]? { revParseArgs }
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
+    func localDiffInvocation() -> String? { localDiffRange }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
 

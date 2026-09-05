@@ -30,6 +30,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - **`config.json` survives a reviewer entry with missing fields.** Recording the sign-in mode meant giving each reviewer's settings a defensive decoder, so a hand-edited or truncated reviewer object no longer throws the whole file away and resets every other setting with it; anything it omits falls back instead — including the model, which falls back to the shipped default rather than an empty string no CLI could run.
 - Documented why macOS re-asks for your login password to read a saved key after a rebuild, and what actually fixes it. Each Keychain item records the saving app's identity, and without a signing identity that record is the binary's hash, so every rebuild reads as a different app. Only a Developer ID (`CODE_SIGN_IDENTITY="Developer ID Application: …" make app`) makes it stable. Two cheaper approaches were measured and **both fail**, so `CredentialStore.swift` carries a note against retrying them: a permissive item ACL (an independent partition-list check still refuses the rebuilt binary) and a self-signed certificate (fixes the ACL requirement, but the partition list still falls back to the binary hash for want of a team id).
 
+### Fixed
+
+- **A pull request too large for GitHub's diff API is now reviewed from the local clone.** `gh pr diff` answers anything over 20,000 lines with an HTTP 406, which is a property of the API rather than of the pull request — so the review failed, retried, and burned its whole failure budget on a condition no retry could ever get past. Review Bot already fetches both the pull request head and its base branch before the review starts, so the same three-dot diff is now computed locally when the API refuses, with no line ceiling. `git diff base...head` is exactly what `gh pr diff` asks the API to render, so reviewers cannot tell which route produced the patch; a review only fails now if the clone cannot produce the diff either, and the message says so rather than pointing at GitHub's limit alone.
+
 ## [0.1.15] - 2026-08-27
 
 ### Changed

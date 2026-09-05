@@ -738,10 +738,21 @@ actor ReviewEngine {
                 arguments: ["pr", "diff", String(number), "--repo", repository.githubSlug],
                 timeout: 120
             )
-            guard diff.succeeded else {
-                throw ReviewEngineError.commandFailed("Could not download the PR diff: \(conciseError(diff))")
+            if diff.succeeded {
+                diffText = diff.stdout
+            } else if let local = await localDiffText(repository: repository, metadata: metadata) {
+                // GitHub's diff endpoint refuses anything over 20,000 lines with a 406, which is a
+                // property of the API rather than of the pull request: the commits are already in
+                // the clone, so the same three-dot diff computes locally with no ceiling. Falling
+                // back is strictly better than failing, and it is not a lesser answer — `git diff
+                // base...head` is exactly what `gh pr diff` asks the API to render.
+                diffText = local
+            } else {
+                throw ReviewEngineError.commandFailed(
+                    "Could not download the PR diff: \(conciseError(diff)); computing it from the "
+                        + "local clone did not work either."
+                )
             }
-            diffText = diff.stdout
         }
         try Data(diffText.utf8).write(
             to: worktree.appendingPathComponent(".review-bot-diff.patch"),
@@ -940,6 +951,43 @@ actor ReviewEngine {
             timeout: 120
         )
         guard let diff, diff.succeeded else { return nil }
+        return diff.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : diff.stdout
+    }
+
+    /// The pull request's three-dot diff computed from the clone instead of the API, or `nil` when
+    /// the base cannot be resolved locally.
+    ///
+    /// `review` has already fetched both sides — the PR head and
+    /// `refs/remotes/origin/<baseRefName>` — so this needs no network. `base...head` is git's own
+    /// spelling of "merge-base to head", which is the same diff `gh pr diff` renders, so a reviewer
+    /// cannot tell which route produced the patch it reads.
+    private func localDiffText(
+        repository: RepositoryConfiguration,
+        metadata: PullRequestMetadata
+    ) async -> String? {
+        func git(_ arguments: [String], timeout: Int = 120) async -> CommandResult? {
+            try? await runner.run("git", arguments: ["-C", repository.path] + arguments, timeout: timeout)
+        }
+
+        // Same rule as `mergePreview`: prefer the ref that was just fetched over `baseRefOid`,
+        // which is GitHub's snapshot of the base at the time it answered and may be stale.
+        let tracked = await git([
+            "rev-parse", "--verify", "--quiet",
+            "refs/remotes/origin/\(metadata.baseRefName)^{commit}",
+        ])
+        let base = tracked.flatMap { result -> String? in
+            guard result.succeeded else { return nil }
+            let oid = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            return oid.isEmpty ? nil : oid
+        } ?? metadata.baseRefOid
+
+        guard let diff = await git(["diff", "\(base)...\(metadata.headRefOid)"]), diff.succeeded
+        else { return nil }
+
+        // An empty patch is a real answer for a pull request that changes nothing, but it is also
+        // what a silently wrong revision range produces. Since this path only runs after the API
+        // already refused, treat empty as failure rather than sending reviewers an empty diff and
+        // letting them approve it.
         return diff.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : diff.stdout
     }
 
