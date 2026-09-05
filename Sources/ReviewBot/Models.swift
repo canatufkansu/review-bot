@@ -415,6 +415,10 @@ enum ReviewerFailureClass: Equatable {
             "please run `codex login`",
             "please run `claude login`",
             "credit balance is too low",
+            // A reviewer that reported it could not assess the pull request. Not a provider
+            // failure at all — the call succeeded — but a second call re-reads the same
+            // unreadable evidence and reaches the same conclusion.
+            "could not assess this pull request",
         ]
         return terminalMarkers.contains { haystack.contains($0) } ? .terminal : .transient
     }
@@ -435,6 +439,14 @@ struct ReviewerResult: Equatable {
     var failureClass: ReviewerFailureClass? {
         guard let failure else { return nil }
         return ReviewerFailureClass.classify(failure)
+    }
+
+    /// Whether this reviewer withdrew its own verdict by reporting it could not assess the pull
+    /// request. Distinct from a failure: the call succeeded and the reviewer answered honestly,
+    /// which is why a panel of nothing but these is still worth posting — the author is told why
+    /// no review happened instead of being left with silence.
+    var couldNotAssess: Bool {
+        verdict == nil && (failure?.contains("could not assess this pull request") ?? false)
     }
 
     /// Whether running this reviewer again right now is worth the wall time: a crash,

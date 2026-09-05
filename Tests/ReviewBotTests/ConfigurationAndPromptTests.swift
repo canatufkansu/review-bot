@@ -274,4 +274,54 @@ final class ConfigurationAndPromptTests: XCTestCase {
         )
         XCTAssertEqual(restored.claude.timeoutMinutes, 45)
     }
+
+    // MARK: - Reviews that assess nothing
+
+    func testAReviewThatSaysItCouldNotAssessIsRecognisedInTheWordingModelsUse() {
+        let saidSo = [
+            "This PR could not be reviewed: the diff is not readable.",
+            "## Merge gate\nUnable to assess.",
+            "I could not review this pull request without the diff.",
+            "I have no basis to certify the PR as mergeable.",
+            "The gate cannot be meaningfully determined from the evidence available.",
+        ]
+        for body in saidSo {
+            XCTAssertTrue(
+                VerdictParser.statesItCouldNotAssess(body),
+                "should have been recognised: \(body)"
+            )
+        }
+    }
+
+    func testOrdinaryReviewProseIsNotMistakenForAnInabilityToAssess() {
+        // The expensive mistake in the other direction: a real review whose findings happen to
+        // use the same verbs would have its verdict thrown away and the pull request left
+        // unreviewed, which is exactly the outcome this check exists to prevent.
+        let ordinaryReviews = [
+            "## Summary\nThe migration could not be verified against production data, so I flagged it.",
+            "This change could not have caused the regression described in the thread.",
+            "I reviewed the diff and found two blocking issues.",
+            "The author could not reproduce the failure, but the added test covers it.",
+            "## Summary\nLooks safe.",
+        ]
+        for body in ordinaryReviews {
+            XCTAssertFalse(
+                VerdictParser.statesItCouldNotAssess(body),
+                "should NOT have been recognised: \(body)"
+            )
+        }
+    }
+
+    func testAWithdrawnVerdictClassifiesAsTerminalSoItIsNotRetried() {
+        let withdrawn = ReviewerResult(
+            reviewer: .claude,
+            model: "claude-opus-5",
+            output: "",
+            verdict: nil,
+            failure: "reported that it could not assess this pull request, so its verdict was not counted"
+        )
+        XCTAssertTrue(withdrawn.couldNotAssess)
+        XCTAssertEqual(withdrawn.failureClass, .terminal)
+        XCTAssertFalse(withdrawn.isWorthRetrying)
+    }
 }

@@ -553,6 +553,81 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(usedGhDiff, "First review of a PR should use the full PR diff")
     }
 
+    func testAReviewerThatCouldNotAssessDoesNotProduceAnApproval() async throws {
+        let fixture = try FeatureFixture()
+        // The shape that made this necessary: the reviewer reports it never read the diff, then
+        // signs off with a permissive verdict because the contract demands one. Read literally
+        // that is an approval on a pull request nobody looked at.
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .nitsOnly,
+            claudeBody: "This PR could not be reviewed: the diff could not be opened.\n\n"
+                + "## Merge gate\nUnable to assess."
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        let postCount = await runner.postCount()
+
+        XCTAssertNotEqual(postArgument, "--approve", "an unread pull request must never be approved")
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertNotEqual(events.last?.kind, .approved)
+        // Silence is the other wrong answer: the author would wait out the whole failure budget
+        // and never be told why no review arrived.
+        XCTAssertEqual(postCount, 1, "the reason has to reach the pull request")
+        XCTAssertTrue(
+            postedBody.contains("No reviewer was able to assess this pull request"),
+            postedBody
+        )
+        XCTAssertTrue(postedBody.contains("could not assess the pull request"), postedBody)
+        // The reviewer's own account is the entire value of this comment, so it must be shown.
+        XCTAssertTrue(postedBody.contains("the diff could not be opened"), postedBody)
+    }
+
+    func testAReviewerThatCouldNotAssessIsNotRunAgainInsideTheSameReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeVerdict: .clean, claudeBody: "Unable to assess.")
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        await engine.poll(configuration: fixture.configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        // Withdrawing the verdict leaves the result looking like "no verdict", which is normally
+        // retried in place. It must not be here: the second pass re-reads the same unreadable
+        // evidence and reaches the same conclusion.
+        let claudeRuns = await runner.claudeCount()
+        XCTAssertEqual(claudeRuns, 1, "a reviewer that reported it could not assess must not be re-run")
+    }
+
+    func testASurvivingReviewerStillDecidesWhenTheOtherCouldNotAssess() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            claudeBody: "Unable to assess."
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        // The withdrawn verdict must not dilute the reviewer that did the work — a CLEAN that was
+        // never earned used to be able to straddle the gate and trigger a reconciliation.
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertTrue(postedBody.contains("Partial panel"), postedBody)
+        XCTAssertTrue(postedBody.contains("could not assess the pull request"), postedBody)
+    }
+
     func testADiffTooLargeForTheAPIIsComputedFromTheCloneInstead() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(ghPrDiffFails: true)
