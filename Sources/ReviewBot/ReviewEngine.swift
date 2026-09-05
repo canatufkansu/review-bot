@@ -1091,7 +1091,7 @@ actor ReviewEngine {
                     "--output-format", "text",
                 ],
                 currentDirectory: worktree,
-                timeout: 900
+                timeout: configuration.timeoutSeconds
             )
             guard result.succeeded else {
                 return failedReviewer(.claude, configuration, message: conciseError(result))
@@ -1127,7 +1127,7 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
-                timeout: 900
+                timeout: configuration.timeoutSeconds
             )
             guard result.succeeded,
                   let output = try? String(contentsOf: outputFile, encoding: .utf8) else {
@@ -1175,7 +1175,7 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
-                timeout: 900,
+                timeout: configuration.timeoutSeconds,
                 environment: [
                     "OPENCODE_CONFIG_DIR": paths.opencodeConfigDirectory.path,
                     "OPENCODE_CONFIG_CONTENT": permissions,

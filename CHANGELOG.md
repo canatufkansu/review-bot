@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Added
+
+- **Reviewer time limits are configurable.** Every reviewer was fixed at 15 minutes, and a pull request that ran over produced nothing at all — the reviewer was cut off at exactly 900 seconds and the panel shrank to whoever else finished. Each reviewer card now carries a **Time limit** stepper (1–240 minutes, default 15). It is per reviewer rather than global so raising one to finish a large diff does not silently raise the rest, and decoding clamps the value, since this one bounds a running process.
+
 ## [0.1.15] - 2026-08-27
 
 ### Changed

@@ -231,4 +231,47 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("do not average them, and do not defer to the strictest by default"))
         XCTAssertTrue(prompt.contains("absence of evidence, not agreement"))
     }
+
+    // MARK: - Reviewer time limit
+
+    func testTheTimeLimitDefaultsToWhatEveryReviewerUsedBeforeItWasConfigurable() throws {
+        let json = #"{"claude":{"enabled":true,"model":"claude-opus-5","effort":"high"}}"#
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(configuration.claude.timeoutMinutes, 15)
+        XCTAssertEqual(configuration.claude.timeoutSeconds, 900)
+    }
+
+    func testAnOutOfRangeTimeLimitIsClampedRatherThanObeyed() throws {
+        // This one bounds a running process, so a hand-edited `0` would cut every review off
+        // before it began and a stray `100000` would pin a reviewer for weeks.
+        let json = #"""
+        {"claude":{"enabled":true,"model":"m","effort":"high","timeoutMinutes":0},
+         "codex":{"enabled":true,"model":"m","effort":"high","timeoutMinutes":100000}}
+        """#
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(
+            configuration.claude.timeoutMinutes,
+            ReviewerConfiguration.timeoutMinutesRange.lowerBound
+        )
+        XCTAssertEqual(
+            configuration.codex.timeoutMinutes,
+            ReviewerConfiguration.timeoutMinutesRange.upperBound
+        )
+    }
+
+    func testTheTimeLimitSurvivesARoundTrip() throws {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.timeoutMinutes = 45
+        let restored = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: JSONEncoder().encode(configuration)
+        )
+        XCTAssertEqual(restored.claude.timeoutMinutes, 45)
+    }
 }

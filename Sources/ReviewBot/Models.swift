@@ -43,6 +43,58 @@ struct ReviewerConfiguration: Codable, Equatable {
     var enabled: Bool
     var model: String
     var effort: ReviewEffort
+    /// How long this reviewer may spend on one review before it is cut off.
+    ///
+    /// Per reviewer rather than global because a large pull request does not cost each of them
+    /// the same, and because raising one to finish a 200-file diff should not silently raise the
+    /// rest. The default is what every reviewer used before this was configurable.
+    var timeoutMinutes: Int
+
+    static let defaultTimeoutMinutes = 15
+    /// Below a minute nothing finishes; the upper bound is a guard against a typo pinning a
+    /// reviewer for a day.
+    static let timeoutMinutesRange = 1...240
+
+    /// The timeout as `ProcessRunner` wants it.
+    var timeoutSeconds: Int { timeoutMinutes * 60 }
+
+    init(
+        enabled: Bool,
+        model: String,
+        effort: ReviewEffort,
+        timeoutMinutes: Int = ReviewerConfiguration.defaultTimeoutMinutes
+    ) {
+        self.enabled = enabled
+        self.model = model
+        self.effort = effort
+        self.timeoutMinutes = Self.clampedTimeout(timeoutMinutes)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case model
+        case effort
+        case timeoutMinutes
+    }
+
+    /// Defensive, like the rest of the configuration: a reviewer entry written before this field
+    /// existed — or edited by hand into nonsense — must not throw the whole file away.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        model = try values.decodeIfPresent(String.self, forKey: .model) ?? ""
+        effort = try values.decodeIfPresent(ReviewEffort.self, forKey: .effort) ?? .high
+        // Clamped rather than trusted: this one bounds a running process, and a `0` would cut
+        // every review off before it started.
+        timeoutMinutes = Self.clampedTimeout(
+            try values.decodeIfPresent(Int.self, forKey: .timeoutMinutes)
+                ?? Self.defaultTimeoutMinutes
+        )
+    }
+
+    private static func clampedTimeout(_ minutes: Int) -> Int {
+        min(max(minutes, timeoutMinutesRange.lowerBound), timeoutMinutesRange.upperBound)
+    }
 }
 
 struct RepositoryConfiguration: Codable, Equatable, Identifiable {
