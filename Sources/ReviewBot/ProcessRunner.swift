@@ -9,6 +9,11 @@ struct CommandResult {
     var succeeded: Bool { exitCode == 0 }
 }
 
+/// Changes applied on top of the inherited environment. A `nil` value removes the variable,
+/// which is how a reviewer configured for session auth is kept from silently picking up an
+/// API key that happens to be exported in the developer's shell.
+typealias EnvironmentOverrides = [String: String?]
+
 protocol CommandRunning {
     func run(
         _ executable: String,
@@ -17,15 +22,17 @@ protocol CommandRunning {
         timeout: Int
     ) async throws -> CommandResult
 
-    /// Runs a command with extra environment variables merged over the process
-    /// environment. A default implementation is provided in an extension, so
-    /// mocks that only implement the environment-free variant keep working.
+    /// Runs a command with per-command changes applied to the process environment. A `nil`
+    /// value removes the variable (see `EnvironmentOverrides`), which is how a reviewer
+    /// configured for session auth is kept from inheriting an exported API key. A default
+    /// implementation is provided in an extension, so mocks that only implement the
+    /// environment-free variant keep working.
     func run(
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
-        timeout: Int,
-        environment: [String: String]?
+        environment: EnvironmentOverrides,
+        timeout: Int
     ) async throws -> CommandResult
 }
 
@@ -43,12 +50,14 @@ extension CommandRunning {
         )
     }
 
+    /// Runners that do not care about the environment (test doubles, mainly) inherit this and
+    /// behave exactly as they did before environment overrides existed.
     func run(
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
-        timeout: Int,
-        environment: [String: String]?
+        environment: EnvironmentOverrides,
+        timeout: Int
     ) async throws -> CommandResult {
         try await run(
             executable,
@@ -61,32 +70,83 @@ extension CommandRunning {
 
 enum CommandExecutionError: LocalizedError {
     case timedOut(command: String, seconds: Int)
+    /// The command names nothing that can be started: not on `PATH`, or on `PATH` only as a
+    /// launcher this app refuses to run through a shell (see `NpmShim`).
+    case notFound(command: String, detail: String)
+    /// The OS refused to start the process at all.
+    case launchFailed(command: String, detail: String)
 
     var errorDescription: String? {
         switch self {
         case let .timedOut(command, seconds):
             "Command timed out after \(seconds) seconds: \(command)"
+        case let .notFound(command, detail):
+            "Command not found: \(command) — \(detail)"
+        case let .launchFailed(command, detail):
+            "Could not start \(command): \(detail)"
         }
     }
+}
+
+/// What one platform's launcher reports back: the exit status, or that the time limit fired.
+struct LaunchOutcome {
+    var exitCode: Int32
+    var timedOut: Bool
+    /// Anything the launcher knows about an abnormal end that the exit code alone hides — a
+    /// Windows exception status, say. Surfaced in place of an empty stderr, so a process that
+    /// died without a word still leaves a diagnosis in the log.
+    var detail: String? = nil
+}
+
+/// The pieces of process launching that differ between macOS and Windows. Each platform
+/// folder provides `PlatformProcess` with exactly these members; the core never touches an
+/// OS API for processes itself.
+///
+/// - `augmentedPATH` — the `PATH` every child inherits. On macOS the login shell is probed for
+///   the real one, since a Finder-launched app starts with launchd's; on Windows the user's
+///   `Path` is already complete, and common installer directories are appended.
+/// - `launch` — starts `executable` under a hard time limit and waits for it. The core
+///   passes an already-composed environment and the files the output streams go to, so the
+///   launcher's only job is the OS-specific part: how the limit is enforced (`perl alarm` on
+///   macOS, a job object on Windows), how the command is resolved (`env` on macOS, a
+///   `PATH`/`PATHEXT` search plus npm shim unwrapping on Windows), and how the child's
+///   standard handles are wired to those files.
+/// - `locate` — where `command` would resolve to, or `nil`, for the tool-availability panel.
+protocol PlatformProcessLaunching {
+    static var augmentedPATH: String { get }
+    static func launch(
+        executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        stdout: URL,
+        stderr: URL,
+        timeout: Int
+    ) throws -> LaunchOutcome
+    static func locate(_ command: String) -> String?
 }
 
 struct ProcessRunner: CommandRunning {
     private let fileManager = FileManager.default
 
-    /// The `PATH` every spawned command inherits. A Finder- or launch-at-login-started app
-    /// inherits launchd's minimal environment (often just `/usr/bin:/bin:/usr/sbin:/sbin`),
-    /// so CLIs installed by a version manager (nvm, mise, volta, fnm, asdf) are unreachable.
-    /// We ask the login+interactive shell for its real `PATH` once, then fall back to a fixed
-    /// list of common install dirs and the inherited value. Computed lazily, exactly once.
-    static let augmentedPath: String = composePATH(
-        shellPath: loginShellPATH(),
-        inherited: ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin",
-        home: FileManager.default.homeDirectoryForCurrentUser.path
-    )
+    /// The `PATH` every spawned command inherits. See `PlatformProcessLaunching.augmentedPATH`
+    /// for what each platform does to recover it. Computed lazily, exactly once.
+    static let augmentedPath: String = PlatformProcess.augmentedPATH
+
+    /// The platform's list separator inside `PATH`: `:` on macOS, `;` on Windows.
+    static var pathListSeparator: String {
+        #if os(Windows)
+        ";"
+        #else
+        ":"
+        #endif
+    }
 
     /// Merges the login-shell `PATH` (if any), a fixed list of common install directories, and
     /// the inherited `PATH` into a single ordered, de-duplicated `PATH`. Pure so it can be tested
-    /// without spawning a shell.
+    /// without spawning a shell. This is the Unix shape — colon-separated, Homebrew and the
+    /// npm-global prefix — and the one the macOS launcher uses; `WindowsCommandResolution`
+    /// carries the Windows equivalent.
     static func composePATH(shellPath: String?, inherited: String, home: String) -> String {
         let preferredPaths = [
             "/opt/homebrew/bin",
@@ -117,81 +177,46 @@ struct ProcessRunner: CommandRunning {
     ///
     /// `OLDPWD` is dropped rather than corrected: it describes a `cd` this process never made, and
     /// there is no honest value for it here.
+    ///
+    /// Overrides are applied last, so a caller can deliberately override even `PATH` or `PWD`. An
+    /// override whose value is `nil` removes the variable outright, which is what unsets an
+    /// inherited API key for a reviewer running under session auth.
+    ///
+    /// Variable names are matched case-insensitively on Windows, where the inherited block spells
+    /// the path `Path`: writing `PATH` beside it would hand the child two entries and leave the OS
+    /// to pick one. On macOS names are case-sensitive and compared exactly, as they always were.
     static func composeEnvironment(
         inherited: [String: String],
         path: String,
         workingDirectory: String,
-        overrides: [String: String]?
+        overrides: EnvironmentOverrides
     ) -> [String: String] {
         var environment = inherited
-        environment["PATH"] = path
-        environment["PWD"] = workingDirectory
-        environment.removeValue(forKey: "OLDPWD")
-        for (key, value) in overrides ?? [:] {
-            environment[key] = value
+        set(&environment, "PATH", to: path)
+        set(&environment, "PWD", to: workingDirectory)
+        set(&environment, "OLDPWD", to: nil)
+        for (key, value) in overrides {
+            set(&environment, key, to: value)
         }
         return environment
     }
 
-    /// Asks the user's login+interactive shell for its `PATH`, or `nil` if the probe fails.
-    /// Uses `-i -l` so rc files that initialise version managers (commonly `~/.zshrc`) are sourced,
-    /// wraps the shell in the same `perl alarm` timeout used for reviews so a hanging rc file can't
-    /// stall startup, and emits the value behind a sentinel so a chatty rc banner can't corrupt it.
-    private static func loginShellPATH() -> String? {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        let sentinel = "__REVIEWBOT_PATH__:"
-        let script = "printf '%s%s\\n' '\(sentinel)' \"$PATH\""
-        guard let output = captureStdout(
-            "/usr/bin/perl",
-            arguments: [
-                "-e", "alarm shift @ARGV; exec @ARGV or exit 127",
-                "5",
-                shell, "-ilc", script,
-            ]
-        ) else {
-            return nil
-        }
-
-        for line in output.split(separator: "\n", omittingEmptySubsequences: true)
-        where line.hasPrefix(sentinel) {
-            let value = line.dropFirst(sentinel.count).trimmingCharacters(in: .whitespaces)
-            return value.isEmpty ? nil : value
-        }
-        return nil
+    /// Whether two environment variable names refer to the same variable on this platform.
+    static func environmentNamesMatch(_ lhs: String, _ rhs: String) -> Bool {
+        #if os(Windows)
+        lhs.caseInsensitiveCompare(rhs) == .orderedSame
+        #else
+        lhs == rhs
+        #endif
     }
 
-    /// Runs a process to completion and returns its stdout, or `nil` on any failure. Reads stdout
-    /// from a temp file (not a pipe) so a large rc banner can't deadlock, and discards stderr.
-    private static func captureStdout(_ launchPath: String, arguments: [String]) -> String? {
-        let fm = FileManager.default
-        let directory = fm.temporaryDirectory
-            .appendingPathComponent("review-bot-path-\(UUID().uuidString)", isDirectory: true)
-        guard (try? fm.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else {
-            return nil
+    private static func set(_ environment: inout [String: String], _ key: String, to value: String?) {
+        for existing in environment.keys where environmentNamesMatch(existing, key) {
+            environment.removeValue(forKey: existing)
         }
-        defer { try? fm.removeItem(at: directory) }
-
-        let stdoutURL = directory.appendingPathComponent("stdout")
-        fm.createFile(atPath: stdoutURL.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: stdoutURL) else { return nil }
-        defer { try? handle.close() }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: launchPath)
-        process.arguments = arguments
-        process.standardOutput = handle
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
-
-        do {
-            try process.run()
-        } catch {
-            return nil
+        if let value {
+            environment[key] = value
         }
-        process.waitUntilExit()
-        try? handle.synchronize()
-        guard process.terminationStatus == 0 else { return nil }
-        return String(decoding: (try? Data(contentsOf: stdoutURL)) ?? Data(), as: UTF8.self)
     }
 
     func run(
@@ -204,25 +229,25 @@ struct ProcessRunner: CommandRunning {
             executable,
             arguments: arguments,
             currentDirectory: currentDirectory,
-            timeout: timeout,
-            environment: nil
+            environment: [:],
+            timeout: timeout
         )
     }
 
     func run(
         _ executable: String,
-        arguments: [String] = [],
-        currentDirectory: URL? = nil,
-        timeout: Int = 60,
-        environment: [String: String]?
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: EnvironmentOverrides,
+        timeout: Int
     ) async throws -> CommandResult {
         try await Task.detached(priority: .utility) {
             try runSynchronously(
                 executable,
                 arguments: arguments,
                 currentDirectory: currentDirectory,
-                timeout: timeout,
-                environmentOverrides: environment
+                environment: environment,
+                timeout: timeout
             )
         }.value
     }
@@ -231,8 +256,8 @@ struct ProcessRunner: CommandRunning {
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
-        timeout: Int,
-        environmentOverrides: [String: String]? = nil
+        environment overrides: EnvironmentOverrides,
+        timeout: Int
     ) throws -> CommandResult {
         let temporaryDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("review-bot-command-\(UUID().uuidString)", isDirectory: true)
@@ -241,58 +266,44 @@ struct ProcessRunner: CommandRunning {
 
         let stdoutURL = temporaryDirectory.appendingPathComponent("stdout")
         let stderrURL = temporaryDirectory.appendingPathComponent("stderr")
-        fileManager.createFile(atPath: stdoutURL.path, contents: nil)
-        fileManager.createFile(atPath: stderrURL.path, contents: nil)
 
-        let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
-        let stderrHandle = try FileHandle(forWritingTo: stderrURL)
-        defer {
-            try? stdoutHandle.close()
-            try? stderrHandle.close()
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
-        process.arguments = [
-            "-e",
-            "alarm shift @ARGV; exec @ARGV or exit 127",
-            String(timeout),
-            "/usr/bin/env",
-            executable,
-        ] + arguments
-        process.currentDirectoryURL = currentDirectory
-        process.standardOutput = stdoutHandle
-        process.standardError = stderrHandle
-        process.standardInput = FileHandle.nullDevice
-
-        process.environment = Self.composeEnvironment(
+        let environment = Self.composeEnvironment(
             inherited: ProcessInfo.processInfo.environment,
             path: Self.augmentedPath,
-            // `currentDirectory` is what `process.currentDirectoryURL` was just set to, so the two
+            // `currentDirectory` is what the child's working directory is set to, so the two
             // cannot drift; when it is nil the child inherits this process's own directory.
             workingDirectory: currentDirectory?.path ?? fileManager.currentDirectoryPath,
-            overrides: environmentOverrides
+            overrides: overrides
         )
 
-        try process.run()
-        process.waitUntilExit()
-        try? stdoutHandle.synchronize()
-        try? stderrHandle.synchronize()
-
-        let stdout = String(decoding: (try? Data(contentsOf: stdoutURL)) ?? Data(), as: UTF8.self)
-        let stderr = String(decoding: (try? Data(contentsOf: stderrURL)) ?? Data(), as: UTF8.self)
         // Only the executable name is surfaced in errors and results. The argument
         // list can contain the full review prompt (plus any REVIEW.md and custom
         // instructions), which must never leak into a posted review, history, or logs.
         let displayCommand = executable
 
-        if process.terminationReason == .uncaughtSignal, process.terminationStatus == SIGALRM {
+        let outcome = try PlatformProcess.launch(
+            executable: executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            stdout: stdoutURL,
+            stderr: stderrURL,
+            timeout: timeout
+        )
+
+        if outcome.timedOut {
             throw CommandExecutionError.timedOut(command: displayCommand, seconds: timeout)
+        }
+
+        let stdout = String(decoding: (try? Data(contentsOf: stdoutURL)) ?? Data(), as: UTF8.self)
+        var stderr = String(decoding: (try? Data(contentsOf: stderrURL)) ?? Data(), as: UTF8.self)
+        if stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let detail = outcome.detail {
+            stderr = detail
         }
 
         return CommandResult(
             command: displayCommand,
-            exitCode: process.terminationStatus,
+            exitCode: outcome.exitCode,
             stdout: stdout,
             stderr: stderr
         )

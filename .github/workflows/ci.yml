@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build and test
+    name: Build and test (macOS)
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
@@ -24,3 +24,36 @@ jobs:
 
       - name: Test
         run: swift test
+
+  build-and-test-windows:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Swift
+        uses: compnerd/gha-setup-swift@main
+        with:
+          swift-version: swift-6.1.2-release
+          swift-build: 6.1.2-RELEASE
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build
+        run: swift build -v
+
+      - name: Test
+        run: swift test
+
+      - name: Package
+        run: pwsh scripts/build-windows.ps1
+
+      # The installer and the zip from a pull request build, so a change can be tried on a
+      # Windows machine without cutting a release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReviewBot-windows-x64
+          path: |
+            dist/ReviewBot-*-setup.exe
+            dist/ReviewBot-*-windows-x64.zip
