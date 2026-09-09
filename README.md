@@ -101,6 +101,10 @@ If `ReviewBot.exe` fails to start with a missing-DLL error, install the [Microso
 
 CLI availability is shown on the Reviewers tab. Review Bot asks your login shell for its `PATH` at startup — so CLIs installed through a version manager (nvm, mise, volta, fnm, asdf) are found even when the app is launched from Finder or at login — and also searches common Homebrew, local-user, and npm binary directories in addition to the process `PATH`.
 
+## GitHub account
+
+Review Bot never holds a GitHub credential of its own; it uses `gh`. When `gh` is signed in to more than one account (`gh auth login` once per account), **Repositories → Review as** chooses which one Review Bot acts as. Leaving it on *gh's active account* is the original behaviour. Choosing an account scopes every `gh` and `git` call of a poll to that account's token — the review-request search, the fetch, and the posted review — without changing `gh`'s active account or git's credential helper for anything else on the machine. The status line reports the account each poll ran as. If the chosen account is later signed out, polls fail with a status naming it until you sign back in or pick another.
+
 ## Reviewers and credentials
 
 Claude, Codex, and opencode are agents: Review Bot hands each one the prompt and the worktree, and the CLI explores the code itself under its own read-only sandbox.

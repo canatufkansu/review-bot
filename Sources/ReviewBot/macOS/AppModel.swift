@@ -10,6 +10,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var lastCheckDate: Date?
     @Published private(set) var toolAvailability: [String: Bool] = [:]
+    /// The GitHub accounts `gh` is signed in to, for the account picker.
+    @Published private(set) var githubAccounts: GitHubAccounts = .none
     @Published private(set) var reviewersWithSavedKey: Set<ReviewerName> = []
     @Published private(set) var launchAtLoginEnabled: Bool
     @Published private(set) var pendingReviews: [ReviewQueueItem] = []
@@ -94,7 +96,18 @@ final class AppModel: ObservableObject {
             statuses[tool] = result?.succeeded == true
         }
         toolAvailability = statuses
+        githubAccounts = await Self.discoverGitHubAccounts(runner: runner)
         await refreshSavedKeys()
+    }
+
+    /// `gh auth status` lists every signed-in account; it exits non-zero when any of them is
+    /// broken, so the output is parsed whatever the exit code, and read from both streams —
+    /// older `gh` versions print it to stderr.
+    static func discoverGitHubAccounts(runner: any CommandRunning) async -> GitHubAccounts {
+        guard let result = try? await runner.run("gh", arguments: ["auth", "status"], timeout: 20) else {
+            return .none
+        }
+        return GitHubAccounts.parse(result.stdout + "\n" + result.stderr)
     }
 
     /// Whether a reviewer could run right now.

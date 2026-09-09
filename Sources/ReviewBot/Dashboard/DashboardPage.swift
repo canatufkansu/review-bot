@@ -180,6 +180,13 @@ enum DashboardPage {
             <span class="caption" id="lastChecked"></span>
           </div>
           <div class="row">
+            <label class="name">Review as</label>
+            <select id="githubAccount"></select>
+            <button id="refreshAccounts">Refresh accounts</button>
+          </div>
+          <div class="caption">Review requests are found, the pull request is fetched, and the review is posted as this account. Sign <code>gh</code> in to another with <code>gh auth login</code>, then refresh; nothing else on this machine changes.</div>
+          <div class="warn" id="githubAccountWarning" hidden></div>
+          <div class="row">
             <label class="name">At once</label>
             <input type="number" id="maxConcurrent" min="1" max="8" style="width:70px">
             <span id="maxConcurrentLabel"></span>
@@ -446,6 +453,7 @@ enum DashboardPage {
       // ---- config forms ------------------------------------------------------------------
       function renderConfig() {
         $('pollInterval').value = String(config.pollIntervalMinutes);
+        renderAccounts();
         $('maxConcurrent').value = config.maxConcurrentReviews;
         $('maxConcurrentLabel').textContent = config.maxConcurrentReviews === 1 ? 'pull request at a time' : 'pull requests at once';
         $('includeUsage').checked = config.includeUsageInReview;
@@ -474,6 +482,20 @@ enum DashboardPage {
         renderRepositories();
         renderReviewers();
         renderDecisions();
+      }
+
+      function renderAccounts() {
+        const accounts = (snapshot && snapshot.githubAccounts) || { accounts: [], active: null };
+        const configured = config.githubAccount || '';
+        const select = $('githubAccount');
+        let options = '<option value="">' + escapeHTML(accounts.active ? "gh's active account (" + accounts.active + ')' : "gh's active account") + '</option>';
+        accounts.accounts.forEach((name) => { options += '<option value="' + escapeHTML(name) + '">' + escapeHTML(name) + '</option>'; });
+        const missing = configured && !accounts.accounts.includes(configured);
+        if (missing) options += '<option value="' + escapeHTML(configured) + '">' + escapeHTML(configured) + ' (not signed in)</option>';
+        select.innerHTML = options;
+        select.value = configured;
+        $('githubAccountWarning').hidden = !missing;
+        $('githubAccountWarning').textContent = missing ? '⚠ gh is not signed in as ' + configured + '; polls will fail until it is.' : '';
       }
 
       function seg(container, value) {
@@ -725,6 +747,8 @@ enum DashboardPage {
       $('clearHistory').onclick = () => { if (confirm('Clear all activity history?\n\nGenerated review files and detailed logs will remain on disk.')) api('POST', 'history/clear').then(refreshHistory).catch((e) => showError(e.message)); };
       $('quit').onclick = () => { if (confirm('Quit Review Bot? Monitoring stops until you start it again.')) api('POST', 'quit').catch(() => {}); };
       $('launchAtLogin').onchange = () => api('PUT', 'launch-at-login', { enabled: $('launchAtLogin').checked }).then(poll).catch((e) => showError(e.message));
+      $('githubAccount').onchange = () => { config.githubAccount = $('githubAccount').value; queueSave(); renderAccounts(); };
+      $('refreshAccounts').onclick = () => api('POST', 'refresh-tools').then(poll).then(renderAccounts).catch((e) => showError(e.message));
       $('pollInterval').onchange = () => { config.pollIntervalMinutes = Number($('pollInterval').value); queueSave(); renderLive(); };
       $('maxConcurrent').oninput = () => { const n = parseInt($('maxConcurrent').value, 10); if (n >= 1 && n <= 8) { config.maxConcurrentReviews = n; $('maxConcurrentLabel').textContent = n === 1 ? 'pull request at a time' : 'pull requests at once'; queueSave(); } };
       $('includeUsage').onchange = () => { config.includeUsageInReview = $('includeUsage').checked; queueSave(); };
@@ -744,7 +768,7 @@ enum DashboardPage {
         finally { $('addRepo').disabled = false; }
       };
       $('newRepoPath').onkeydown = (event) => { if (event.key === 'Enter') $('addRepo').click(); };
-      document.querySelectorAll('#customPrompt, #pollInterval, #maxConcurrent, #includeUsage, #maxRounds, #failureBudget, #newRepoPath').forEach((el) => el.setAttribute('data-config', ''));
+      document.querySelectorAll('#customPrompt, #pollInterval, #githubAccount, #maxConcurrent, #includeUsage, #maxRounds, #failureBudget, #newRepoPath').forEach((el) => el.setAttribute('data-config', ''));
 
       poll();
       setInterval(poll, 2000);

@@ -327,6 +327,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
     /// them runs every enabled reviewer, so this bounds the fan-out of CLI processes
     /// (and the API traffic behind them); `1` restores the old one-at-a-time poll.
     var maxConcurrentReviews: Int
+    /// The GitHub account to review as — one `gh` is signed in to — or empty for whatever
+    /// account `gh` currently has active. Review requests are searched for, the fetch is
+    /// made, and the review is posted as this account; see `GitHubAccountEnvironment`.
+    var githubAccount: String
 
     /// DeepSeek has no CLI to inherit a session from, so it is API-key-only and starts disabled.
     static let defaultDeepSeek = ReviewerConfiguration(
@@ -367,7 +371,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         reviewScope: .fullPullRequest,
         maxReviewRoundsPerPR: nil,
         failureBudget: .default,
-        maxConcurrentReviews: 3
+        maxConcurrentReviews: 3,
+        githubAccount: ""
     )
 
     /// `decoded` unless it is blank, in which case the shipped default.
@@ -390,6 +395,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case maxReviewRoundsPerPR
         case failureBudget
         case maxConcurrentReviews
+        case githubAccount
     }
 
     init(
@@ -406,7 +412,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         reviewScope: ReviewScope = .fullPullRequest,
         maxReviewRoundsPerPR: Int? = nil,
         failureBudget: FailureBudget = .default,
-        maxConcurrentReviews: Int = 3
+        maxConcurrentReviews: Int = 3,
+        githubAccount: String = ""
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -422,6 +429,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.maxReviewRoundsPerPR = maxReviewRoundsPerPR.map { max(1, $0) }
         self.failureBudget = failureBudget
         self.maxConcurrentReviews = max(1, maxConcurrentReviews)
+        self.githubAccount = githubAccount.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     init(from decoder: Decoder) throws {
@@ -510,6 +518,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
             1,
             try values.decodeIfPresent(Int.self, forKey: .maxConcurrentReviews) ?? 3
         )
+        githubAccount = (try values.decodeIfPresent(String.self, forKey: .githubAccount) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

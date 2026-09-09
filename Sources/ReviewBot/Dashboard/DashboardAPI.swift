@@ -7,6 +7,8 @@ struct DashboardSnapshot: Codable {
     var isRunning: Bool
     var lastCheckDate: Date?
     var toolAvailability: [String: Bool]
+    /// The accounts `gh` is signed in to, for the account picker.
+    var githubAccounts: GitHubAccounts
     var reviewersWithSavedKey: [ReviewerName]
     var launchAtLoginEnabled: Bool
     var pendingReviews: [ReviewQueueItem]

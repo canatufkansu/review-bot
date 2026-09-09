@@ -62,6 +62,7 @@ final class DashboardTests: XCTestCase {
         func snapshot() -> DashboardSnapshot {
             DashboardSnapshot(
                 status: "Watching", isRunning: false, lastCheckDate: nil, toolAvailability: [:],
+                githubAccounts: GitHubAccounts(accounts: ["alice"], active: "alice"),
                 reviewersWithSavedKey: Array(keys.keys), launchAtLoginEnabled: false,
                 pendingReviews: [], runningReviews: [], errorMessage: nil,
                 configuration: configuration, configurationVersion: version, historyCount: 0,

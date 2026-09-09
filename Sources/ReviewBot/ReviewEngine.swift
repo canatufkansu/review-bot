@@ -26,7 +26,11 @@ actor ReviewEngine {
     typealias StatusSink = (String) async -> Void
 
     private let paths: StoragePaths
-    private let runner: any CommandRunning
+    /// The runner every command goes through. Rebound at the start of each poll: the runner as
+    /// handed in when the configuration names no GitHub account, or an `AccountScopedRunner`
+    /// over it when it does, so every `gh` and `git` of that poll acts as that account.
+    private var runner: any CommandRunning
+    private let baseRunner: any CommandRunning
     /// Only ever read through `ResolvedCredentials.resolve`, which takes the blocking Keychain
     /// call off this actor's executor. Nothing here may call `apiKey(for:)` directly.
     private let credentialStore: any CredentialStoring
@@ -60,6 +64,7 @@ actor ReviewEngine {
     ) {
         self.paths = paths
         self.runner = runner
+        baseRunner = runner
         credentialStore = credentials
         self.chatClient = chatClient
         self.now = now
@@ -94,6 +99,7 @@ actor ReviewEngine {
         }
 
         do {
+            runner = try await accountRunner(for: configuration.githubAccount)
             await onStatus("Checking GitHub authentication…")
             let userResult = try await runner.run(
                 "gh",
@@ -132,7 +138,8 @@ actor ReviewEngine {
             await onStatus(
                 watchingStatus(
                     repositoryCount: repositories.count,
-                    deferredRequests: deferredRequests
+                    deferredRequests: deferredRequests,
+                    user: githubUser
                 )
             )
         } catch {
@@ -748,8 +755,35 @@ actor ReviewEngine {
         await gitGate.release(repository.githubSlug)
     }
 
-    private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
+    /// The runner for one poll: the base runner, or one that makes every `gh` and `git` act as
+    /// the configured account. The token is asked of `gh` each poll and never stored — Review
+    /// Bot has no credential of its own, only the choice of which of `gh`'s to use — and an
+    /// account `gh` is not signed in to fails here, before any repository is touched, with a
+    /// message that says which account and what to do.
+    private func accountRunner(for account: String) async throws -> any CommandRunning {
+        let name = account.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return baseRunner }
+        let result = try await baseRunner.run(
+            "gh",
+            arguments: ["auth", "token", "--hostname", "github.com", "--user", name],
+            timeout: 30
+        )
+        let token = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.succeeded, !token.isEmpty else {
+            throw ReviewEngineError.commandFailed(
+                "GitHub account \(name) is not signed in to gh — run `gh auth login` for it, or "
+                    + "choose another account in Settings: \(conciseError(result))"
+            )
+        }
+        return AccountScopedRunner(
+            base: baseRunner,
+            overrides: GitHubAccountEnvironment.overrides(token: token)
+        )
+    }
+
+    private func watchingStatus(repositoryCount: Int, deferredRequests: Int, user: String) -> String {
         let watching = "Watching \(repositoryCount) repositor\(repositoryCount == 1 ? "y" : "ies")"
+            + (user.isEmpty ? "" : " as @\(user)")
         guard deferredRequests > 0 else { return watching }
         return watching
             + " — \(deferredRequests) request\(deferredRequests == 1 ? "" : "s") paused after repeated failures; Run now retries"

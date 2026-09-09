@@ -10,6 +10,7 @@ final class WindowsAppModel: DashboardBackend {
     private(set) var isRunning = false
     private(set) var lastCheckDate: Date?
     private(set) var toolAvailability: [String: Bool] = [:]
+    private(set) var githubAccounts: GitHubAccounts = .none
     private(set) var reviewersWithSavedKey: Set<ReviewerName> = []
     private(set) var pendingReviews: [ReviewQueueItem] = []
     /// Every review running right now — a poll reviews several pull requests at once.
@@ -116,6 +117,7 @@ final class WindowsAppModel: DashboardBackend {
             isRunning: isRunning,
             lastCheckDate: lastCheckDate,
             toolAvailability: toolAvailability,
+            githubAccounts: githubAccounts,
             reviewersWithSavedKey: ReviewerName.allCases.filter { reviewersWithSavedKey.contains($0) },
             launchAtLoginEnabled: WindowsShell.LaunchAtLogin.isEnabled,
             pendingReviews: pendingReviews,
@@ -271,6 +273,9 @@ final class WindowsAppModel: DashboardBackend {
             statuses[tool] = PlatformProcess.locate(tool) != nil
         }
         toolAvailability = statuses
+        if let result = try? await runner.run("gh", arguments: ["auth", "status"], timeout: 20) {
+            githubAccounts = GitHubAccounts.parse(result.stdout + "\n" + result.stderr)
+        }
         await refreshSavedKeys()
         changed()
     }

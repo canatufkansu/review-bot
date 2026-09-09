@@ -85,6 +85,8 @@ private struct GeneralSettingsView: View {
                         }
                     }
 
+                    GitHubAccountRow(model: model, settings: settings)
+
                     VStack(alignment: .leading, spacing: 4) {
                         Stepper(
                             value: $settings.configuration.maxConcurrentReviews,
@@ -167,6 +169,49 @@ private struct GeneralSettingsView: View {
         panel.resolvesAliases = true
         guard panel.runModal() == .OK, let folder = panel.url else { return }
         model.addRepository(folder: folder)
+    }
+}
+
+/// Which of `gh`'s signed-in accounts Review Bot reviews as. Blank means `gh`'s own active
+/// account, which is how every install behaved before the setting existed.
+private struct GitHubAccountRow: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var settings: SettingsStore
+
+    private var configured: String { settings.configuration.githubAccount }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Review as")
+                Picker("GitHub account", selection: $settings.configuration.githubAccount) {
+                    Text(model.githubAccounts.active.map { "gh's active account (\($0))" } ?? "gh's active account")
+                        .tag("")
+                    ForEach(model.githubAccounts.accounts, id: \.self) { account in
+                        Text(account).tag(account)
+                    }
+                    // A configured account gh no longer lists stays selectable, so the picker
+                    // shows the truth instead of silently reading as "active account".
+                    if !configured.isEmpty, !model.githubAccounts.accounts.contains(configured) {
+                        Text("\(configured) (not signed in)").tag(configured)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 260)
+                Spacer()
+                Button("Refresh accounts") {
+                    Task { await model.refreshToolAvailability() }
+                }
+            }
+            Text("Review requests are found, the pull request is fetched, and the review is posted as this account. Sign `gh` in to another with `gh auth login`, then refresh; nothing else on this machine changes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !configured.isEmpty, !model.githubAccounts.accounts.contains(configured) {
+                Label("gh is not signed in as \(configured); polls will fail until it is.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
     }
 }
 

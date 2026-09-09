@@ -698,6 +698,66 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertFalse(environment.keys.contains("OPENCODE_API_KEY"))
     }
 
+    /// The account setting must reach every `gh` and `git` of the poll — the search that finds
+    /// the requests, the fetch, the post — as the token `gh` holds for that account, and reach
+    /// no reviewer: a `GH_TOKEN` in a reviewer's environment is a credential it must not see.
+    func testAConfiguredGitHubAccountScopesEveryGhAndGitButNoReviewer() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.githubAccount = "bob"
+
+        var statuses: [String] = []
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { statuses.append($0) })
+
+        let gh = await runner.ghEnvironment()
+        let git = await runner.gitEnvironment()
+        let claude = await runner.claudeEnvironment()
+        XCTAssertEqual(gh["GH_TOKEN"], "gho_token_for_bob")
+        XCTAssertEqual(git["GH_TOKEN"], "gho_token_for_bob")
+        XCTAssertEqual(git["GIT_CONFIG_VALUE_1"], "!gh auth git-credential")
+        XCTAssertNil(claude["GH_TOKEN"] ?? nil)
+        XCTAssertFalse(claude.keys.contains("GH_TOKEN"))
+        // The status names the account the poll ran as.
+        XCTAssertTrue(statuses.contains { $0.hasPrefix("Watching") && $0.hasSuffix("as @reviewer") }, "\(statuses)")
+    }
+
+    /// The default — no account — must be byte-for-byte the old behaviour: `gh` and `git` run
+    /// with no token and no config override, so `gh`'s own active account decides.
+    func testNoConfiguredAccountLeavesGhAndGitUnscoped() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        await engine.poll(configuration: fixture.configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let gh = await runner.ghEnvironment()
+        let git = await runner.gitEnvironment()
+        XCTAssertFalse(gh.keys.contains("GH_TOKEN"))
+        XCTAssertFalse(git.keys.contains("GIT_CONFIG_COUNT"))
+    }
+
+    /// An account `gh` is not signed in to fails the poll before any repository is touched, and
+    /// says which account and what to do; nothing is reviewed under whatever account happens to
+    /// be active instead.
+    func testAnAccountGhIsNotSignedInToFailsThePollWithoutFallingBack() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.githubAccount = "carol"
+
+        var statuses: [String] = []
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { statuses.append($0) })
+
+        let claudeCount = await runner.claudeCount()
+        XCTAssertEqual(claudeCount, 0)
+        let failure = try XCTUnwrap(statuses.last)
+        XCTAssertTrue(failure.contains("carol"), failure)
+        XCTAssertTrue(failure.contains("gh auth login"), failure)
+    }
+
     /// Reading a Keychain item is a synchronous call that blocks its thread on a modal prompt,
     /// so it must not happen from inside a reviewer's run method: that code is `ReviewEngine`
     /// actor-isolated, and blocking the actor's executor would stall the reviewers running in
@@ -2164,6 +2224,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// property per reviewer: opencode's sandbox variables and the CLI reviewers' auth overrides
     /// now come through the same seam, and a reviewer added later records itself for free.
     private var environmentByExecutable: [String: EnvironmentOverrides] = [:]
+    /// The accounts `gh auth token --user` answers for; every other name is "not signed in".
+    var ghAccounts: Set<String> = ["alice", "bob"]
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
@@ -2287,6 +2349,13 @@ private actor ReviewWorkflowMock: CommandRunning {
     ) async throws -> CommandResult {
         if ReviewerName.allCases.compactMap(\.commandName).contains(executable) {
             spawnClock?.recordReviewerLaunch()
+        }
+        if executable == "gh", arguments.starts(with: ["auth", "token"]) {
+            // Only a signed-in account has a token; `--user` names which.
+            guard let user = arguments.last, ghAccounts.contains(user) else {
+                return result(exitCode: 1, stderr: "no oauth token found for \(arguments.last ?? "")")
+            }
+            return result(stdout: "gho_token_for_\(user)\n")
         }
         if executable == "gh", arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
@@ -2515,6 +2584,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeCount() -> Int { claudeRuns }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
+    func ghEnvironment() -> EnvironmentOverrides { environmentByExecutable["gh"] ?? [:] }
+    func gitEnvironment() -> EnvironmentOverrides { environmentByExecutable["git"] ?? [:] }
     func claudeEnvironment() -> EnvironmentOverrides { environmentByExecutable["claude"] ?? [:] }
     func codexEnvironment() -> EnvironmentOverrides { environmentByExecutable["codex"] ?? [:] }
     func opencodeEnvironment() -> EnvironmentOverrides { environmentByExecutable["opencode"] ?? [:] }
