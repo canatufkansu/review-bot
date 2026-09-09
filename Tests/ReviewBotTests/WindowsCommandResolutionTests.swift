@@ -154,8 +154,11 @@ final class WindowsCommandLineTests: XCTestCase {
         XCTAssertEqual(WindowsCommandLine.quoteArgument("a b"), #""a b""#)
         XCTAssertEqual(WindowsCommandLine.quoteArgument(""), #""""#)
         XCTAssertEqual(WindowsCommandLine.quoteArgument(#"say "hi""#), #""say \"hi\"""#)
-        // Backslashes before a quote double; elsewhere they are literal.
-        XCTAssertEqual(WindowsCommandLine.quoteArgument(#"C:\dir\"#), #""C:\dir\\""#)
+        // Backslashes before a quote double; elsewhere they are literal — so a path that needs
+        // no quoting keeps its trailing backslash, and one that does gets it doubled before the
+        // closing quote.
+        XCTAssertEqual(WindowsCommandLine.quoteArgument(#"C:\dir\"#), #"C:\dir\"#)
+        XCTAssertEqual(WindowsCommandLine.quoteArgument(#"C:\my dir\"#), #""C:\my dir\\""#)
         XCTAssertEqual(WindowsCommandLine.quoteArgument(#"x\"y"#), #""x\\\"y""#)
         XCTAssertEqual(WindowsCommandLine.quoteArgument(#"C:\dir with space\file"#), #""C:\dir with space\file""#)
         // A prompt: multi-line, quoted as one argument.
