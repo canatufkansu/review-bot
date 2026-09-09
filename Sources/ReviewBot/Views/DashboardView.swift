@@ -85,6 +85,22 @@ private struct GeneralSettingsView: View {
                         }
                     }
 
+                    VStack(alignment: .leading, spacing: 4) {
+                        Stepper(
+                            value: $settings.configuration.maxConcurrentReviews,
+                            in: 1...8
+                        ) {
+                            Text(
+                                settings.configuration.maxConcurrentReviews == 1
+                                    ? "Review one pull request at a time"
+                                    : "Review up to \(settings.configuration.maxConcurrentReviews) pull requests at once"
+                            )
+                        }
+                        Text("Each pull request runs every enabled reviewer, so this many times that many CLI processes — and that much API traffic — can be in flight together. Pull requests from the same repository still prepare their worktrees one at a time.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     Toggle(
                         "Launch Review Bot at login",
                         isOn: Binding(

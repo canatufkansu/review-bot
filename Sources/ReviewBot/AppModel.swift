@@ -12,7 +12,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var toolAvailability: [String: Bool] = [:]
     @Published private(set) var launchAtLoginEnabled: Bool
     @Published private(set) var pendingReviews: [ReviewQueueItem] = []
-    @Published private(set) var runningReview: ReviewQueueItem?
+    /// Every review running right now — a poll reviews several pull requests at once,
+    /// so this is a list. It was a single optional while polls were sequential, which
+    /// meant the second review to start erased the first from the menu bar even though
+    /// it was still running.
+    @Published private(set) var runningReviews: [ReviewQueueItem] = []
     @Published var errorMessage: String?
 
     let settings: SettingsStore
@@ -175,7 +179,7 @@ final class AppModel: ObservableObject {
             // should remain queued afterward. Reset defensively so a missed or
             // out-of-order terminal event can never leave a stale count in the menu bar.
             pendingReviews.removeAll()
-            runningReview = nil
+            runningReviews.removeAll()
         }
 
         let configuration = settings.configuration
@@ -205,12 +209,11 @@ final class AppModel: ObservableObject {
             pendingReviews.append(item)
         case .reviewStarted:
             pendingReviews.removeAll(where: { $0.id == item.id })
-            runningReview = item
+            runningReviews.removeAll(where: { $0.id == item.id })
+            runningReviews.append(item)
         case .approved, .changesRequested, .commented, .failed:
             pendingReviews.removeAll(where: { $0.id == item.id })
-            if runningReview?.id == item.id {
-                runningReview = nil
-            }
+            runningReviews.removeAll(where: { $0.id == item.id })
         }
     }
 }
