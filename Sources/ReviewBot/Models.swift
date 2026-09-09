@@ -547,7 +547,7 @@ struct HistoryEntry: Codable, Equatable, Identifiable {
     var usage: TokenUsage?
 }
 
-struct ReviewQueueItem: Equatable, Identifiable {
+struct ReviewQueueItem: Codable, Equatable, Identifiable {
     let repositoryName: String
     let repositorySlug: String
     let pullRequestNumber: Int

@@ -24,8 +24,8 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
 
 ## Requirements
 
-- macOS 14 or newer.
-- Xcode 16 or newer, or a compatible Swift toolchain, to build the app.
+- macOS 14 or newer, or Windows 10/11 (x64). See [Windows](#windows) for what differs there.
+- To build: Xcode 16 or newer (or a compatible Swift toolchain) on macOS; the Swift 6.1 toolchain from swift.org on Windows.
 - GitHub CLI (`gh`), authenticated with `gh auth login`.
 - At least one reviewer:
   - `claude` — authenticated, or an Anthropic API key.
@@ -60,6 +60,29 @@ make run
 ```
 
 Launch-at-login registration only works reliably from the packaged app in `/Applications`.
+
+### Windows
+
+The same engine runs on Windows as a notification-area (tray) app. Instead of a native settings window, the tray icon opens a dashboard page in your browser, served from the app itself on `127.0.0.1` — it never listens on the network, and every request from the page carries a token that only the tray hands out. The page has the same tabs as the macOS settings window: Repositories, Reviewers, Decisions, Prompt, and History.
+
+Build and package with PowerShell:
+
+```powershell
+pwsh scripts\build-windows.ps1
+```
+
+This produces `dist\ReviewBot-dev-windows-x64.zip` containing `ReviewBot.exe` and the Swift runtime DLLs it needs. Unzip it anywhere and run `ReviewBot.exe`; it appears in the notification area. Double-click the icon or choose **Open dashboard** from its menu. Running it a second time opens the running instance's dashboard rather than starting another. Releases on GitHub include the same zip.
+
+What differs from macOS:
+
+- **Credentials.** API keys are stored in the Windows Credential Manager (generic credentials under `Review Bot reviewer API keys/<reviewer>`), not the Keychain. A rebuilt binary is never prompted for access.
+- **Launch at sign-in** is a per-user `Run` registry entry pointing at wherever `ReviewBot.exe` is. Move the executable and the entry goes stale; toggle it off and on again from the dashboard.
+- **Finding the CLIs.** Windows gives the app your full `Path`, so no login-shell probe is needed. Review Bot also searches npm's global folder (`%APPDATA%\npm`), `%USERPROFILE%\.local\bin`, scoop's shims, winget's links, and the Git and GitHub CLI installers under Program Files. A CLI installed with `npm install -g` is a `.cmd` launcher; Review Bot reads it and runs `node.exe` on the package's script directly rather than going through `cmd.exe`, which would re-parse the review prompt. Other `.cmd`/`.bat` launchers are refused — install a native executable instead.
+- **Time limits** are enforced with a job object, so a reviewer that is cut off takes every process it spawned with it.
+- **Data folder:** `%APPDATA%\ReviewBot\` (the same files as below).
+- **Adding a repository** takes a folder path typed or pasted into the dashboard; there is no folder picker.
+
+If `ReviewBot.exe` fails to start with a missing-DLL error, install the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) — the Swift runtime depends on it.
 
 ## First-time setup
 
@@ -190,12 +213,13 @@ Review Bot writes to:
 - `worktrees/` is temporary and normally empty between reviews.
 - `opencode/` holds the read-only agent definition the opencode reviewer runs under.
 
-Use **History → Show data folder** to open this location.
+Use **History → Show data folder** to open this location. On Windows the folder is `%APPDATA%\ReviewBot\` and holds one extra file while the app runs, `dashboard.json`, which records the dashboard's address for a second launch of the app to open.
 
 ## Privacy and safety
 
 - Source code inspected by Claude, Codex, or opencode is handled according to the account and provider configuration of those CLIs. Code sent to DeepSeek — the diff, the PR discussion, and any file its tools read — leaves your machine over HTTPS to DeepSeek's API, so enable it only where that is acceptable.
-- API keys are held in the macOS Keychain, passed only to the reviewer they belong to, and never written to configuration, history, logs, or a posted review.
+- API keys are held in the macOS Keychain or the Windows Credential Manager, passed only to the reviewer they belong to, and never written to configuration, history, logs, or a posted review.
+- On Windows the dashboard is served on the loopback interface only, on a random port, and its API accepts requests only with the per-launch token the tray icon hands to the page. The page loads no external script or style.
 - Review Bot does not start a shell for repository values, PR titles, prompts, or paths; commands are passed as argument arrays.
 - Claude is restricted to read/search tools. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled. DeepSeek's tools are implemented in-process, only read, and refuse any path that resolves outside the review worktree.
 - Review work never modifies the developer's current branch or working tree.
@@ -207,7 +231,7 @@ Use **History → Show data folder** to open this location.
 make test
 ```
 
-The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, environment composition, token-usage arithmetic and formatting, worktree-tool containment, and the DeepSeek agent loop. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, DeepSeek reviews over a stubbed API, API-key injection and session-mode key removal, usage reporting from Claude's JSON envelope and the plain-text fallback, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
+CI runs the suite on both macOS and Windows. The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, environment composition, token-usage arithmetic and formatting, worktree-tool containment, Windows command resolution and npm-launcher unwrapping, the dashboard's request parsing and routes, and the DeepSeek agent loop. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, DeepSeek reviews over a stubbed API, API-key injection and session-mode key removal, usage reporting from Claude's JSON envelope and the plain-text fallback, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
 
 ## Roadmap
 
