@@ -4,7 +4,8 @@ import WinSDK
 /// How Windows starts a command. This is the launcher `ProcessRunner` uses on Windows;
 /// `UnixProcess.swift` is the macOS one.
 ///
-/// Two things differ from macOS. There is no `env` and no `perl`: the command is resolved
+/// Two things differ from macOS. There is no `env` and no `perl`, and no Foundation `Process`
+/// either — see `launch` for why `CreateProcessW` is called directly: the command is resolved
 /// here, with `WindowsCommandResolution`, into a real executable — an npm `.cmd` launcher is
 /// unwrapped into `node.exe <script>` rather than run through `cmd.exe`, which would re-parse
 /// the review prompt. And the time limit is a job object: the child is placed in one with
@@ -85,51 +86,139 @@ enum PlatformProcess: PlatformProcessLaunching {
         arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
-        stdout: FileHandle,
-        stderr: FileHandle,
+        stdout: URL,
+        stderr: URL,
         timeout: Int
     ) throws -> LaunchOutcome {
         let resolved = try resolve(executable)
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: resolved.executable)
-        process.arguments = resolved.leadingArguments + arguments
-        process.currentDirectoryURL = currentDirectory
-        process.standardOutput = stdout
-        process.standardError = stderr
-        process.standardInput = FileHandle.nullDevice
-        process.environment = environment
-
-        try process.run()
-
+        // `CreateProcessW` directly rather than Foundation's `Process`, for three things it
+        // cannot give: `CREATE_NO_WINDOW`, without which every git and gh call from this
+        // console-less app flashes a console window; `CREATE_SUSPENDED`, so the child is in
+        // the job before it runs a single instruction; and the raw exit code, so a child that
+        // died of an exception is reported as such instead of as a bare number.
         let job = JobObject()
-        job.assign(processID: process.processIdentifier)
+        var standardInput = try openHandle(path: "NUL", forWriting: false)
+        defer { standardInput.close() }
+        var standardOutput = try openHandle(path: WindowsShell.nativePath(stdout), forWriting: true)
+        defer { standardOutput.close() }
+        var standardError = try openHandle(path: WindowsShell.nativePath(stderr), forWriting: true)
+        defer { standardError.close() }
 
-        // The limit. Fired from a background queue, it kills the job — the child and everything
-        // it started — and records that it did so. `isRunning` is checked under the lock so a
-        // child that exits in the same instant the limit fires is not reported as timed out.
-        let watchdog = Watchdog()
-        let limit = DispatchWorkItem {
-            watchdog.fire {
-                guard process.isRunning else { return false }
-                if !job.terminate() {
-                    process.terminate()
+        var startup = STARTUPINFOW()
+        startup.cb = DWORD(MemoryLayout<STARTUPINFOW>.size)
+        startup.dwFlags = 0x100 // STARTF_USESTDHANDLES
+        startup.hStdInput = standardInput.handle
+        startup.hStdOutput = standardOutput.handle
+        startup.hStdError = standardError.handle
+        var information = PROCESS_INFORMATION()
+
+        var application = Array(resolved.executable.utf16) + [0]
+        var commandLine = Array(
+            WindowsCommandLine.quote([resolved.executable] + resolved.leadingArguments + arguments).utf16
+        ) + [0]
+        var block = WindowsCommandLine.environmentBlock(environment)
+        var directory = currentDirectory.map { Array(WindowsShell.nativePath($0).utf16) + [0] }
+
+        // CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED
+        let flags: DWORD = 0x400 | 0x0800_0000 | 0x4
+        let created = application.withUnsafeMutableBufferPointer { applicationPointer in
+            commandLine.withUnsafeMutableBufferPointer { commandPointer in
+                block.withUnsafeMutableBytes { blockPointer in
+                    withOptionalDirectory(&directory) { directoryPointer in
+                        CreateProcessW(
+                            applicationPointer.baseAddress, commandPointer.baseAddress,
+                            nil, nil, true, flags, blockPointer.baseAddress,
+                            directoryPointer, &startup, &information
+                        )
+                    }
                 }
-                return true
             }
         }
-        DispatchQueue.global(qos: .utility).asyncAfter(
-            deadline: .now() + .seconds(max(1, timeout)),
-            execute: limit
-        )
+        guard created else {
+            throw CommandExecutionError.launchFailed(
+                command: executable,
+                detail: "CreateProcess failed with error \(GetLastError()) for \(resolved.executable)"
+            )
+        }
+        defer {
+            CloseHandle(information.hThread)
+            CloseHandle(information.hProcess)
+            // Closing the job kills any grandchild the CLI left behind, so a review never leaks
+            // a language server or a node helper into the background.
+            job.close()
+        }
 
-        process.waitUntilExit()
-        limit.cancel()
-        // Closing the job kills any grandchild the CLI left behind, so a review never leaks a
-        // language server or a node helper into the background.
-        job.close()
+        job.assign(process: information.hProcess)
+        ResumeThread(information.hThread)
 
-        return LaunchOutcome(exitCode: process.terminationStatus, timedOut: watchdog.didFire)
+        // Our copies of the child's standard handles are closed now that it holds its own;
+        // otherwise the files stay open for writing until this call returns.
+        standardInput.close()
+        standardOutput.close()
+        standardError.close()
+
+        var timedOut = false
+        // WAIT_TIMEOUT
+        if WaitForSingleObject(information.hProcess, DWORD(max(1, timeout)) * 1000) == 0x102 {
+            timedOut = true
+            if !job.terminate() {
+                TerminateProcess(information.hProcess, 1)
+            }
+            WaitForSingleObject(information.hProcess, INFINITE)
+        }
+
+        var rawExitCode: DWORD = 0
+        GetExitCodeProcess(information.hProcess, &rawExitCode)
+        var detail: String?
+        if rawExitCode & 0xF000_0000 != 0 {
+            // An NTSTATUS/HRESULT: the process did not return, it was killed by an exception
+            // (access violation, missing DLL, stack overflow) — or by a debugger, or by Windows.
+            detail = String(format: "process ended abnormally with status 0x%08X", rawExitCode)
+        }
+        return LaunchOutcome(exitCode: Int32(bitPattern: rawExitCode), timedOut: timedOut, detail: detail)
+    }
+
+    /// An inheritable file handle for a child's standard stream.
+    private struct InheritableHandle {
+        var handle: HANDLE?
+
+        mutating func close() {
+            if let handle { CloseHandle(handle) }
+            handle = nil
+        }
+    }
+
+    private static func openHandle(path: String, forWriting: Bool) throws -> InheritableHandle {
+        var security = SECURITY_ATTRIBUTES()
+        security.nLength = DWORD(MemoryLayout<SECURITY_ATTRIBUTES>.size)
+        security.bInheritHandle = true
+        let handle = path.withCString(encodedAs: UTF16.self) { name in
+            CreateFileW(
+                name,
+                forWriting ? 0x4000_0000 : 0x8000_0000, // GENERIC_WRITE : GENERIC_READ
+                0x1 | 0x2, // FILE_SHARE_READ | FILE_SHARE_WRITE
+                &security,
+                forWriting ? 2 : 3, // CREATE_ALWAYS : OPEN_EXISTING
+                0x80, // FILE_ATTRIBUTE_NORMAL
+                nil
+            )
+        }
+        guard let handle, handle != INVALID_HANDLE_VALUE else {
+            throw CommandExecutionError.launchFailed(
+                command: path,
+                detail: "could not open \(path) for the child's standard streams (error \(GetLastError()))"
+            )
+        }
+        return InheritableHandle(handle: handle)
+    }
+
+    private static func withOptionalDirectory<T>(
+        _ directory: inout [UInt16]?,
+        _ body: (UnsafePointer<UInt16>?) -> T
+    ) -> T {
+        guard directory != nil else { return body(nil) }
+        return directory!.withUnsafeBufferPointer { body($0.baseAddress) }
     }
 
     static func locate(_ command: String) -> String? {
@@ -139,24 +228,6 @@ enum PlatformProcess: PlatformProcessLaunching {
     private static func directory(of path: String) -> String {
         guard let index = path.lastIndex(where: { $0 == "\\" || $0 == "/" }) else { return "." }
         return String(path[..<index])
-    }
-
-    /// Records whether the time limit ran, under a lock shared with the exit path.
-    private final class Watchdog: @unchecked Sendable {
-        private let lock = NSLock()
-        private var fired = false
-
-        func fire(_ body: () -> Bool) {
-            lock.lock()
-            defer { lock.unlock() }
-            if body() { fired = true }
-        }
-
-        var didFire: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return fired
-        }
     }
 
     /// A kill-on-close job object. Every method tolerates a job that could not be created, in
@@ -182,13 +253,8 @@ enum PlatformProcess: PlatformProcessLaunching {
             handle = job
         }
 
-        func assign(processID: Int32) {
-            guard let handle else { return }
-            // PROCESS_SET_QUOTA | PROCESS_TERMINATE: what `AssignProcessToJobObject` requires.
-            guard let process = OpenProcess(0x0100 | 0x0001, false, DWORD(bitPattern: processID)) else {
-                return
-            }
-            defer { CloseHandle(process) }
+        func assign(process: HANDLE?) {
+            guard let handle, let process else { return }
             _ = AssignProcessToJobObject(handle, process)
         }
 

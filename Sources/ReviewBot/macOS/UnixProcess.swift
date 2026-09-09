@@ -20,10 +20,20 @@ enum PlatformProcess: PlatformProcessLaunching {
         arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
-        stdout: FileHandle,
-        stderr: FileHandle,
+        stdout: URL,
+        stderr: URL,
         timeout: Int
     ) throws -> LaunchOutcome {
+        let fileManager = FileManager.default
+        _ = fileManager.createFile(atPath: stdout.path, contents: nil)
+        _ = fileManager.createFile(atPath: stderr.path, contents: nil)
+        let stdoutHandle = try FileHandle(forWritingTo: stdout)
+        let stderrHandle = try FileHandle(forWritingTo: stderr)
+        defer {
+            try? stdoutHandle.close()
+            try? stderrHandle.close()
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
         process.arguments = [
@@ -34,13 +44,15 @@ enum PlatformProcess: PlatformProcessLaunching {
             executable,
         ] + arguments
         process.currentDirectoryURL = currentDirectory
-        process.standardOutput = stdout
-        process.standardError = stderr
+        process.standardOutput = stdoutHandle
+        process.standardError = stderrHandle
         process.standardInput = FileHandle.nullDevice
         process.environment = environment
 
         try process.run()
         process.waitUntilExit()
+        try? stdoutHandle.synchronize()
+        try? stderrHandle.synchronize()
 
         let timedOut = process.terminationReason == .uncaughtSignal
             && process.terminationStatus == SIGALRM

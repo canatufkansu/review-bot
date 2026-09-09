@@ -151,3 +151,61 @@ struct NpmShim: Equatable {
         return segments
     }
 }
+
+/// The two byte-exact encodings `CreateProcessW` takes, built here so they can be tested
+/// without Windows: the single command-line string a child parses back into `argv`, and the
+/// environment block.
+enum WindowsCommandLine {
+    /// Joins arguments into one command line under the C runtime's parsing rules — the ones
+    /// every `main(argc, argv)` on Windows, Node and Go included, use to split it again.
+    ///
+    /// An argument is quoted when it is empty or contains a space, tab or quote. Inside quotes
+    /// a `"` becomes `\"`, and only backslashes that precede a quote (or the closing quote) are
+    /// doubled; a backslash anywhere else is literal, which is why `C:\Users\x` needs no
+    /// escaping. Review prompts go through here as one argument, newlines and all: the runtime
+    /// splits on whitespace outside quotes only, so a quoted argument keeps its newlines.
+    static func quote(_ arguments: [String]) -> String {
+        arguments.map(quoteArgument).joined(separator: " ")
+    }
+
+    static func quoteArgument(_ argument: String) -> String {
+        let needsQuotes = argument.isEmpty || argument.contains { $0 == " " || $0 == "\t" || $0 == "\"" || $0 == "\n" || $0 == "\r" }
+        guard needsQuotes else { return argument }
+        var result = "\""
+        var backslashes = 0
+        for character in argument {
+            if character == "\\" {
+                backslashes += 1
+                continue
+            }
+            if character == "\"" {
+                result += String(repeating: "\\", count: backslashes * 2 + 1)
+                result.append("\"")
+            } else {
+                result += String(repeating: "\\", count: backslashes)
+                result.append(character)
+            }
+            backslashes = 0
+        }
+        result += String(repeating: "\\", count: backslashes * 2)
+        result += "\""
+        return result
+    }
+
+    /// The `name=value` block, as UTF-16 with the double terminator `CreateProcessW` wants.
+    /// Sorted case-insensitively by name, which is the layout Windows itself produces and the
+    /// one some runtimes binary-search.
+    static func environmentBlock(_ environment: [String: String]) -> [UInt16] {
+        let entries = environment
+            .sorted { $0.key.lowercased() < $1.key.lowercased() }
+            .map { "\($0.key)=\($0.value)" }
+        var block: [UInt16] = []
+        for entry in entries {
+            block.append(contentsOf: entry.utf16)
+            block.append(0)
+        }
+        block.append(0)
+        if entries.isEmpty { block.append(0) }
+        return block
+    }
+}

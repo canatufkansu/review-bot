@@ -139,3 +139,33 @@ final class WindowsCommandResolutionTests: XCTestCase {
         XCTAssertNil(NpmShim.parse(contents: batch, directory: #"C:\tools"#))
     }
 }
+
+/// The bytes handed to `CreateProcessW`. A wrong quote here would hand a CLI a prompt cut at
+/// its first space; a wrong environment block would hand it no `Path` at all.
+final class WindowsCommandLineTests: XCTestCase {
+    func testPlainArgumentsAreLeftAlone() {
+        XCTAssertEqual(
+            WindowsCommandLine.quote([#"C:\Program Files\Git\cmd\git.exe"#, "-C", #"C:\src\repo"#, "fetch"]),
+            #""C:\Program Files\Git\cmd\git.exe" -C C:\src\repo fetch"#
+        )
+    }
+
+    func testSpacesQuotesAndNewlinesAreQuotedTheWayTheCRuntimeSplitsThem() {
+        XCTAssertEqual(WindowsCommandLine.quoteArgument("a b"), #""a b""#)
+        XCTAssertEqual(WindowsCommandLine.quoteArgument(""), #""""#)
+        XCTAssertEqual(WindowsCommandLine.quoteArgument(#"say "hi""#), #""say \"hi\"""#)
+        // Backslashes before a quote double; elsewhere they are literal.
+        XCTAssertEqual(WindowsCommandLine.quoteArgument(#"C:\dir\"#), #""C:\dir\\""#)
+        XCTAssertEqual(WindowsCommandLine.quoteArgument(#"x\"y"#), #""x\\\"y""#)
+        XCTAssertEqual(WindowsCommandLine.quoteArgument(#"C:\dir with space\file"#), #""C:\dir with space\file""#)
+        // A prompt: multi-line, quoted as one argument.
+        XCTAssertEqual(WindowsCommandLine.quoteArgument("Review this.\nBe strict."), "\"Review this.\nBe strict.\"")
+    }
+
+    func testEnvironmentBlockIsSortedAndDoubleTerminated() {
+        let block = WindowsCommandLine.environmentBlock(["Path": "C:\\bin", "APPDATA": "C:\\a", "b": "2"])
+        let text = String(decoding: block, as: UTF16.self)
+        XCTAssertEqual(text, "APPDATA=C:\\a\0b=2\0Path=C:\\bin\0\0")
+        XCTAssertEqual(String(decoding: WindowsCommandLine.environmentBlock([:]), as: UTF16.self), "\0\0")
+    }
+}

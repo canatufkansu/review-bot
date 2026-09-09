@@ -73,6 +73,8 @@ enum CommandExecutionError: LocalizedError {
     /// The command names nothing that can be started: not on `PATH`, or on `PATH` only as a
     /// launcher this app refuses to run through a shell (see `NpmShim`).
     case notFound(command: String, detail: String)
+    /// The OS refused to start the process at all.
+    case launchFailed(command: String, detail: String)
 
     var errorDescription: String? {
         switch self {
@@ -80,6 +82,8 @@ enum CommandExecutionError: LocalizedError {
             "Command timed out after \(seconds) seconds: \(command)"
         case let .notFound(command, detail):
             "Command not found: \(command) — \(detail)"
+        case let .launchFailed(command, detail):
+            "Could not start \(command): \(detail)"
         }
     }
 }
@@ -88,6 +92,10 @@ enum CommandExecutionError: LocalizedError {
 struct LaunchOutcome {
     var exitCode: Int32
     var timedOut: Bool
+    /// Anything the launcher knows about an abnormal end that the exit code alone hides — a
+    /// Windows exception status, say. Surfaced in place of an empty stderr, so a process that
+    /// died without a word still leaves a diagnosis in the log.
+    var detail: String? = nil
 }
 
 /// The pieces of process launching that differ between macOS and Windows. Each platform
@@ -98,10 +106,11 @@ struct LaunchOutcome {
 ///   the real one, since a Finder-launched app starts with launchd's; on Windows the user's
 ///   `Path` is already complete, and common installer directories are appended.
 /// - `launch` — starts `executable` under a hard time limit and waits for it. The core
-///   passes an already-composed environment and open file handles for the output streams, so
-///   the launcher's only job is the OS-specific part: how the limit is enforced (`perl alarm`
-///   on macOS, a job object on Windows) and how the command is resolved (`env` on macOS, a
-///   `PATH`/`PATHEXT` search plus npm shim unwrapping on Windows).
+///   passes an already-composed environment and the files the output streams go to, so the
+///   launcher's only job is the OS-specific part: how the limit is enforced (`perl alarm` on
+///   macOS, a job object on Windows), how the command is resolved (`env` on macOS, a
+///   `PATH`/`PATHEXT` search plus npm shim unwrapping on Windows), and how the child's
+///   standard handles are wired to those files.
 /// - `locate` — where `command` would resolve to, or `nil`, for the tool-availability panel.
 protocol PlatformProcessLaunching {
     static var augmentedPATH: String { get }
@@ -110,8 +119,8 @@ protocol PlatformProcessLaunching {
         arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
-        stdout: FileHandle,
-        stderr: FileHandle,
+        stdout: URL,
+        stderr: URL,
         timeout: Int
     ) throws -> LaunchOutcome
     static func locate(_ command: String) -> String?
@@ -257,16 +266,6 @@ struct ProcessRunner: CommandRunning {
 
         let stdoutURL = temporaryDirectory.appendingPathComponent("stdout")
         let stderrURL = temporaryDirectory.appendingPathComponent("stderr")
-        // `_ =`: swift-corelibs-foundation marks the result non-discardable, Darwin does not.
-        _ = fileManager.createFile(atPath: stdoutURL.path, contents: nil)
-        _ = fileManager.createFile(atPath: stderrURL.path, contents: nil)
-
-        let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
-        let stderrHandle = try FileHandle(forWritingTo: stderrURL)
-        defer {
-            try? stdoutHandle.close()
-            try? stderrHandle.close()
-        }
 
         let environment = Self.composeEnvironment(
             inherited: ProcessInfo.processInfo.environment,
@@ -287,19 +286,20 @@ struct ProcessRunner: CommandRunning {
             arguments: arguments,
             currentDirectory: currentDirectory,
             environment: environment,
-            stdout: stdoutHandle,
-            stderr: stderrHandle,
+            stdout: stdoutURL,
+            stderr: stderrURL,
             timeout: timeout
         )
-        try? stdoutHandle.synchronize()
-        try? stderrHandle.synchronize()
 
         if outcome.timedOut {
             throw CommandExecutionError.timedOut(command: displayCommand, seconds: timeout)
         }
 
         let stdout = String(decoding: (try? Data(contentsOf: stdoutURL)) ?? Data(), as: UTF8.self)
-        let stderr = String(decoding: (try? Data(contentsOf: stderrURL)) ?? Data(), as: UTF8.self)
+        var stderr = String(decoding: (try? Data(contentsOf: stderrURL)) ?? Data(), as: UTF8.self)
+        if stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let detail = outcome.detail {
+            stderr = detail
+        }
 
         return CommandResult(
             command: displayCommand,
