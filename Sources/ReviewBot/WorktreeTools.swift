@@ -22,12 +22,45 @@ struct WorktreeTools {
     }
 
     private let root: URL
+    /// `root`'s path, split the way `isContained` compares paths: by component, so the check
+    /// does not depend on the platform's separator, and folded to lower case on Windows, where
+    /// the filesystem is case-insensitive and `C:\\Work` and `c:\\work` are the same directory —
+    /// a prefix check on the raw strings would let a model escape the sandbox by changing case.
+    private let rootComponents: [String]
     private let fileManager = FileManager.default
 
     init(root: URL) {
         // Resolve once: temporary directories are symlinked on macOS (`/var` → `/private/var`),
         // and containment has to be checked against the real path on both sides.
         self.root = root.resolvingSymlinksInPath().standardizedFileURL
+        rootComponents = Self.comparableComponents(of: self.root)
+    }
+
+    /// The path components used for containment checks; see `rootComponents`.
+    private static func comparableComponents(of url: URL) -> [String] {
+        let components = url.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        #if os(Windows)
+        return components.map { $0.lowercased() }
+        #else
+        return components
+        #endif
+    }
+
+    /// Whether a model-supplied path is absolute on this platform: `/…` everywhere, plus
+    /// `C:\…`, `C:/…` and `\\server\…` on Windows.
+    private static func isAbsolutePath(_ path: String) -> Bool {
+        if path.hasPrefix("/") { return true }
+        #if os(Windows)
+        if path.hasPrefix("\\\\") { return true }
+        let scalars = Array(path.unicodeScalars)
+        if scalars.count >= 3,
+           CharacterSet.letters.contains(scalars[0]),
+           scalars[1] == ":",
+           scalars[2] == "\\" || scalars[2] == "/" {
+            return true
+        }
+        #endif
+        return false
     }
 
     static let definitions: [ChatTool] = [
@@ -223,7 +256,7 @@ struct WorktreeTools {
         let trimmed = path.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("~") else { return nil }
 
-        let candidate = trimmed.hasPrefix("/")
+        let candidate = Self.isAbsolutePath(trimmed)
             ? URL(fileURLWithPath: trimmed)
             : root.appendingPathComponent(trimmed)
         let resolved = candidate.resolvingSymlinksInPath().standardizedFileURL
@@ -236,8 +269,9 @@ struct WorktreeTools {
     /// Whether a URL lands inside the worktree once symlinks and `..` are resolved away. The
     /// single containment rule, so the walked-file path and the model-named path cannot drift.
     private func isContained(_ url: URL) -> Bool {
-        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
-        return path == root.path || path.hasPrefix(root.path + "/")
+        let components = Self.comparableComponents(of: url)
+        return components.count >= rootComponents.count
+            && Array(components.prefix(rootComponents.count)) == rootComponents
     }
 
     private func refusal(_ path: String) -> String {
@@ -251,9 +285,14 @@ struct WorktreeTools {
         // that exposes it: the enumerator hands back `/private/var/…` while `root.path` is
         // `/var/…`, the prefix check fails, and every hit in a subdirectory is reported as a bare
         // filename the model then cannot read back or cite as `path:line`.
-        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
-        guard path.hasPrefix(root.path + "/") else { return url.lastPathComponent }
-        return String(path.dropFirst(root.path.count + 1))
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+        let components = resolved.pathComponents
+        guard isContained(resolved), components.count > rootComponents.count else {
+            return url.lastPathComponent
+        }
+        // Always `/`-joined, whatever the platform separator: this is the path the model reads
+        // back and cites as `path:line`, and the diff it is checked against is `/`-separated.
+        return components.dropFirst(rootComponents.count).joined(separator: "/")
     }
 
     private func files(under url: URL) -> [URL] {

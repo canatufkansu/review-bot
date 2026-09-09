@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 enum ReviewEngineError: LocalizedError {
     case commandFailed(String)
