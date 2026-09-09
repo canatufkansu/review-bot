@@ -257,8 +257,9 @@ struct ProcessRunner: CommandRunning {
 
         let stdoutURL = temporaryDirectory.appendingPathComponent("stdout")
         let stderrURL = temporaryDirectory.appendingPathComponent("stderr")
-        fileManager.createFile(atPath: stdoutURL.path, contents: nil)
-        fileManager.createFile(atPath: stderrURL.path, contents: nil)
+        // `_ =`: swift-corelibs-foundation marks the result non-discardable, Darwin does not.
+        _ = fileManager.createFile(atPath: stdoutURL.path, contents: nil)
+        _ = fileManager.createFile(atPath: stderrURL.path, contents: nil)
 
         let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
         let stderrHandle = try FileHandle(forWritingTo: stderrURL)
