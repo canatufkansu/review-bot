@@ -10,6 +10,7 @@ import Foundation
 /// runs on this thread, while the tray's Win32 message loop runs on a thread of its own. The
 /// process ends when the model is told to quit, from the tray menu or the page.
 public enum ReviewBotWindowsApp {
+    @MainActor
     public static func run() async {
         let paths = StoragePaths()
         try? paths.prepare()
