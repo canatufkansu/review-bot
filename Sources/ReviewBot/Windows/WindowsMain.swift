@@ -3,13 +3,14 @@ import Foundation
 /// Review Bot on Windows: a tray icon and a local dashboard page, over the same engine as the
 /// macOS menu-bar app.
 ///
-/// `main` is `async` so the process lives on the Swift concurrency main executor: everything
-/// `@MainActor` — the stores, the model, the engine's callbacks — runs on this thread, while
-/// the tray's Win32 message loop runs on a thread of its own. The process ends when the model
-/// is told to quit, from the tray menu or the page.
-@main
-enum ReviewBotWindowsApp {
-    static func main() async {
+/// `run` is what the `ReviewBotWindows` executable target's `@main` calls — the only public
+/// symbol in the module, because SwiftPM cannot test a Windows target that carries an entry
+/// point (see `Package.swift`). It is `async` so the process lives on the Swift concurrency
+/// main executor: everything `@MainActor` — the stores, the model, the engine's callbacks —
+/// runs on this thread, while the tray's Win32 message loop runs on a thread of its own. The
+/// process ends when the model is told to quit, from the tray menu or the page.
+public enum ReviewBotWindowsApp {
+    public static func run() async {
         let paths = StoragePaths()
         try? paths.prepare()
 
