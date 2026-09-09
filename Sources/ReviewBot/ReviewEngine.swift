@@ -52,7 +52,7 @@ actor ReviewEngine {
     init(
         paths: StoragePaths,
         runner: any CommandRunning = ProcessRunner(),
-        credentials: any CredentialStoring = KeychainCredentialStore(),
+        credentials: any CredentialStoring = PlatformCredentialStore(),
         chatClient: any ChatCompleting = DeepSeekClient(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {

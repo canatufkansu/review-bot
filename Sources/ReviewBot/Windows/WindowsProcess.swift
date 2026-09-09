@@ -175,7 +175,7 @@ enum PlatformProcess: PlatformProcessLaunching {
                 &limits,
                 DWORD(MemoryLayout<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>.size)
             )
-            guard applied.boolValue else {
+            guard applied else {
                 CloseHandle(job)
                 return
             }
@@ -195,7 +195,7 @@ enum PlatformProcess: PlatformProcessLaunching {
         /// Kills everything in the job. `false` when there is no job to kill.
         func terminate() -> Bool {
             guard let handle else { return false }
-            return TerminateJobObject(handle, 1).boolValue
+            return TerminateJobObject(handle, 1)
         }
 
         func close() {

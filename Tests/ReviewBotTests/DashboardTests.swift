@@ -12,7 +12,7 @@ final class DashboardTests: XCTestCase {
     // MARK: - Request parsing
 
     func testParserReadsRequestLineHeadersQueryAndBody() throws {
-        let raw = "PUT /api/keys/Claude?t=abc&x=1%202 HTTP/1.1\r\nHost: 127.0.0.1:5\r\nContent-Length: 13\r\nAuthorization: Bearer tok\r\n\r\n{\"key\":\"k\"}"
+        let raw = "PUT /api/keys/Claude?t=abc&x=1%202 HTTP/1.1\r\nHost: 127.0.0.1:5\r\nContent-Length: 11\r\nAuthorization: Bearer tok\r\n\r\n{\"key\":\"k\"}"
         guard case let .complete(request) = HTTPRequestParser.parse(Data(raw.utf8)) else {
             return XCTFail("expected a complete request")
         }

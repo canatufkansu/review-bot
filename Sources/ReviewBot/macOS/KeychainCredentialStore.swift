@@ -1,6 +1,9 @@
 import Foundation
 import Security
 
+/// The store `ReviewEngine` and `AppModel` default to on this platform.
+typealias PlatformCredentialStore = KeychainCredentialStore
+
 struct KeychainCredentialStore: CredentialStoring {
     /// Deliberately uses the file-based login Keychain rather than the data-protection
     /// Keychain: the latter needs an `application-identifier` entitlement, which an

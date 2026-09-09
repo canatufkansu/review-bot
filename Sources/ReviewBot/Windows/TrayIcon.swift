@@ -122,7 +122,7 @@ final class TrayIcon: @unchecked Sendable {
         started.signal()
 
         var message = MSG()
-        while GetMessageW(&message, nil, 0, 0).boolValue {
+        while GetMessageW(&message, nil, 0, 0) {
             TranslateMessage(&message)
             DispatchMessageW(&message)
         }
@@ -193,13 +193,17 @@ final class TrayIcon: @unchecked Sendable {
         SetForegroundWindow(window)
         var point = POINT()
         GetCursorPos(&point)
-        // TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_NONOTIFY
-        let chosen = TrackPopupMenu(menu, 0x0002 | 0x0100 | 0x0020 | 0x0080, point.x, point.y, 0, window, nil)
+        // TPM_RIGHTBUTTON | TPM_BOTTOMALIGN. The chosen item arrives as WM_COMMAND (below)
+        // rather than as TPM_RETURNCMD's return value: `BOOL` imports as `Bool`, which cannot
+        // carry an item id.
+        TrackPopupMenu(menu, 0x0002 | 0x0020, point.x, point.y, 0, window, nil)
         PostMessageW(window, 0, 0, 0)
         DestroyMenu(menu)
+    }
 
-        // With TPM_RETURNCMD the BOOL carries the chosen item id.
-        switch unsafeBitCast(chosen, to: Int32.self) {
+    /// A menu item was chosen; `id` is the low word of WM_COMMAND's wParam.
+    fileprivate func handleCommand(_ id: UInt) {
+        switch id {
         case 1: onAction(.openDashboard)
         case 2: onAction(.runNow)
         case 3: onAction(.togglePaused)
@@ -285,6 +289,9 @@ private func trayWindowProcedure(_ window: HWND?, _ message: UINT, _ wParam: WPA
         return 0
     case TrayIcon.refreshMessage:
         TrayIcon.shared?.refresh()
+        return 0
+    case 0x0111: // WM_COMMAND
+        TrayIcon.shared?.handleCommand(UInt(wParam & 0xFFFF))
         return 0
     case 0x0010: // WM_CLOSE
         DestroyWindow(window)

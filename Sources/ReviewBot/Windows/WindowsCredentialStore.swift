@@ -1,6 +1,9 @@
 import Foundation
 import WinSDK
 
+/// The store `ReviewEngine` and `WindowsAppModel` default to on this platform.
+typealias PlatformCredentialStore = WindowsCredentialStore
+
 /// Reviewer API keys in the Windows Credential Manager, as generic credentials under
 /// `Review Bot reviewer API keys/<reviewer>`. They are encrypted under the user's login (DPAPI)
 /// and readable by any process running as that user, so — unlike the macOS Keychain — a rebuilt
@@ -46,7 +49,7 @@ struct WindowsCredentialStore: CredentialStoring {
         let deleted = target(for: reviewer).withCString(encodedAs: UTF16.self) { name in
             CredDeleteW(name, Self.genericType, 0)
         }
-        guard !deleted.boolValue else { return }
+        guard !deleted else { return }
         let error = GetLastError()
         guard error == Self.errorNotFound else {
             throw CredentialStoreError.platform(
@@ -73,7 +76,7 @@ struct WindowsCredentialStore: CredentialStoring {
         let found = target.withCString(encodedAs: UTF16.self) { name in
             CredReadW(name, Self.genericType, 0, &credential)
         }
-        guard found.boolValue, let credential else { return nil }
+        guard found, let credential else { return nil }
         defer { CredFree(credential) }
         let size = Int(credential.pointee.CredentialBlobSize)
         guard size > 0, let blob = credential.pointee.CredentialBlob else { return nil }
@@ -98,7 +101,7 @@ struct WindowsCredentialStore: CredentialStoring {
                 }
             }
         }
-        guard written.boolValue else {
+        guard written else {
             throw CredentialStoreError.platform(
                 store: "Credential Manager",
                 code: Int32(bitPattern: GetLastError()),
