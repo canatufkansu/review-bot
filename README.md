@@ -83,7 +83,7 @@ What differs from macOS:
 - **Launch at sign-in** is a per-user `Run` registry entry pointing at wherever `ReviewBot.exe` is. Move the executable and the entry goes stale; toggle it off and on again from the dashboard.
 - **Finding the CLIs.** Windows gives the app your full `Path`, so no login-shell probe is needed. Review Bot also searches npm's global folder (`%APPDATA%\npm`), `%USERPROFILE%\.local\bin`, scoop's shims, winget's links, and the Git and GitHub CLI installers under Program Files. A CLI installed with `npm install -g` is a `.cmd` launcher; Review Bot reads it and runs `node.exe` on the package's script directly rather than going through `cmd.exe`, which would re-parse the review prompt. Other `.cmd`/`.bat` launchers are refused — install a native executable instead.
 - **Time limits** are enforced with a job object, so a reviewer that is cut off takes every process it spawned with it.
-- **Data folder:** `%APPDATA%\ReviewBot\` (the same files as below).
+- **Data folder:** `%LOCALAPPDATA%\ReviewBot\` (the same files as below).
 - **Adding a repository** takes a folder path typed or pasted into the dashboard; there is no folder picker.
 
 If `ReviewBot.exe` fails to start with a missing-DLL error, install the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) — the Swift runtime depends on it.
@@ -217,7 +217,7 @@ Review Bot writes to:
 - `worktrees/` is temporary and normally empty between reviews.
 - `opencode/` holds the read-only agent definition the opencode reviewer runs under.
 
-Use **History → Show data folder** to open this location. On Windows the folder is `%APPDATA%\ReviewBot\` and holds one extra file while the app runs, `dashboard.json`, which records the dashboard's address for a second launch of the app to open.
+Use **History → Show data folder** to open this location. On Windows the folder is `%LOCALAPPDATA%\ReviewBot\` and holds one extra file while the app runs, `dashboard.json`, which records the dashboard's address for a second launch of the app to open.
 
 ## Privacy and safety
 
