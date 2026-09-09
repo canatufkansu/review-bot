@@ -109,6 +109,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
     /// spaced out by a widening backoff, so a permanently broken reviewer costs a
     /// bounded amount of work instead of re-running on every poll forever.
     var failureBudget: FailureBudget
+    /// How many pull requests a single poll reviews at the same time. Every one of
+    /// them runs every enabled reviewer, so this bounds the fan-out of CLI processes
+    /// (and the API traffic behind them); `1` restores the old one-at-a-time poll.
+    var maxConcurrentReviews: Int
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -135,7 +139,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         decisionPolicy: .default,
         reviewScope: .fullPullRequest,
         maxReviewRoundsPerPR: nil,
-        failureBudget: .default
+        failureBudget: .default,
+        maxConcurrentReviews: 3
     )
 
     private enum CodingKeys: String, CodingKey {
@@ -150,6 +155,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case reviewScope
         case maxReviewRoundsPerPR
         case failureBudget
+        case maxConcurrentReviews
     }
 
     init(
@@ -163,7 +169,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
         maxReviewRoundsPerPR: Int? = nil,
-        failureBudget: FailureBudget = .default
+        failureBudget: FailureBudget = .default,
+        maxConcurrentReviews: Int = 3
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -176,6 +183,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.reviewScope = reviewScope
         self.maxReviewRoundsPerPR = maxReviewRoundsPerPR.map { max(1, $0) }
         self.failureBudget = failureBudget
+        self.maxConcurrentReviews = max(1, maxConcurrentReviews)
     }
 
     init(from decoder: Decoder) throws {
@@ -230,6 +238,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
             FailureBudget.self,
             forKey: .failureBudget
         ) ?? .default
+        maxConcurrentReviews = max(
+            1,
+            try values.decodeIfPresent(Int.self, forKey: .maxConcurrentReviews) ?? 3
+        )
     }
 }
 
