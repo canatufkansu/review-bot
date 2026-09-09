@@ -1,11 +1,13 @@
-# Builds the Windows app and packages it as a zip: ReviewBot.exe, the Swift runtime DLLs it
-# needs, and a version.txt the dashboard shows. The Windows counterpart of build-app.sh.
+# Builds the Windows app and packages it twice: as a zip (ReviewBot.exe, the Swift runtime
+# DLLs it needs, and a version.txt the dashboard shows) and, when Inno Setup is installed, as
+# a setup.exe built from Packaging\ReviewBot.iss. The Windows counterpart of build-app.sh.
 #
 #   pwsh scripts\build-windows.ps1              -> dist\ReviewBot-dev-windows-x64.zip
+#                                                  dist\ReviewBot-dev-setup.exe
 #   $env:APP_VERSION = 'v1.2.3'; pwsh scripts\build-windows.ps1
 #
-# Unzip anywhere and run ReviewBot.exe. There is no installer: launch-at-login is a registry
-# entry the app writes for itself, pointing at wherever the .exe is.
+# The zip needs no installation: unzip anywhere and run ReviewBot.exe. The installer adds a
+# Start-menu entry, an uninstaller and an optional start-at-sign-in task.
 
 param([string]$Version = $env:APP_VERSION)
 
@@ -47,4 +49,20 @@ if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zip
 
 Write-Host "Built: $zip"
-Write-Host "Unzip it anywhere and run ReviewBot.exe; it appears in the notification area."
+
+# The installer. Inno Setup ships on GitHub's Windows runners and installs with
+# `winget install JRSoftware.InnoSetup`; without it the zip is still a complete build.
+$iscc = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+if (-not $iscc) {
+    $candidate = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+    if (Test-Path $candidate) { $iscc = $candidate }
+}
+if ($iscc) {
+    $script = Join-Path $root 'Packaging\ReviewBot.iss'
+    & $iscc /Q "/DAppVersion=$label" "/DSourceDir=$dist" "/DOutputDir=$(Join-Path $root 'dist')" $script
+    if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+    Write-Host "Built: $(Join-Path $root "dist\ReviewBot-$label-setup.exe")"
+} else {
+    Write-Host "Inno Setup (ISCC.exe) not found; skipped the installer. winget install JRSoftware.InnoSetup"
+}
+Write-Host "Run the setup.exe, or unzip the zip anywhere and run ReviewBot.exe; it appears in the notification area."

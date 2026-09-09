@@ -86,7 +86,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/ReviewBot-*-windows-x64.zip
+          path: |
+            dist/ReviewBot-*-setup.exe
+            dist/ReviewBot-*-windows-x64.zip
 
   publish:
     name: Publish GitHub Release
@@ -102,6 +104,7 @@ jobs:
         with:
           files: |
             artifacts/macos/ReviewBot-*.dmg
+            artifacts/windows/ReviewBot-*-setup.exe
             artifacts/windows/ReviewBot-*-windows-x64.zip
           body_path: artifacts/release-notes/release-notes.md
           fail_on_unmatched_files: true

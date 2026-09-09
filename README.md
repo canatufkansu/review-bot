@@ -65,13 +65,17 @@ Launch-at-login registration only works reliably from the packaged app in `/Appl
 
 The same engine runs on Windows as a notification-area (tray) app. Instead of a native settings window, the tray icon opens a dashboard page in your browser, served from the app itself on `127.0.0.1` — it never listens on the network, and every request from the page carries a token that only the tray hands out. The page has the same tabs as the macOS settings window: Repositories, Reviewers, Decisions, Prompt, and History.
 
-Build and package with PowerShell:
+**Install.** Every release carries `ReviewBot-<version>-setup.exe`: a per-user installer (no administrator rights) that puts the app under `%LOCALAPPDATA%\Programs\Review Bot`, adds a Start-menu entry and an uninstaller, offers to start it at sign-in, and starts it when it finishes. The installer is unsigned, so SmartScreen may ask once; choose *More info → Run anyway*. The same release also carries `ReviewBot-<version>-windows-x64.zip` for a portable install: unzip anywhere and run `ReviewBot.exe`.
+
+Either way the app appears in the notification area. Double-click the icon or choose **Open dashboard** from its menu. Running it a second time opens the running instance's dashboard rather than starting another.
+
+**Build.** With the Swift toolchain installed, PowerShell builds both packages:
 
 ```powershell
 pwsh scripts\build-windows.ps1
 ```
 
-This produces `dist\ReviewBot-dev-windows-x64.zip` containing `ReviewBot.exe` and the Swift runtime DLLs it needs. Unzip it anywhere and run `ReviewBot.exe`; it appears in the notification area. Double-click the icon or choose **Open dashboard** from its menu. Running it a second time opens the running instance's dashboard rather than starting another. Releases on GitHub include the same zip.
+This produces `dist\ReviewBot-dev-windows-x64.zip` and, if Inno Setup is installed (`winget install JRSoftware.InnoSetup`), `dist\ReviewBot-dev-setup.exe` from `Packaging\ReviewBot.iss`.
 
 What differs from macOS:
 

@@ -49,9 +49,11 @@ jobs:
       - name: Package
         run: pwsh scripts/build-windows.ps1
 
-      # The zip from a pull request build, so a change can be tried on a Windows machine
-      # without cutting a release.
+      # The installer and the zip from a pull request build, so a change can be tried on a
+      # Windows machine without cutting a release.
       - uses: actions/upload-artifact@v4
         with:
           name: ReviewBot-windows-x64
-          path: dist/ReviewBot-*-windows-x64.zip
+          path: |
+            dist/ReviewBot-*-setup.exe
+            dist/ReviewBot-*-windows-x64.zip
