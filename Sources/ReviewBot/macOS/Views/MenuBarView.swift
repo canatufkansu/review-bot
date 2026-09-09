@@ -97,8 +97,8 @@ struct MenuBarView: View {
                 StatChip(
                     icon: "sparkles",
                     label: "Running",
-                    value: model.runningReview == nil ? 0 : 1,
-                    tint: model.runningReview == nil ? .secondary : .blue
+                    value: model.runningReviews.count,
+                    tint: model.runningReviews.isEmpty ? .secondary : .blue
                 )
                 StatChip(
                     icon: "hourglass",
@@ -109,8 +109,8 @@ struct MenuBarView: View {
                 Spacer()
             }
 
-            if let running = model.runningReview {
-                QueueRow(item: running, state: "Running", color: .blue, showsProgress: true)
+            ForEach(model.runningReviews) { item in
+                QueueRow(item: item, state: "Running", color: .blue, showsProgress: true)
             }
 
             ForEach(model.pendingReviews.prefix(3)) { item in

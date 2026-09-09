@@ -10,7 +10,8 @@ struct DashboardSnapshot: Codable {
     var reviewersWithSavedKey: [ReviewerName]
     var launchAtLoginEnabled: Bool
     var pendingReviews: [ReviewQueueItem]
-    var runningReview: ReviewQueueItem?
+    /// Every review in flight: a poll reviews several pull requests at once.
+    var runningReviews: [ReviewQueueItem]
     /// The latest failure the shell wants shown, cleared once the page has fetched it.
     var errorMessage: String?
     var configuration: ReviewBotConfiguration

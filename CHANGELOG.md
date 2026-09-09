@@ -38,6 +38,22 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - **A large file in the review worktree is served a page at a time instead of being refused.** The DeepSeek tool sandbox capped files at 1 MB and reported everything it turned away — too large, binary, or genuinely mis-encoded — as "not a readable UTF-8 text file". A 1.5 MB diff that was valid UTF-8 throughout was therefore unreadable both to `read_file` and to `search`, and unavailable to inline in the opening message, so the reviewer could not see the pull request at all and said so. Size now bounds what a read *returns*, never whether a file can be opened: `read_file` pages with `offset`/`limit`, `search` matches line by line, and only a file too large to hold in memory is turned away. The three refusals now say which one they are, so a reader that could page through a large file is told to.
 - **A pull request too large for GitHub's diff API is now reviewed from the local clone.** `gh pr diff` answers anything over 20,000 lines with an HTTP 406, which is a property of the API rather than of the pull request — so the review failed, retried, and burned its whole failure budget on a condition no retry could ever get past. Review Bot already fetches both the pull request head and its base branch before the review starts, so the same three-dot diff is now computed locally when the API refuses, with no line ceiling. `git diff base...head` is exactly what `gh pr diff` asks the API to render, so reviewers cannot tell which route produced the patch; a review only fails now if the clone cannot produce the diff either, and the message says so rather than pointing at GitHub's limit alone.
 
+## [0.1.16] - 2026-09-09
+
+### Added
+
+- **A poll now reviews several pull requests at once instead of one after another.** Every request a poll discovered was reviewed in sequence, so the last one in a backlog of five waited out four full reviews — each of them minutes of CLI time — before it started, with the machine idle in between. Reviews now run concurrently, bounded by a new **Review up to N pull requests at once** setting on the dashboard (default 3, `1` restores the old behaviour). The bound is the point: each pull request runs *every* enabled reviewer, so an unbounded queue would put a dozen reviewer processes against the same API at the same time.
+- The menu bar's queue lists every review currently running, not just one.
+
+### Changed
+
+- The git steps of a review — the fetch, `worktree add`, and the worktree cleanup — are serialized per repository, since concurrent reviews of pull requests in the same repository share one clone and would contend for git's ref and index locks. A loser of that race fails with something like "cannot lock ref", which nothing downstream could distinguish from a real failure: it would spend the request's retry budget and back the review off. The reviewer CLIs, where a review actually spends its time, still overlap freely.
+- While several reviews run, the status line reports the queue's progress ("Reviewed 2 of 5 pull requests…") rather than flickering between the pull requests competing for it. A lone review still narrates itself as before.
+
+### Fixed
+
+- The menu bar showed only the most recently started review, so with concurrent reviews an earlier one would vanish from the queue while it was still running.
+
 ## [0.1.15] - 2026-08-27
 
 ### Changed
@@ -174,7 +190,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/melihucar/review-bot/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/melihucar/review-bot/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/melihucar/review-bot/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/melihucar/review-bot/compare/v0.1.12...v0.1.13

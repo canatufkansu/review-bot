@@ -12,7 +12,8 @@ final class WindowsAppModel: DashboardBackend {
     private(set) var toolAvailability: [String: Bool] = [:]
     private(set) var reviewersWithSavedKey: Set<ReviewerName> = []
     private(set) var pendingReviews: [ReviewQueueItem] = []
-    private(set) var runningReview: ReviewQueueItem?
+    /// Every review running right now — a poll reviews several pull requests at once.
+    private(set) var runningReviews: [ReviewQueueItem] = []
     /// Shown once by the page, then cleared — the equivalent of the macOS alert.
     private var errorMessage: String?
     /// Bumped on every configuration change so the page knows when to re-render its forms.
@@ -118,7 +119,7 @@ final class WindowsAppModel: DashboardBackend {
             reviewersWithSavedKey: ReviewerName.allCases.filter { reviewersWithSavedKey.contains($0) },
             launchAtLoginEnabled: WindowsShell.LaunchAtLogin.isEnabled,
             pendingReviews: pendingReviews,
-            runningReview: runningReview,
+            runningReviews: runningReviews,
             errorMessage: message,
             configuration: settings.configuration,
             configurationVersion: configurationVersion,
@@ -344,7 +345,7 @@ final class WindowsAppModel: DashboardBackend {
             // remain queued afterward. Reset defensively so a missed or out-of-order terminal
             // event can never leave a stale count on the page.
             pendingReviews.removeAll()
-            runningReview = nil
+            runningReviews.removeAll()
             changed()
         }
 
@@ -376,12 +377,11 @@ final class WindowsAppModel: DashboardBackend {
             pendingReviews.append(item)
         case .reviewStarted:
             pendingReviews.removeAll(where: { $0.id == item.id })
-            runningReview = item
+            runningReviews.removeAll(where: { $0.id == item.id })
+            runningReviews.append(item)
         case .approved, .changesRequested, .commented, .failed:
             pendingReviews.removeAll(where: { $0.id == item.id })
-            if runningReview?.id == item.id {
-                runningReview = nil
-            }
+            runningReviews.removeAll(where: { $0.id == item.id })
         }
     }
 }

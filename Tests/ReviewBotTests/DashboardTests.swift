@@ -63,7 +63,7 @@ final class DashboardTests: XCTestCase {
             DashboardSnapshot(
                 status: "Watching", isRunning: false, lastCheckDate: nil, toolAvailability: [:],
                 reviewersWithSavedKey: Array(keys.keys), launchAtLoginEnabled: false,
-                pendingReviews: [], runningReview: nil, errorMessage: nil,
+                pendingReviews: [], runningReviews: [], errorMessage: nil,
                 configuration: configuration, configurationVersion: version, historyCount: 0,
                 lastEventKind: nil, dataFolder: "C:\\data", version: "test",
                 reviewers: ReviewerDescriptor.all

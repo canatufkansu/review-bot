@@ -36,8 +36,10 @@ actor ReviewEngine {
     private let attempts: ReviewAttemptStore
     private let logger: ActivityLogger
     private let now: @Sendable () -> Date
+    /// Serializes the git steps of concurrent reviews that share a clone.
+    private let gitGate = RepositoryGate()
 
-    private struct PendingPullRequest {
+    private struct PendingPullRequest: Sendable {
         let summary: PullRequestSummary
         let metadata: PullRequestMetadata
         let repository: RepositoryConfiguration
@@ -120,14 +122,12 @@ actor ReviewEngine {
                 deferredRequests += discovered.deferred
             }
 
-            for pendingReview in pendingReviews {
-                await review(
-                    pendingReview,
-                    configuration: configuration,
-                    onEvent: onEvent,
-                    onStatus: onStatus
-                )
-            }
+            await runPendingReviews(
+                pendingReviews,
+                configuration: configuration,
+                onEvent: onEvent,
+                onStatus: onStatus
+            )
 
             await onStatus(
                 watchingStatus(
@@ -337,12 +337,82 @@ actor ReviewEngine {
         }
     }
 
-    private func review(
-        _ pendingReview: PendingPullRequest,
+    /// Reviews everything this poll discovered, `configuration.maxConcurrentReviews`
+    /// at a time.
+    ///
+    /// A review is minutes of CLI time, so reviewing a queue one pull request at a
+    /// time meant the newest request waited out every older one — a backlog of five
+    /// took five times as long as it needed to, with the machine idle in between. The
+    /// cap is the counterweight: each pull request runs *every* enabled reviewer, so
+    /// an unbounded fan-out would put a dozen CLI processes against the same API at
+    /// once.
+    private func runPendingReviews(
+        _ pendingReviews: [PendingPullRequest],
         configuration: ReviewBotConfiguration,
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
     ) async {
+        guard !pendingReviews.isEmpty else { return }
+        let total = pendingReviews.count
+        let limit = max(1, min(configuration.maxConcurrentReviews, total))
+        // There is one status line and it can only describe one thing. A lone review
+        // narrates itself as before; a queue would just flicker between its members,
+        // so the poll reports the queue's progress instead and the per-pull-request
+        // detail stays in the menu bar queue and the history.
+        let announcesStatus = total == 1
+        if !announcesStatus {
+            await onStatus(Self.queueStatus(completed: 0, total: total))
+        }
+
+        var completed = 0
+        await withTaskGroup(of: Void.self) { group in
+            var inFlight = 0
+            for pendingReview in pendingReviews {
+                if inFlight == limit {
+                    _ = await group.next()
+                    inFlight -= 1
+                    completed += 1
+                    if !announcesStatus {
+                        await onStatus(Self.queueStatus(completed: completed, total: total))
+                    }
+                }
+                group.addTask {
+                    await self.review(
+                        pendingReview,
+                        configuration: configuration,
+                        announcesStatus: announcesStatus,
+                        onEvent: onEvent,
+                        onStatus: onStatus
+                    )
+                }
+                inFlight += 1
+            }
+
+            while await group.next() != nil {
+                completed += 1
+                if !announcesStatus {
+                    await onStatus(Self.queueStatus(completed: completed, total: total))
+                }
+            }
+        }
+    }
+
+    private static func queueStatus(completed: Int, total: Int) -> String {
+        completed == 0
+            ? "Reviewing \(total) pull requests…"
+            : "Reviewed \(completed) of \(total) pull requests…"
+    }
+
+    /// - Parameter announcesStatus: whether this review owns the status line. False
+    ///   when it is one of several running at once — see `runPendingReviews`.
+    private func review(
+        _ pendingReview: PendingPullRequest,
+        configuration: ReviewBotConfiguration,
+        announcesStatus: Bool = true,
+        onEvent: @escaping EventSink,
+        onStatus: @escaping StatusSink
+    ) async {
+        let announce: StatusSink = announcesStatus ? onStatus : { _ in }
         let pullRequest = pendingReview.summary
         let metadata = pendingReview.metadata
         let repository = pendingReview.repository
@@ -351,26 +421,7 @@ actor ReviewEngine {
         var spent: TokenUsage?
 
         do {
-            await onStatus("Preparing \(repository.name) #\(pullRequest.number)…")
-
-            let fetch = try await runner.run(
-                "git",
-                arguments: [
-                    "-C", repository.path,
-                    "fetch", "--quiet", "origin",
-                    "refs/pull/\(pullRequest.number)/head",
-                    // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
-                    // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
-                    // merely an opportunistic side effect of the clone's configured fetch
-                    // refspec. `mergePreview` reads that remote-tracking ref, so name it here
-                    // rather than depending on how this particular clone happens to be set up.
-                    "+refs/heads/\(metadata.baseRefName):refs/remotes/origin/\(metadata.baseRefName)",
-                ],
-                timeout: 180
-            )
-            guard fetch.succeeded else {
-                throw ReviewEngineError.commandFailed("Git fetch failed: \(conciseError(fetch))")
-            }
+            await announce("Preparing \(repository.name) #\(pullRequest.number)…")
 
             let repositoryDirectory = paths.worktreesDirectory.appendingPathComponent(
                 safeFilename(repository.githubSlug),
@@ -386,20 +437,7 @@ actor ReviewEngine {
             )
             worktreeURL = worktree
 
-            let addWorktree = try await runner.run(
-                "git",
-                arguments: [
-                    "-C", repository.path,
-                    "worktree", "add", "--quiet", "--detach",
-                    worktree.path, metadata.headRefOid,
-                ],
-                timeout: 60
-            )
-            guard addWorktree.succeeded else {
-                throw ReviewEngineError.commandFailed(
-                    "Could not create the review worktree: \(conciseError(addWorktree))"
-                )
-            }
+            try await checkOutPullRequest(pendingReview, at: worktree)
             worktreeAdded = true
 
             let priorHead = lastReviewed.head(
@@ -421,7 +459,7 @@ actor ReviewEngine {
                 message: reviewerDescription(configuration),
                 onEvent: onEvent
             )
-            await onStatus("Reviewing \(repository.name) #\(pullRequest.number)…")
+            await announce("Reviewing \(repository.name) #\(pullRequest.number)…")
 
             // Resolved once, here, before any reviewer starts — and off this actor. Reading a
             // Keychain item is a synchronous call that can block on a modal prompt, so doing it
@@ -500,7 +538,7 @@ actor ReviewEngine {
             // exactly like one that came back decisive.
             var adjudicationSpend: ReviewerResult?
             if DecisionEvaluator.gateDisagreement(results, policy: policy) {
-                await onStatus("Reviewers disagreed on \(repository.name) #\(pullRequest.number); reconciling…")
+                await announce("Reviewers disagreed on \(repository.name) #\(pullRequest.number); reconciling…")
                 let adjudicated = await runReconciliation(
                     results: results,
                     configuration: configuration,
@@ -632,6 +670,10 @@ actor ReviewEngine {
         }
 
         if let worktreeURL, worktreeAdded {
+            // Gated like the checkout: `worktree remove` and the `prune` fallback both
+            // rewrite the shared clone's worktree administration, which a concurrent
+            // review of the same repository may be adding to right now.
+            await gitGate.acquire(repository.githubSlug)
             let cleanup = try? await runner.run(
                 "git",
                 arguments: [
@@ -648,7 +690,62 @@ actor ReviewEngine {
                     timeout: 30
                 )
             }
+            await gitGate.release(repository.githubSlug)
         }
+    }
+
+    /// Fetches the pull request and checks its head out in a fresh worktree.
+    ///
+    /// Held under `gitGate` for the whole sequence: reviews now overlap, and two of
+    /// them fetching into the same clone contend for git's ref locks. The gate must be
+    /// released on every path — an early `throw` that skipped it would strand every
+    /// other pull request in the repository for the rest of the poll.
+    private func checkOutPullRequest(
+        _ pendingReview: PendingPullRequest,
+        at worktree: URL
+    ) async throws {
+        let repository = pendingReview.repository
+        await gitGate.acquire(repository.githubSlug)
+        do {
+            let fetch = try await runner.run(
+                "git",
+                arguments: [
+                    "-C", repository.path,
+                    "fetch", "--quiet", "origin",
+                    "refs/pull/\(pendingReview.summary.number)/head",
+                    // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
+                    // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
+                    // merely an opportunistic side effect of the clone's configured fetch
+                    // refspec. `mergePreview` reads that remote-tracking ref, so name it here
+                    // rather than depending on how this particular clone happens to be set up.
+                    "+refs/heads/\(pendingReview.metadata.baseRefName)"
+                        + ":refs/remotes/origin/\(pendingReview.metadata.baseRefName)",
+                ],
+                timeout: 180
+            )
+            guard fetch.succeeded else {
+                throw ReviewEngineError.commandFailed("Git fetch failed: \(conciseError(fetch))")
+            }
+
+            let addWorktree = try await runner.run(
+                "git",
+                arguments: [
+                    "-C", repository.path,
+                    "worktree", "add", "--quiet", "--detach",
+                    worktree.path, pendingReview.metadata.headRefOid,
+                ],
+                timeout: 60
+            )
+            guard addWorktree.succeeded else {
+                throw ReviewEngineError.commandFailed(
+                    "Could not create the review worktree: \(conciseError(addWorktree))"
+                )
+            }
+        } catch {
+            await gitGate.release(repository.githubSlug)
+            throw error
+        }
+        await gitGate.release(repository.githubSlug)
     }
 
     private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {

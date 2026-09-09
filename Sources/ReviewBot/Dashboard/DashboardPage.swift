@@ -180,6 +180,12 @@ enum DashboardPage {
             <span class="caption" id="lastChecked"></span>
           </div>
           <div class="row">
+            <label class="name">At once</label>
+            <input type="number" id="maxConcurrent" min="1" max="8" style="width:70px">
+            <span id="maxConcurrentLabel"></span>
+          </div>
+          <div class="caption">Each pull request runs every enabled reviewer, so this many times that many CLI processes, and that much API traffic, can be in flight together. Pull requests from the same repository still prepare their worktrees one at a time.</div>
+          <div class="row">
             <label><input type="checkbox" id="launchAtLogin"> Launch Review Bot when you sign in</label>
           </div>
         </div>
@@ -411,14 +417,14 @@ enum DashboardPage {
         $('monitorStatus').innerHTML = '<b>' + escapeHTML(paused ? 'Monitoring is paused' : s.status) + '</b>';
         $('lastChecked').textContent = s.lastCheckDate ? 'Last checked ' + relative(s.lastCheckDate) : '';
         $('launchAtLogin').checked = s.launchAtLoginEnabled;
-        $('runningCount').textContent = s.runningReview ? 1 : 0;
+        $('runningCount').textContent = s.runningReviews.length;
         $('pendingCount').textContent = s.pendingReviews.length;
         const minutes = config.pollIntervalMinutes;
         const enabledRepos = config.repositories.filter((r) => r.enabled).length;
         $('configSummary').textContent = '⏱ Every ' + (minutes === 60 ? '1 hour' : minutes + ' minutes') + ' · 📦 ' + enabledRepos + ' enabled';
 
         let queue = '';
-        if (s.runningReview) queue += queueRow(s.runningReview, 'running', 'Running');
+        s.runningReviews.forEach((item) => { queue += queueRow(item, 'running', 'Running'); });
         s.pendingReviews.slice(0, 3).forEach((item) => { queue += queueRow(item, 'pending', 'Pending'); });
         if (s.pendingReviews.length > 3) queue += '<div class="caption">+ ' + (s.pendingReviews.length - 3) + ' more pending</div>';
         $('queueList').innerHTML = queue;
@@ -440,6 +446,8 @@ enum DashboardPage {
       // ---- config forms ------------------------------------------------------------------
       function renderConfig() {
         $('pollInterval').value = String(config.pollIntervalMinutes);
+        $('maxConcurrent').value = config.maxConcurrentReviews;
+        $('maxConcurrentLabel').textContent = config.maxConcurrentReviews === 1 ? 'pull request at a time' : 'pull requests at once';
         $('includeUsage').checked = config.includeUsageInReview;
         seg($('reviewScope'), config.reviewScope);
 
@@ -718,6 +726,7 @@ enum DashboardPage {
       $('quit').onclick = () => { if (confirm('Quit Review Bot? Monitoring stops until you start it again.')) api('POST', 'quit').catch(() => {}); };
       $('launchAtLogin').onchange = () => api('PUT', 'launch-at-login', { enabled: $('launchAtLogin').checked }).then(poll).catch((e) => showError(e.message));
       $('pollInterval').onchange = () => { config.pollIntervalMinutes = Number($('pollInterval').value); queueSave(); renderLive(); };
+      $('maxConcurrent').oninput = () => { const n = parseInt($('maxConcurrent').value, 10); if (n >= 1 && n <= 8) { config.maxConcurrentReviews = n; $('maxConcurrentLabel').textContent = n === 1 ? 'pull request at a time' : 'pull requests at once'; queueSave(); } };
       $('includeUsage').onchange = () => { config.includeUsageInReview = $('includeUsage').checked; queueSave(); };
       $('reviewScope').querySelectorAll('button').forEach((b) => { b.onclick = () => { config.reviewScope = b.dataset.value; queueSave(); seg($('reviewScope'), config.reviewScope); }; });
       $('limitRounds').onchange = () => { config.maxReviewRoundsPerPR = $('limitRounds').checked ? 3 : null; queueSave(); renderConfig(); };
@@ -735,7 +744,7 @@ enum DashboardPage {
         finally { $('addRepo').disabled = false; }
       };
       $('newRepoPath').onkeydown = (event) => { if (event.key === 'Enter') $('addRepo').click(); };
-      document.querySelectorAll('#customPrompt, #pollInterval, #includeUsage, #maxRounds, #failureBudget, #newRepoPath').forEach((el) => el.setAttribute('data-config', ''));
+      document.querySelectorAll('#customPrompt, #pollInterval, #maxConcurrent, #includeUsage, #maxRounds, #failureBudget, #newRepoPath').forEach((el) => el.setAttribute('data-config', ''));
 
       poll();
       setInterval(poll, 2000);
