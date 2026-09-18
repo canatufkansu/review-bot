@@ -17,10 +17,13 @@ enum ReviewEffort: String, Codable, CaseIterable, Identifiable {
     }
 
     // Claude, Codex, and opencode expose different top-tier effort names, so
-    // each reviewer only offers the levels its CLI accepts.
+    // each reviewer only offers the levels its CLI accepts. Gemini's CLI has no
+    // effort flag at all — its empty list hides the picker rather than offering
+    // a control that would silently do nothing.
     static let claudeCases: [ReviewEffort] = [.low, .medium, .high, .max]
     static let codexCases: [ReviewEffort] = [.low, .medium, .high, .xhigh]
     static let opencodeCases: [ReviewEffort] = [.low, .medium, .high, .max]
+    static let geminiCases: [ReviewEffort] = []
 }
 
 /// How much of a pull request each review looks at.
@@ -144,6 +147,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var claude: ReviewerConfiguration
     var codex: ReviewerConfiguration
     var opencode: ReviewerConfiguration
+    var gemini: ReviewerConfiguration
     var customPrompt: String
     var decisionPolicy: DecisionPolicy
     var reviewScope: ReviewScope
@@ -183,6 +187,13 @@ struct ReviewBotConfiguration: Codable, Equatable {
             effort: .max,
             authMode: .session
         ),
+        // Gemini is opt-in too. `effort` is stored but unused — the CLI takes no
+        // effort flag — so it keeps the shared default rather than a meaningful value.
+        gemini: ReviewerConfiguration(
+            enabled: false,
+            model: "gemini-3-pro-preview",
+            effort: .high
+        ),
         customPrompt: "",
         decisionPolicy: .default,
         reviewScope: .fullPullRequest,
@@ -203,6 +214,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case claude
         case codex
         case opencode
+        case gemini
         case customPrompt
         case decisionPolicy
         case reviewScope
@@ -218,6 +230,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         claude: ReviewerConfiguration,
         codex: ReviewerConfiguration,
         opencode: ReviewerConfiguration,
+        gemini: ReviewerConfiguration,
         customPrompt: String,
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
@@ -231,6 +244,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.claude = claude
         self.codex = codex
         self.opencode = opencode
+        self.gemini = gemini
         self.customPrompt = customPrompt
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
@@ -262,6 +276,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
             ReviewerConfiguration.self,
             forKey: .opencode
         ) ?? ReviewBotConfiguration.default.opencode
+        gemini = try values.decodeIfPresent(
+            ReviewerConfiguration.self,
+            forKey: .gemini
+        ) ?? ReviewBotConfiguration.default.gemini
         if !ReviewEffort.claudeCases.contains(claude.effort) {
             claude.effort = .high
         }
@@ -271,6 +289,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         if !ReviewEffort.opencodeCases.contains(opencode.effort) {
             opencode.effort = .max
         }
+        // Gemini has no clamp: its CLI takes no effort flag, so no stored value
+        // is wrong and there is no valid set to snap one back to.
         // `ReviewerConfiguration.init(from:)` decodes a missing `model` to an empty string so a
         // hand-edited config still loads instead of throwing the whole file away. An empty model
         // is not runnable, though — the CLI would be invoked as `--model ""` and fail in a way
@@ -379,6 +399,7 @@ enum ReviewerName: String, Codable, CaseIterable {
     case claude = "Claude"
     case codex = "Codex"
     case opencode = "opencode"
+    case gemini = "Gemini"
 
     /// The CLI this reviewer shells out to, or `nil` for a reviewer that is not backed by a
     /// command at all.
@@ -387,6 +408,7 @@ enum ReviewerName: String, Codable, CaseIterable {
         case .claude: "claude"
         case .codex: "codex"
         case .opencode: "opencode"
+        case .gemini: "gemini"
         }
     }
 
@@ -406,8 +428,10 @@ enum ReviewerName: String, Codable, CaseIterable {
         case .claude: "ANTHROPIC_API_KEY"
         case .codex: "OPENAI_API_KEY"
         // opencode is credentialed through OPENCODE_CONFIG_DIR, not through an injected key,
-        // so there is nothing to hand its child process.
-        case .opencode: nil
+        // so there is nothing to hand its child process. Gemini is the same shape: it signs in
+        // through its own CLI and runs under a policy file Review Bot writes, so Review Bot has
+        // nothing to hand it either — it stays session-only.
+        case .opencode, .gemini: nil
         }
     }
 
@@ -424,6 +448,7 @@ enum ReviewerName: String, Codable, CaseIterable {
         case .claude: "ANTHROPIC_API_KEY"
         case .codex: "OPENAI_API_KEY"
         case .opencode: "OPENCODE_API_KEY"
+        case .gemini: "GEMINI_API_KEY"
         }
     }
 }
@@ -436,6 +461,7 @@ extension ReviewBotConfiguration {
         case .claude: claude
         case .codex: codex
         case .opencode: opencode
+        case .gemini: gemini
         }
     }
 }
@@ -488,6 +514,12 @@ enum ReviewerFailureClass: Equatable {
             "please run `claude login`",
             "credit balance is too low",
             "hit your weekly limit",
+            // Gemini: quota, a rejected credential, and a CLI build whose OAuth
+            // client the service no longer accepts — none of which a second call fixes.
+            "resource_exhausted",
+            "error authenticating",
+            "api key not valid",
+            "this client is no longer supported",
             // Review Bot's own message for a reviewer set to API-key auth whose key is absent
             // or whose Keychain prompt was denied. Only Settings can fix that, so retrying
             // would spend the failure budget on a request that cannot start.
