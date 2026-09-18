@@ -928,13 +928,16 @@ actor ReviewEngine {
             : ""
 
         // What the diff cannot show: how this pull request interacts with a base branch that has
-        // moved since it was cut. Best-effort — a repository whose base ref could not be resolved
-        // still gets a review, just without the merge section.
+        // moved since it was cut. Best-effort in one direction only — a repository whose base ref
+        // could not be resolved still gets a review, just without the merge section. Writing the
+        // file is not best-effort: the alternative to a written preview is a *removed* one, since
+        // this is the single context file the bot does not always overwrite and the prompt reads
+        // its absence as "the PR is current with its base".
+        let mergePreviewFile = worktree.appendingPathComponent(".review-bot-merge.md")
         if let preview = await mergePreview(repository: repository, metadata: metadata) {
-            try? Data(preview.render().utf8).write(
-                to: worktree.appendingPathComponent(".review-bot-merge.md"),
-                options: .atomic
-            )
+            try Data(preview.render().utf8).write(to: mergePreviewFile, options: .atomic)
+        } else {
+            try removePullRequestCopy(of: mergePreviewFile)
         }
 
         async let conversation = captureCommand {
@@ -988,6 +991,25 @@ actor ReviewEngine {
             options: .atomic
         )
         return ReviewContext(thread: thread, diff: diffText)
+    }
+
+    /// Removes a Review Bot context file that the pull request itself committed at the same path.
+    ///
+    /// The review worktree is checked out at the pull request's head, so every `.review-bot-*`
+    /// path is content the author controls until the bot overwrites it — and the prompt presents
+    /// those files to the reviewers as Review Bot's own evidence, verdict lines included. Files
+    /// the bot always writes are safe by construction; this is for the ones it may not write.
+    /// A removal that fails throws: reviewing against planted context is worse than not reviewing.
+    private func removePullRequestCopy(of file: URL) throws {
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: file)
+        } catch {
+            throw ReviewEngineError.commandFailed(
+                "Could not remove the \(file.lastPathComponent) committed by the pull request: "
+                    + error.localizedDescription
+            )
+        }
     }
 
     /// How this pull request interacts with a base branch that may have moved since it was cut, or
@@ -1372,6 +1394,11 @@ actor ReviewEngine {
     ) async -> ReviewerResult {
         let outputFile = worktree.appendingPathComponent(".review-bot-codex.md")
         do {
+            // codex writes its review here, but the worktree is the pull request's head: a PR can
+            // commit its own `.review-bot-codex.md`, and a run that exits 0 without producing one
+            // would be read back as codex's review, planted verdict line included. Clear it first,
+            // so the only file this reviewer can read is the one this run wrote.
+            try removePullRequestCopy(of: outputFile)
             let result = try await runner.run(
                 "codex",
                 arguments: [
