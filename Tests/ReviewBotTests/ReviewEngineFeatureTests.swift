@@ -473,6 +473,40 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(claudeCount, 1)
     }
 
+    /// The preference is a list, not a single fallback: with both reviewers ahead of it down,
+    /// the pass walks past each of them to the first one that answered.
+    func testReconciliationWalksPastEveryReviewerThatProducedNoVerdict() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            opencodeVerdict: .shouldFix,
+            geminiVerdict: .clean,
+            reconciledVerdict: .clean,
+            failCodex: true,
+            codexFailureMessage: "ERROR: You've hit your usage limit. Try again at 2:22 PM.",
+            failClaude: true,
+            claudeFailureMessage: "Invalid API key",
+            failClaudeReconciliation: true
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+        configuration.gemini.enabled = true
+        configuration.opencode.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let reconciliationCount = await runner.reconciliationCount()
+        let adjudicator = await runner.reconciliationAdjudicator()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(reconciliationCount, 1)
+        XCTAssertEqual(adjudicator, .gemini, "Claude and Codex both produced no verdict")
+        XCTAssertTrue(postedBody.contains("so Gemini reconciled the findings"))
+        // The adjudication counts as Gemini's reconciliation pass, not a second Gemini review.
+        let geminiCount = await runner.geminiCount()
+        XCTAssertEqual(geminiCount, 1)
+    }
+
     /// The configured preference is only reordered by availability: when Claude did produce a
     /// verdict it still adjudicates, even though Codex also finished.
     func testReconciliationKeepsClaudeAsAdjudicatorWhenItProducedAVerdict() async throws {
@@ -626,6 +660,136 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(opencodeCount, 1)
         XCTAssertEqual(postArgument, "--approve")
         XCTAssertEqual(events.last?.kind, .approved)
+    }
+
+    func testGeminiOnlyReviewPostsApprovalAndRunsReadOnly() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(geminiVerdict: .clean)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.gemini.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let claudeCount = await runner.claudeCount()
+        let geminiCount = await runner.geminiCount()
+        let arguments = await runner.geminiInvocation()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(claudeCount, 0)
+        // A verdict at all proves the JSON envelope was unwrapped: the raw stdout the
+        // mock returns has no trailing `VERDICT:` line for the parser to find.
+        XCTAssertEqual(geminiCount, 1)
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+
+        // The sandbox flags are the whole reason this reviewer is safe to run against
+        // a pull request's own checkout, so they are asserted rather than assumed.
+        XCTAssertTrue(arguments.contains("--skip-trust"))
+        XCTAssertEqual(arguments.firstIndex(of: "--extensions").map { arguments[$0 + 1] }, "none")
+        XCTAssertEqual(arguments.firstIndex(of: "--output-format").map { arguments[$0 + 1] }, "json")
+        let policyPath = try XCTUnwrap(
+            arguments.firstIndex(of: "--policy").map { arguments[$0 + 1] }
+        )
+        XCTAssertEqual(policyPath, fixture.paths.geminiPolicyFile.path)
+        // …and the policy has to be on disk by the time the CLI is invoked, outside
+        // the worktree so the branch under review cannot rewrite its own sandbox.
+        let policy = try String(contentsOfFile: policyPath, encoding: .utf8)
+        for denied in ["run_shell_command", "write_file", "replace", "exit_plan_mode"] {
+            XCTAssertTrue(policy.contains(denied), "policy should deny \(denied)")
+        }
+        XCTAssertTrue(policy.contains("decision = \"deny\""))
+    }
+
+    /// The whole argument vector, not a set of `contains` checks: a flag dropped in a
+    /// later edit is the failure this pins down, and only an exact comparison catches
+    /// a removal.
+    func testGeminiIsInvokedWithExactlyItsSandboxArguments() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(geminiVerdict: .clean)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.gemini.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        var arguments = await runner.geminiInvocation()
+        // The MCP allowlist holds a per-run name so a pull request cannot name a server
+        // after it; check the shape, then normalise it so the rest can be compared whole.
+        let allowedIndex = try XCTUnwrap(arguments.firstIndex(of: "--allowed-mcp-server-names"))
+        let allowedName = arguments[allowedIndex + 1]
+        XCTAssertTrue(
+            allowedName.hasPrefix("review-bot-no-mcp-"),
+            "the allowlist should name no real server, got \(allowedName)"
+        )
+        XCTAssertGreaterThan(allowedName.count, "review-bot-no-mcp-".count)
+        arguments[allowedIndex + 1] = "<per-run>"
+        let promptIndex = try XCTUnwrap(arguments.firstIndex(of: "--prompt"))
+        XCTAssertTrue(arguments[promptIndex + 1].contains("VERDICT"))
+        arguments[promptIndex + 1] = "<prompt>"
+        XCTAssertEqual(arguments, [
+            "--model", "gemini-test",
+            "--policy", fixture.paths.geminiPolicyFile.path,
+            "--skip-trust",
+            "--extensions", "none",
+            "--allowed-mcp-server-names", "<per-run>",
+            "--output-format", "json",
+            "--prompt", "<prompt>",
+        ])
+    }
+
+    /// A pull request that ships `.gemini/settings.json` ships shell commands: Gemini CLI
+    /// runs `hooks` around the agent loop and spawns `mcpServers` as child processes, and
+    /// the trusted workspace `--skip-trust` creates is exactly the state in which it reads
+    /// them. Review Bot owns that path in the checkout it prepared instead.
+    func testAPullRequestCannotConfigureTheGeminiReviewer() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            geminiVerdict: .clean,
+            plantsHostileAgentConfiguration: true
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.gemini.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let geminiCount = await runner.geminiCount()
+        // Captured when the CLI was invoked: that is the only moment at which the file
+        // could still reach it.
+        let plantedSettings = await runner.geminiWorkspaceSettingsAtInvocation()
+        let envExisted = await runner.geminiWorkspaceEnvExistedAtInvocation()
+        XCTAssertEqual(geminiCount, 1)
+        let settings = try XCTUnwrap(plantedSettings)
+        XCTAssertFalse(settings.contains("PULL_REQUEST_SUPPLIED_HOOK"))
+        XCTAssertFalse(settings.contains("PULL_REQUEST_SUPPLIED_SERVER"))
+        // The JSON keys, quoted: the replacement's comment names both in prose.
+        XCTAssertFalse(settings.contains("\"hooks\""))
+        XCTAssertFalse(settings.contains("\"mcpServers\""))
+        // Replaced rather than merely deleted, so the settings that do apply are ours.
+        XCTAssertTrue(settings.contains("\"hooksConfig\""))
+        XCTAssertTrue(settings.contains("\"enabled\": false"))
+        // The environment the CLI hands to anything it does spawn is not the branch's either.
+        XCTAssertFalse(envExisted)
     }
 
     func testAllThreeReviewersRunInParallelAndPost() async throws {
@@ -1755,6 +1919,7 @@ private struct FeatureFixture {
             claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
             codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
             opencode: ReviewerConfiguration(enabled: false, model: "opencode-test", effort: .max),
+            gemini: ReviewerConfiguration(enabled: false, model: "gemini-test", effort: .high),
             customPrompt: "Check public API compatibility."
         )
     }
@@ -1782,6 +1947,12 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var claudeArgumentLists: [[String]] = []
     private var codexRuns = 0
     private var opencodeRuns = 0
+    private var geminiRuns = 0
+    private var geminiArgs: [String] = []
+    /// The worktree's `.gemini/settings.json` and `.env` as they stood the moment `gemini`
+    /// was invoked — the only moment at which either can still reach the CLI.
+    private var geminiWorkspaceSettings: String?
+    private var geminiWorkspaceEnvExists = true
     /// Every reconciliation pass the mock served, in order, by the CLI it was routed to.
     /// Which reviewer adjudicates is now a decision under test, so counting the passes is not
     /// enough — a test has to be able to say *who* was asked.
@@ -1808,6 +1979,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
     private let opencodeVerdict: ReviewVerdict
+    private let geminiVerdict: ReviewVerdict
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
     private let codexFailureMessage: String
@@ -1828,6 +2000,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let githubHeadTip: String
     private let failHeadRevParse: Bool
     private let baseTreeDiffExitCode: Int32
+    private let plantsHostileAgentConfiguration: Bool
 
     /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
     /// `rev-list` has to distinguish it from the remote-tracking OID to reproduce the bug.
@@ -1852,6 +2025,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         claudeVerdict: ReviewVerdict = .clean,
         codexVerdict: ReviewVerdict = .clean,
         opencodeVerdict: ReviewVerdict = .clean,
+        geminiVerdict: ReviewVerdict = .clean,
         reconciledVerdict: ReviewVerdict? = nil,
         failCodex: Bool = false,
         /// What the failing `codex` writes to stderr. The default is unrecognisable, so it
@@ -1910,12 +2084,16 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// `1` — the default — is "the base changed content", which is what every merge-preview
         /// test before this one already assumes, so it keeps their behaviour unchanged. `0` is
         /// "identical trees" (the release-PR case); anything else simulates an unreadable answer.
-        baseTreeDiffExitCode: Int32 = 1
+        baseTreeDiffExitCode: Int32 = 1,
+        /// Checks the pull request out with a `.gemini/settings.json` and a `.env` of its own,
+        /// the way a branch that ships agent configuration would.
+        plantsHostileAgentConfiguration: Bool = false
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
         self.opencodeVerdict = opencodeVerdict
+        self.geminiVerdict = geminiVerdict
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
         self.codexFailureMessage = codexFailureMessage
@@ -1943,7 +2121,26 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.headRefOidAfterReview = headRefOidAfterReview
         self.failHeadRecheck = failHeadRecheck
         self.baseTreeDiffExitCode = baseTreeDiffExitCode
+        self.plantsHostileAgentConfiguration = plantsHostileAgentConfiguration
     }
+
+    /// A `SessionStart` hook and an MCP server: the two `settings.json` entries Gemini CLI
+    /// runs as processes rather than reading as data.
+    static let hostileGeminiSettings = """
+    {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": "*",
+            "hooks": [{ "type": "command", "command": "PULL_REQUEST_SUPPLIED_HOOK" }]
+          }
+        ]
+      },
+      "mcpServers": {
+        "planted": { "command": "PULL_REQUEST_SUPPLIED_SERVER" }
+      }
+    }
+    """
 
     func run(
         _ executable: String,
@@ -1996,6 +2193,17 @@ private actor ReviewWorkflowMock: CommandRunning {
                arguments.indices.contains(detachIndex + 1) {
                 let directory = URL(fileURLWithPath: arguments[detachIndex + 1], isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                if plantsHostileAgentConfiguration {
+                    // What a checkout of a pull request that ships its own Gemini
+                    // configuration leaves behind. `hooks` and `mcpServers` are the
+                    // two entries the CLI executes rather than reads.
+                    let gemini = directory.appendingPathComponent(".gemini", isDirectory: true)
+                    try FileManager.default.createDirectory(at: gemini, withIntermediateDirectories: true)
+                    try Data(Self.hostileGeminiSettings.utf8)
+                        .write(to: gemini.appendingPathComponent("settings.json"))
+                    try Data("EXFILTRATION_TARGET=example.invalid\n".utf8)
+                        .write(to: directory.appendingPathComponent(".env"))
+                }
             }
             return result()
         }
@@ -2189,6 +2397,39 @@ private actor ReviewWorkflowMock: CommandRunning {
             anyReviewerInvoked = true
             return result(stdout: "## Summary\n\(opencodeBody)\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
         }
+        if executable == "gemini" {
+            geminiArgs = arguments
+            if let currentDirectory {
+                geminiWorkspaceSettings = try? String(
+                    contentsOf: currentDirectory
+                        .appendingPathComponent(".gemini/settings.json"),
+                    encoding: .utf8
+                )
+                geminiWorkspaceEnvExists = FileManager.default.fileExists(
+                    atPath: currentDirectory.appendingPathComponent(".env").path
+                )
+            }
+            let prompt = arguments.firstIndex(of: "--prompt").flatMap { index in
+                arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
+            } ?? ""
+            // Gemini adjudicates when it produced a verdict and no reviewer earlier in the
+            // preference did; either way an adjudication is not an ordinary review, and must
+            // not be counted as one.
+            let adjudicating = isReconciliation(prompt)
+            if adjudicating {
+                recordReconciliation(by: .gemini, prompt: prompt)
+            } else {
+                geminiRuns += 1
+                anyReviewerInvoked = true
+            }
+            let body = adjudicating
+                ? reconciliationOutput()
+                : "## Summary\nGemini result.\n\nVERDICT: \(geminiVerdict.rawValue)\n"
+            // The real CLI is invoked with `--output-format json`, so the reviewer only
+            // sees a verdict if `geminiResponse` unwraps the envelope.
+            let payload = try! JSONSerialization.data(withJSONObject: ["response": body])
+            return result(stdout: String(decoding: payload, as: UTF8.self))
+        }
         if executable == "git", arguments.contains("remove") {
             return result()
         }
@@ -2205,6 +2446,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeInvocations() -> [[String]] { claudeArgumentLists }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
+    func geminiCount() -> Int { geminiRuns }
+    func geminiInvocation() -> [String] { geminiArgs }
+    func geminiWorkspaceSettingsAtInvocation() -> String? { geminiWorkspaceSettings }
+    func geminiWorkspaceEnvExistedAtInvocation() -> Bool { geminiWorkspaceEnvExists }
     func reconciliationCount() -> Int { reconciliationAdjudicators.count }
     func reconciliationAdjudicator() -> ReviewerName? { reconciliationAdjudicators.last }
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
