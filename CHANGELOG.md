@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **A reviewer that is down is no longer asked to settle a disagreement it could not take part in.** When two reviewers straddled the gate, the reconciliation pass went to Claude if enabled, else Codex, else opencode — by configuration alone, even when that reviewer's own review had just failed for a reason a second call cannot fix. With Claude out of quota, Codex at `SHOULD_FIX` and opencode at `CLEAN`, the pass was handed to Claude, failed the same way again, and the decision fell back to the strictest verdict, so the lone blocker requested changes without ever being re-checked — the one outcome reconciliation exists to prevent. The adjudicator is now picked from the reviewers that actually produced a verdict on that pull request, keeping the same Claude → Codex → opencode preference among them, and falls back to the old configuration-only order when none did. The decision still falls back to the strictest verdict if the adjudicator fails anyway, so nothing here can turn a blocked pull request into an approval.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added

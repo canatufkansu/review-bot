@@ -307,6 +307,117 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(postedBody.contains("Partial panel"))
     }
 
+    /// The reconciliation exists to re-check a lone blocker, so it must not be handed to a
+    /// reviewer that just failed: Claude is out of quota, Codex says `SHOULD_FIX`, opencode says
+    /// `CLEAN`. Picking the adjudicator from configuration alone called Claude, which failed the
+    /// same way again — and a reconciliation with no verdict falls back to the strictest, so the
+    /// unexamined blocker requested changes. Codex adjudicates instead.
+    func testReconciliationPrefersAnAdjudicatorThatProducedAVerdict() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            codexVerdict: .shouldFix,
+            opencodeVerdict: .clean,
+            reconciledVerdict: .clean,
+            failClaude: true,
+            claudeFailureMessage: "ERROR: You've hit your usage limit. Try again at 2:22 PM.",
+            failClaudeReconciliation: true
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+        configuration.opencode.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let reconciliationCount = await runner.reconciliationCount()
+        let adjudicator = await runner.reconciliationAdjudicator()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        let claudeCount = await runner.claudeCount()
+        XCTAssertEqual(reconciliationCount, 1, "SHOULD_FIX against CLEAN straddles the gate")
+        XCTAssertEqual(adjudicator, .codex, "Claude produced no verdict, so it does not adjudicate")
+        XCTAssertTrue(postedBody.contains("so Codex reconciled the findings"))
+        XCTAssertTrue(postedBody.contains("`CLEAN`"))
+        // Today a partial panel may still approve, so the adjudicated CLEAN posts as an approval.
+        // What this test is about is the assertion above it — the blocker was re-checked instead
+        // of gating the pull request unexamined.
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+        XCTAssertTrue(events.last?.message.contains("Reconciled by Codex → CLEAN") ?? false)
+        // The panel still discloses that Claude is missing, and its terminal failure is not
+        // retried inside the review.
+        XCTAssertTrue(postedBody.contains("Partial panel"))
+        XCTAssertEqual(claudeCount, 1)
+    }
+
+    /// The configured preference is only reordered by availability: when Claude did produce a
+    /// verdict it still adjudicates, even though Codex also finished.
+    func testReconciliationKeepsClaudeAsAdjudicatorWhenItProducedAVerdict() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .shouldFix
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let engineRecorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await engineRecorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let adjudicator = await runner.reconciliationAdjudicator()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(adjudicator, .claude)
+        XCTAssertEqual(postArgument, "--request-changes")
+    }
+
+    /// Preferring an available adjudicator narrows the window for this, but does not close it —
+    /// a reviewer that answered the panel can still fail the reconciliation call. The decision
+    /// falls back to the strictest verdict, which is the conservative end.
+    func testAnAdjudicatorThatFailsFallsBackToTheStrictestVerdict() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .clean,
+            failClaudeReconciliation: true
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let adjudicator = await runner.reconciliationAdjudicator()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(adjudicator, .claude, "Claude produced a verdict, so it is still the first choice")
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertEqual(events.last?.kind, .changesRequested)
+        XCTAssertFalse(postedBody.contains("reconciled the findings"),
+            "an adjudication with no verdict is not disclosed as one")
+    }
+
     func testCodexOnlyShouldFixVerdictRequestsChanges() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(codexVerdict: .shouldFix)
@@ -1075,7 +1186,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var claudeRuns = 0
     private var codexRuns = 0
     private var opencodeRuns = 0
-    private var reconciliationRuns = 0
+    /// Every reconciliation pass the mock served, in order, by the CLI it was routed to.
+    /// Which reviewer adjudicates is now a decision under test, so counting the passes is not
+    /// enough — a test has to be able to say *who* was asked.
+    private var reconciliationAdjudicators: [ReviewerName] = []
     private var reconciliationPrompt = ""
     private var postedBody = ""
     private var postArgument = ""
@@ -1094,6 +1208,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
     private let codexFailureMessage: String
+    private let failClaude: Bool
+    private let claudeFailureMessage: String
+    private let failClaudeReconciliation: Bool
     private let codexFailuresBeforeSuccess: Int
     private let codexTimesOut: Bool
     private let failTimeline: Bool
@@ -1120,6 +1237,21 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// What the failing `codex` writes to stderr. The default is unrecognisable, so it
         /// classifies as transient; pass a quota or auth message to exercise the terminal path.
         codexFailureMessage: String = "simulated codex failure",
+        /// When set, every panel run of `claude` fails instead of producing a verdict.
+        ///
+        /// Overlaps with PR #28 (`fix/partial-panel-never-approves`), which adds a `failClaude`
+        /// of its own with the same name, default, and meaning — panel runs only. Take either
+        /// hunk on merge and keep `failClaudeReconciliation` alongside it; the two flags are
+        /// independent, and #28's tests never reach a reconciliation pass. Its comment saying
+        /// reconciliation is "unaffected by this flag" stays true, for the reason below.
+        failClaude: Bool = false,
+        claudeFailureMessage: String = "simulated claude failure",
+        /// When set, a reconciliation pass routed to `claude` fails. Kept separate from
+        /// `failClaude` because the two roles are separate calls: a test can break the panel run
+        /// alone to check who gets picked as adjudicator. A failure that does not care which
+        /// question it is asked — an exhausted quota, a rejected credential — is both flags, and
+        /// that is the pairing the reconciliation tests below use.
+        failClaudeReconciliation: Bool = false,
         codexFailuresBeforeSuccess: Int = 0,
         codexTimesOut: Bool = false,
         failTimeline: Bool = false,
@@ -1141,6 +1273,9 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
         self.codexFailureMessage = codexFailureMessage
+        self.failClaude = failClaude
+        self.claudeFailureMessage = claudeFailureMessage
+        self.failClaudeReconciliation = failClaudeReconciliation
         self.codexFailuresBeforeSuccess = codexFailuresBeforeSuccess
         self.codexTimesOut = codexTimesOut
         self.failTimeline = failTimeline
@@ -1256,15 +1391,12 @@ private actor ReviewWorkflowMock: CommandRunning {
             let prompt = arguments.firstIndex(of: "-p").flatMap { index in
                 arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
             } ?? ""
-            // Match on the heading rather than a sentence: the surrounding prose gets reworded,
-            // and a stale sentinel here does not fail — it silently routes the adjudication
-            // through the ordinary reviewer branch, leaving the reconciliation tests green while
-            // testing nothing.
-            if prompt.contains("## How to reconcile") {
-                reconciliationRuns += 1
-                reconciliationPrompt = prompt
-                let verdict = reconciledVerdict ?? .clean
-                return result(stdout: "## Reconciliation\nRe-checked findings.\n\nVERDICT: \(verdict.rawValue)\n")
+            if isReconciliation(prompt) {
+                recordReconciliation(by: .claude, prompt: prompt)
+                if failClaudeReconciliation {
+                    return result(exitCode: 1, stderr: claudeFailureMessage)
+                }
+                return result(stdout: reconciliationOutput())
             }
             claudeRuns += 1
             claudePrompt = prompt
@@ -1277,9 +1409,26 @@ private actor ReviewWorkflowMock: CommandRunning {
                     encoding: .utf8
                 )
             }
+            if failClaude {
+                return result(exitCode: 1, stderr: claudeFailureMessage)
+            }
             return result(stdout: "## Summary\n\(claudeBody)\n\nVERDICT: \(claudeVerdict.rawValue)\n")
         }
         if executable == "codex" {
+            // Adjudication is routed by prompt, not by executable, and it is not a panel run —
+            // so it must not count towards `codexRuns` or trip the panel failure flags, which
+            // describe how this CLI behaves as a *reviewer*.
+            if let prompt = arguments.first(where: isReconciliation) {
+                recordReconciliation(by: .codex, prompt: prompt)
+                if let outputIndex = arguments.firstIndex(of: "-o"),
+                   arguments.indices.contains(outputIndex + 1) {
+                    try Data(reconciliationOutput().utf8).write(
+                        to: URL(fileURLWithPath: arguments[outputIndex + 1]),
+                        options: .atomic
+                    )
+                }
+                return result()
+            }
             codexRuns += 1
             if codexTimesOut {
                 throw CommandExecutionError.timedOut(command: "codex", seconds: 900)
@@ -1298,6 +1447,10 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result()
         }
         if executable == "opencode" {
+            if let prompt = arguments.first(where: isReconciliation) {
+                recordReconciliation(by: .opencode, prompt: prompt)
+                return result(stdout: reconciliationOutput())
+            }
             opencodeRuns += 1
             return result(stdout: "## Summary\nopencode result.\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
         }
@@ -1330,7 +1483,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeCount() -> Int { claudeRuns }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
-    func reconciliationCount() -> Int { reconciliationRuns }
+    func reconciliationCount() -> Int { reconciliationAdjudicators.count }
+    func reconciliationAdjudicator() -> ReviewerName? { reconciliationAdjudicators.last }
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }
     func lastPostArgument() -> String { postArgument }
@@ -1342,6 +1496,24 @@ private actor ReviewWorkflowMock: CommandRunning {
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
+
+    /// Any of the three CLIs can be picked as adjudicator, so a reconciliation pass is told
+    /// apart from a panel review by its prompt rather than by the executable. Match on the
+    /// heading rather than a sentence: the surrounding prose gets reworded, and a stale sentinel
+    /// here does not fail — it silently routes the adjudication through the ordinary reviewer
+    /// branch, leaving the reconciliation tests green while testing nothing.
+    private nonisolated func isReconciliation(_ prompt: String) -> Bool {
+        prompt.contains("## How to reconcile")
+    }
+
+    private func recordReconciliation(by reviewer: ReviewerName, prompt: String) {
+        reconciliationAdjudicators.append(reviewer)
+        reconciliationPrompt = prompt
+    }
+
+    private func reconciliationOutput() -> String {
+        "## Reconciliation\nRe-checked findings.\n\nVERDICT: \((reconciledVerdict ?? .clean).rawValue)\n"
+    }
 
     private func result(
         exitCode: Int32 = 0,
