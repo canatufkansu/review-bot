@@ -914,6 +914,195 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postArgument, "--approve")
     }
 
+    // MARK: - Head branch facts
+
+    /// Regression: on a same-repository release pull request (head `develop`, base `main`) the
+    /// developer's clone kept whatever `origin/develop` it last happened to fetch, and reviewers
+    /// reading it through the worktree's `.git` pointer inferred branch identity from a ref that
+    /// was one commit behind the pull request's actual head — concluding the pull request was a
+    /// side branch and posting a false `BLOCKING`. `staleHeadTrackingOid` models that pre-existing,
+    /// out-of-date tracking ref; the fetch must overwrite it before anything reads it back, so the
+    /// facts in the prompt must carry the freshly fetched tip and never the stale one.
+    func testSameRepositoryHeadBranchIsFetchedAndStatedInThePrompt() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            headRefName: "develop",
+            isCrossRepository: false,
+            staleHeadTrackingOid: "5ca1ed0000000000"
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let fetch = await runner.fetchInvocation()
+        let prompt = await runner.lastClaudePrompt()
+        XCTAssertNotNil(fetch)
+        XCTAssertTrue(fetch?.contains("refs/pull/42/head") ?? false)
+        XCTAssertTrue(fetch?.contains("+refs/heads/main:refs/remotes/origin/main") ?? false)
+        XCTAssertTrue(fetch?.contains("+refs/heads/develop:refs/remotes/origin/develop") ?? false)
+        XCTAssertTrue(prompt.contains("## Pull request facts"))
+        XCTAssertTrue(prompt.contains("`develop`, in this same repository"))
+        XCTAssertTrue(prompt.contains("1234567890abcdef"))
+        XCTAssertTrue(prompt.contains("the same commit"))
+        XCTAssertTrue(prompt.contains("may be days out of date"))
+        // The stale tracking ref the fetch overwrote must never reach a reviewer as if it were
+        // current.
+        XCTAssertFalse(prompt.contains("5ca1ed0000000000"))
+        XCTAssertEqual(events.map(\.kind), [.requestDetected, .reviewStarted, .approved])
+    }
+
+    /// The head moved between discovery and the review actually starting — a queued review can sit
+    /// for minutes. Reviewing the stale commit would waste the run and post against a commit GitHub
+    /// no longer considers current, so the checkout gate aborts instead of proceeding.
+    func testHeadMovedBeforeTheReviewStartedAbortsRatherThanReviewingTheOldCommit() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(githubHeadTip: "fedcba9876543210")
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let claudeCount = await runner.claudeCount()
+        let postCount = await runner.postCount()
+        XCTAssertEqual(claudeCount, 0)
+        XCTAssertEqual(postCount, 0)
+        let failure = events.first(where: { $0.kind == .failed })
+        XCTAssertNotNil(failure)
+        XCTAssertTrue(failure?.message.contains("12345678") ?? false)
+        XCTAssertTrue(failure?.message.contains("fedcba98") ?? false)
+        XCTAssertFalse(events.contains(where: {
+            [.approved, .changesRequested, .commented].contains($0.kind)
+        }))
+    }
+
+    /// A fork's head branch is never fetched by name: it does not live on `origin`, where the same
+    /// name would fetch a different branch, and the head commit already arrives through
+    /// `refs/pull/<n>/head`. The facts still name it, but say plainly that its tip was not fetched.
+    func testForkHeadBranchIsNotFetchedButIsNamedInThePrompt() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(headRefName: "feature/outside", isCrossRepository: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let fetch = await runner.fetchInvocation()
+        let headRevParses = await runner.headRevParseCalls()
+        let prompt = await runner.lastClaudePrompt()
+        let events = await recorder.snapshot()
+        XCTAssertFalse((fetch ?? []).contains { $0.contains("refs/heads/feature/outside") })
+        XCTAssertTrue(headRevParses.isEmpty)
+        XCTAssertTrue(prompt.contains("in a fork"))
+        XCTAssertEqual(events.last?.kind, .approved)
+    }
+
+    /// GitHub did not report whether the head lives in this repository or a fork. Treated
+    /// conservatively: nothing extra is fetched, and the facts say so rather than guessing.
+    func testUnknownHeadRelationshipDoesNotFetchTheHeadBranch() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(headRefName: "develop", isCrossRepository: nil)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let fetch = await runner.fetchInvocation()
+        let headRevParses = await runner.headRevParseCalls()
+        let prompt = await runner.lastClaudePrompt()
+        let events = await recorder.snapshot()
+        XCTAssertFalse((fetch ?? []).contains { $0.contains("refs/heads/develop:refs/remotes/origin/develop") })
+        XCTAssertTrue(headRevParses.isEmpty)
+        XCTAssertTrue(prompt.contains("did not report whether it lives in this repository"))
+        XCTAssertEqual(events.last?.kind, .approved)
+    }
+
+    /// GitHub reported no head branch name at all. Nothing to fetch, and the facts say so.
+    func testNoReportedHeadNameDoesNotFetchTheHeadBranch() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(headRefName: nil, isCrossRepository: false)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let capturedFetch = await runner.fetchInvocation()
+        let fetch = try XCTUnwrap(capturedFetch)
+        let prompt = await runner.lastClaudePrompt()
+        let events = await recorder.snapshot()
+        XCTAssertTrue(fetch.contains("refs/pull/42/head"))
+        XCTAssertTrue(fetch.contains("+refs/heads/main:refs/remotes/origin/main"))
+        XCTAssertFalse(fetch.contains { $0.hasPrefix("+refs/heads/") && !$0.contains("/main:") })
+        XCTAssertTrue(prompt.contains("did not report its name"))
+        XCTAssertEqual(events.last?.kind, .approved)
+    }
+
+    /// The head branch was fetched successfully, but the read-back that resolves its tip failed —
+    /// git ref resolution is not guaranteed to succeed just because the fetch that wrote it did.
+    /// The review still proceeds on the commit GitHub reported at discovery; the facts disclose
+    /// that the tip specifically could not be confirmed.
+    func testUnreadableHeadTipAfterFetchStillProceedsWithTheReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(headRefName: "develop", failHeadRevParse: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let prompt = await runner.lastClaudePrompt()
+        let events = await recorder.snapshot()
+        XCTAssertTrue(prompt.contains("could not be read back"))
+        XCTAssertEqual(events.last?.kind, .approved)
+    }
+
+    /// Reconciliation runs its own read-only pass and must be just as informed about branch
+    /// identity as the original reviewers — a false blocker reached by misreading a stale ref is
+    /// exactly the failure mode reconciliation exists to catch, so it must not lose the facts that
+    /// prevent it in the first place.
+    func testReconciliationPromptCarriesTheHeadBranchFacts() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .clean
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let prompt = await runner.lastReconciliationPrompt()
+        XCTAssertTrue(prompt.contains("## Pull request facts"))
+    }
+
     /// Regression: a release pull request (base `main`, head `develop`) is merged with a merge
     /// commit on every release, so `main` accumulates commits `develop` never receives even though
     /// `main`'s tree after each release is exactly the tree of the `develop` commit it released.
@@ -1409,6 +1598,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let opencodeBody: String
     private let baseCommitsAhead: Int
     private let trackedBaseOid: String?
+    private let headRefName: String?
+    private let isCrossRepository: Bool?
+    private let githubHeadTip: String
+    private let failHeadRevParse: Bool
     private let baseTreeDiffExitCode: Int32
 
     /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
@@ -1416,7 +1609,14 @@ private actor ReviewWorkflowMock: CommandRunning {
     static let staleBaseOid = "abcdef1234567890"
 
     private var fetchArgs: [String]?
-    private var revParseArgs: [String]?
+    /// Every `rev-parse` invocation, in call order — both the merge preview's own (for the base
+    /// branch) and the checkout gate's (for the head branch), which share this dispatch branch.
+    private var revParseCalls: [[String]] = []
+    /// Models the clone's `refs/remotes/origin/<name>` tracking refs for branches other than the
+    /// base: what a `git fetch` of `+refs/heads/<name>:refs/remotes/origin/<name>` last wrote there.
+    /// Seeded with a pre-existing (stale) value so a test can prove the fetch overwrites it before
+    /// anything reads it back.
+    private var trackingRefs: [String: String]
     private var baseTreeDiffArgs: [String]?
     private var mergeTreeCalls = 0
 
@@ -1459,6 +1659,24 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// What `rev-parse refs/remotes/origin/main` resolves to. `nil` makes it fail the way git
         /// does for an unresolvable ref, which is the only case that may fall back to the snapshot.
         trackedBaseOid: String? = "trackedbaseoid00",
+        /// The pull request's head branch name as `gh pr view` reports it. The default names a
+        /// same-repository branch so every existing test exercises the (now default) head-branch
+        /// fetch; pass `nil` to model GitHub not reporting a name at all.
+        headRefName: String? = "feature/widgets",
+        /// GitHub's `isCrossRepository` field. `false` (same repository) is the default so existing
+        /// tests exercise the head-branch fetch; `true` models a fork, `nil` an unreported
+        /// relationship.
+        isCrossRepository: Bool? = false,
+        /// What the clone's `origin/<headRefName>` held *before* this checkout's fetch — modelling a
+        /// developer's stale local copy. `nil` (the default) means nothing was tracked yet.
+        staleHeadTrackingOid: String? = nil,
+        /// What fetching `refs/heads/<headRefName>` writes to the tracking ref — i.e. the head
+        /// branch's real tip as GitHub would report it. Defaults to the mock's own PR head OID, so
+        /// an unmodified checkout finds the fetched tip already matching and never aborts.
+        githubHeadTip: String = "1234567890abcdef",
+        /// Makes the checkout gate's post-fetch `rev-parse` of the head branch fail, modelling a
+        /// read-back that could not resolve the ref it had just fetched.
+        failHeadRevParse: Bool = false,
         /// Exit code for the `git diff --quiet --no-ext-diff <mergeBase> <base>` content probe.
         /// `1` — the default — is "the base changed content", which is what every merge-preview
         /// test before this one already assumes, so it keeps their behaviour unchanged. `0` is
@@ -1484,6 +1702,15 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.opencodeBody = opencodeBody
         self.baseCommitsAhead = baseCommitsAhead
         self.trackedBaseOid = trackedBaseOid
+        self.headRefName = headRefName
+        self.isCrossRepository = isCrossRepository
+        self.githubHeadTip = githubHeadTip
+        self.failHeadRevParse = failHeadRevParse
+        if let headRefName, let staleHeadTrackingOid {
+            trackingRefs = [headRefName: staleHeadTrackingOid]
+        } else {
+            trackingRefs = [:]
+        }
         self.baseTreeDiffExitCode = baseTreeDiffExitCode
     }
 
@@ -1501,7 +1728,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
            arguments.contains("--json") {
-            return result(stdout: #"{"title":"Improve widgets","headRefOid":"1234567890abcdef","baseRefName":"main","baseRefOid":"abcdef1234567890","url":"https://github.com/acme/widget/pull/42"}"#)
+            return result(stdout: pullRequestMetadataJSON())
         }
         if executable == "gh", arguments.contains("repos/acme/widget/issues/42/timeline") {
             timelineCalls += 1
@@ -1512,6 +1739,16 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "git", arguments.contains("fetch") {
             fetchArgs = arguments
+            // A refspec of the form "+refs/heads/<name>:refs/remotes/origin/<name>" updates that
+            // tracking ref to what GitHub reports as the branch's real tip — `main`'s tracking ref
+            // has its own semantics via `trackedBaseOid` above, so it is left alone here.
+            for argument in arguments where argument.hasPrefix("+refs/heads/") {
+                let rest = argument.dropFirst("+refs/heads/".count)
+                guard let separator = rest.range(of: ":refs/remotes/origin/") else { continue }
+                let name = String(rest[rest.startIndex..<separator.lowerBound])
+                guard name != "main" else { continue }
+                trackingRefs[name] = githubHeadTip
+            }
             return result()
         }
         if executable == "git", arguments.contains("worktree"), arguments.contains("add") {
@@ -1529,16 +1766,28 @@ private actor ReviewWorkflowMock: CommandRunning {
             // The prior-reviewed commit is present locally.
             return result()
         }
-        // --- Merge preview plumbing. Must precede the generic `git diff` branch below, which
-        // records `incrementalDiffArgs`: these calls would otherwise overwrite the incremental
-        // invocation the scope tests assert on.
+        // --- Merge preview plumbing, and (since the head-branch fix) the checkout gate's own
+        // post-fetch read-back — both resolve a remote-tracking ref by the same shape of command.
+        // Must precede the generic `git diff` branch below, which records `incrementalDiffArgs`:
+        // these calls would otherwise overwrite the incremental invocation the scope tests assert
+        // on.
         if executable == "git", arguments.contains("rev-parse") {
-            revParseArgs = arguments
-            guard let trackedBaseOid else {
-                // `--verify --quiet` exits non-zero with no output when the ref will not resolve.
+            revParseCalls.append(arguments)
+            if arguments.contains("refs/remotes/origin/main^{commit}") {
+                guard let trackedBaseOid else {
+                    // `--verify --quiet` exits non-zero with no output when the ref will not resolve.
+                    return result(exitCode: 1)
+                }
+                return result(stdout: "\(trackedBaseOid)\n")
+            }
+            // The checkout gate resolving the head branch it just fetched.
+            guard !failHeadRevParse,
+                  let name = headRefTargetName(from: arguments),
+                  let tip = trackingRefs[name]
+            else {
                 return result(exitCode: 1)
             }
-            return result(stdout: "\(trackedBaseOid)\n")
+            return result(stdout: "\(tip)\n")
         }
         if executable == "git", arguments.contains("merge-base") {
             return result(stdout: "aaaaaaaabbbbbbbb\n")
@@ -1702,7 +1951,16 @@ private actor ReviewWorkflowMock: CommandRunning {
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
     func mergePreviewDuringReview() -> String? { mergePreviewText }
     func fetchInvocation() -> [String]? { fetchArgs }
-    func revParseInvocation() -> [String]? { revParseArgs }
+    /// The last `rev-parse` call resolving `origin/main` — `revParseCalls` also holds the checkout
+    /// gate's head-branch rev-parse now, so this filters back down to what callers originally meant.
+    func revParseInvocation() -> [String]? {
+        revParseCalls.last(where: { $0.contains("refs/remotes/origin/main^{commit}") })
+    }
+    /// Every `rev-parse` call that resolved something other than `origin/main` — the checkout
+    /// gate's post-fetch read-back of the head branch.
+    func headRevParseCalls() -> [[String]] {
+        revParseCalls.filter { !$0.contains("refs/remotes/origin/main^{commit}") }
+    }
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
@@ -1725,6 +1983,39 @@ private actor ReviewWorkflowMock: CommandRunning {
 
     private func reconciliationOutput() -> String {
         "## Reconciliation\nRe-checked findings.\n\nVERDICT: \((reconciledVerdict ?? .clean).rawValue)\n"
+    }
+
+    /// The `gh pr view --json` response, omitting `headRefName`/`isCrossRepository` when their
+    /// value is `nil` — a response missing those keys must still decode.
+    private func pullRequestMetadataJSON() -> String {
+        var fields: [String: Any] = [
+            "title": "Improve widgets",
+            "headRefOid": "1234567890abcdef",
+            "baseRefName": "main",
+            "baseRefOid": "abcdef1234567890",
+            "url": "https://github.com/acme/widget/pull/42",
+        ]
+        if let headRefName {
+            fields["headRefName"] = headRefName
+        }
+        if let isCrossRepository {
+            fields["isCrossRepository"] = isCrossRepository
+        }
+        // Force-try/unwrap: the fields above are all plain strings and booleans, so this cannot
+        // fail — a fixture building its own fixture data, not something under test.
+        let data = try! JSONSerialization.data(withJSONObject: fields)
+        return String(data: data, encoding: .utf8)!
+    }
+
+    /// Extracts `<name>` from a `refs/remotes/origin/<name>^{commit}` rev-parse argument.
+    private func headRefTargetName(from arguments: [String]) -> String? {
+        let prefix = "refs/remotes/origin/"
+        let suffix = "^{commit}"
+        guard let target = arguments.last(where: { $0.hasPrefix(prefix) && $0.hasSuffix(suffix) })
+        else {
+            return nil
+        }
+        return String(target.dropFirst(prefix.count).dropLast(suffix.count))
     }
 
     private func result(

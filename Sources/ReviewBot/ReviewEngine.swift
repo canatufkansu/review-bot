@@ -418,7 +418,7 @@ actor ReviewEngine {
             )
             worktreeURL = worktree
 
-            try await checkOutPullRequest(pendingReview, at: worktree)
+            let headBranchTip = try await checkOutPullRequest(pendingReview, at: worktree)
             worktreeAdded = true
 
             let priorHead = lastReviewed.head(
@@ -432,6 +432,7 @@ actor ReviewEngine {
                 priorHead: priorHead,
                 metadata: metadata
             )
+            let facts = PullRequestFacts(metadata: metadata, headBranchTip: headBranchTip).render()
 
             await emit(
                 kind: .reviewStarted,
@@ -448,7 +449,8 @@ actor ReviewEngine {
                 repositoryRules: await loadRepositoryReviewRules(
                     repository: repository,
                     baseCommitSHA: metadata.baseRefOid
-                )
+                ),
+                pullRequestFacts: facts
             )
 
             // Post as long as *someone* finished. A reviewer that failed is named in the posted
@@ -489,7 +491,8 @@ actor ReviewEngine {
                 let adjudicated = await runReconciliation(
                     results: results,
                     configuration: configuration,
-                    worktree: worktree
+                    worktree: worktree,
+                    pullRequestFacts: facts
                 )
                 if let verdict = adjudicated.verdict {
                     decision = DecisionEvaluator.decision(for: verdict, policy: policy)
@@ -618,31 +621,76 @@ actor ReviewEngine {
     /// them fetching into the same clone contend for git's ref locks. The gate must be
     /// released on every path — an early `throw` that skipped it would strand every
     /// other pull request in the repository for the rest of the poll.
+    ///
+    /// Returns the head branch's tip as read back from the clone's `origin` remote right after
+    /// fetching it — only non-`nil` for a same-repository pull request with a reported head name,
+    /// which is the only case the head branch is fetched at all (see
+    /// `PullRequestMetadata.fetchableHeadRefName`); `nil` otherwise, including when the read-back
+    /// itself failed. `PullRequestFacts` renders whichever of these actually happened into the
+    /// reviewers' prompt.
     private func checkOutPullRequest(
         _ pendingReview: PendingPullRequest,
         at worktree: URL
-    ) async throws {
+    ) async throws -> String? {
         let repository = pendingReview.repository
+        let metadata = pendingReview.metadata
+        let headRefName = metadata.fetchableHeadRefName
+        var headTip: String?
         await gitGate.acquire(repository.githubSlug)
         do {
-            let fetch = try await runner.run(
-                "git",
-                arguments: [
-                    "-C", repository.path,
-                    "fetch", "--quiet", "origin",
-                    "refs/pull/\(pendingReview.summary.number)/head",
-                    // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
-                    // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
-                    // merely an opportunistic side effect of the clone's configured fetch
-                    // refspec. `mergePreview` reads that remote-tracking ref, so name it here
-                    // rather than depending on how this particular clone happens to be set up.
-                    "+refs/heads/\(pendingReview.metadata.baseRefName)"
-                        + ":refs/remotes/origin/\(pendingReview.metadata.baseRefName)",
-                ],
-                timeout: 180
-            )
+            var fetchArguments = [
+                "-C", repository.path,
+                "fetch", "--quiet", "origin",
+                "refs/pull/\(pendingReview.summary.number)/head",
+                // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
+                // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
+                // merely an opportunistic side effect of the clone's configured fetch
+                // refspec. `mergePreview` reads that remote-tracking ref, so name it here
+                // rather than depending on how this particular clone happens to be set up.
+                "+refs/heads/\(metadata.baseRefName)"
+                    + ":refs/remotes/origin/\(metadata.baseRefName)",
+            ]
+            if let headRefName {
+                // A same-repository head branch must exist while its pull request stays open —
+                // deleting it closes the PR — so a failure fetching it here is a closed-PR race,
+                // not a transient error, and failing the review is acceptable.
+                fetchArguments.append(
+                    "+refs/heads/\(headRefName):refs/remotes/origin/\(headRefName)"
+                )
+            }
+            let fetch = try await runner.run("git", arguments: fetchArguments, timeout: 180)
             guard fetch.succeeded else {
                 throw ReviewEngineError.commandFailed("Git fetch failed: \(conciseError(fetch))")
+            }
+
+            // Resolved here, inside the gate, rather than after releasing it: a concurrent review
+            // of another pull request sharing this clone could move the ref the moment the gate
+            // opened, and a read taken outside the lock could then answer for the wrong review.
+            // Best-effort: a read-back that fails leaves `headTip` nil, and the facts say so.
+            if let headRefName,
+               let revParse = try? await runner.run(
+                   "git",
+                   arguments: [
+                       "-C", repository.path,
+                       "rev-parse", "--verify", "--quiet",
+                       "refs/remotes/origin/\(headRefName)^{commit}",
+                   ],
+                   timeout: 30
+               ),
+               revParse.succeeded {
+                let trimmed = revParse.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                headTip = trimmed.isEmpty ? nil : trimmed
+            }
+
+            // `metadata` was captured at discovery, and a queued review can start many minutes
+            // later. If the head branch has moved on since, the commit we would check out is no
+            // longer what the pull request proposes, and the review would describe a stale head —
+            // so abort before creating the worktree. The old dedup key never recurs and the next
+            // discovery keys the new head, so the review is deferred, not lost.
+            if let headTip, headTip != metadata.headRefOid {
+                throw ReviewEngineError.reviewIncomplete(
+                    "The head moved from \(metadata.headRefOid.prefix(8)) to \(headTip.prefix(8)) before the review started; the next poll reviews the new head."
+                )
             }
 
             let addWorktree = try await runner.run(
@@ -650,7 +698,7 @@ actor ReviewEngine {
                 arguments: [
                     "-C", repository.path,
                     "worktree", "add", "--quiet", "--detach",
-                    worktree.path, pendingReview.metadata.headRefOid,
+                    worktree.path, metadata.headRefOid,
                 ],
                 timeout: 60
             )
@@ -664,6 +712,7 @@ actor ReviewEngine {
             throw error
         }
         await gitGate.release(repository.githubSlug)
+        return headTip
     }
 
     private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
@@ -682,7 +731,7 @@ actor ReviewEngine {
             arguments: [
                 "pr", "view", String(number),
                 "--repo", repository.githubSlug,
-                "--json", "title,headRefOid,baseRefName,baseRefOid,url",
+                "--json", "title,headRefOid,headRefName,isCrossRepository,baseRefName,baseRefOid,url",
             ],
             timeout: 60
         )
@@ -985,11 +1034,13 @@ actor ReviewEngine {
     private func runReviewers(
         configuration: ReviewBotConfiguration,
         worktree: URL,
-        repositoryRules: String?
+        repositoryRules: String?,
+        pullRequestFacts: String?
     ) async -> [ReviewerResult] {
         let prompt = DefaultPrompt.combined(
             with: configuration.customPrompt,
-            repositoryRules: repositoryRules
+            repositoryRules: repositoryRules,
+            pullRequestFacts: pullRequestFacts
         )
 
         // Runs every enabled reviewer in parallel, preserving a deterministic
@@ -1077,7 +1128,8 @@ actor ReviewEngine {
     private func runReconciliation(
         results: [ReviewerResult],
         configuration: ReviewBotConfiguration,
-        worktree: URL
+        worktree: URL,
+        pullRequestFacts: String?
     ) async -> ReviewerResult {
         // Only reviewers that reached a verdict are adjudicated. `results` keeps the ones that
         // failed so the posted body can disclose a partial panel, but a failed reviewer has no
@@ -1095,7 +1147,7 @@ actor ReviewEngine {
                 )
             }
         }
-        let prompt = DefaultPrompt.reconciliation(reviews: panel)
+        let prompt = DefaultPrompt.reconciliation(reviews: panel, pullRequestFacts: pullRequestFacts)
 
         // Among the enabled reviewers, prefer Claude as adjudicator, then Codex, then opencode —
         // but only among the ones that just produced a verdict on this pull request. A reviewer
