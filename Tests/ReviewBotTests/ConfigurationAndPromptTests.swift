@@ -205,6 +205,7 @@ final class ConfigurationAndPromptTests: XCTestCase {
         configuration.claude.model = "model-claude"
         configuration.codex.model = "model-codex"
         configuration.opencode.model = "model-opencode"
+        configuration.gemini.model = "model-gemini"
 
         for reviewer in ReviewerName.allCases {
             XCTAssertEqual(
@@ -224,11 +225,14 @@ final class ConfigurationAndPromptTests: XCTestCase {
             "claude",
             "codex",
             "opencode",
+            "gemini",
         ])
-        // Outbound: what a CLI child process is handed. opencode takes none.
+        // Outbound: what a CLI child process is handed. opencode and Gemini take none — both
+        // are credentialed through their own CLI rather than a key Review Bot injects.
         XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyEnvironmentVariable), [
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
+            nil,
             nil,
         ])
         // Inbound: what Review Bot itself reads a key from, ahead of the Keychain. Total, so it
@@ -237,14 +241,15 @@ final class ConfigurationAndPromptTests: XCTestCase {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "OPENCODE_API_KEY",
+            "GEMINI_API_KEY",
         ])
         let inbound = ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable)
         XCTAssertEqual(Set(inbound).count, inbound.count, "two reviewers would share a key")
 
         // Only a CLI can borrow a login; only a reviewer Review Bot can hand a key to may be put
-        // in key mode. opencode is the reviewer that separates the two predicates.
-        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true])
-        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false])
+        // in key mode. opencode and Gemini are the reviewers that separate the two predicates.
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true, true])
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false, false])
         XCTAssertFalse(
             ReviewerName.allCases.contains { !$0.supportsSessionAuth && !$0.supportsAPIKeyAuth },
             "a reviewer with neither auth mode could never be credentialed at all"
