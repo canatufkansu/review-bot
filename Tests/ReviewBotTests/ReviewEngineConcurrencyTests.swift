@@ -126,6 +126,7 @@ private struct ConcurrencyFixture {
             claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
             codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
             opencode: ReviewerConfiguration(enabled: false, model: "opencode-test", effort: .max),
+            gemini: ReviewerConfiguration(enabled: false, model: "gemini-test", effort: .high),
             customPrompt: "",
             maxConcurrentReviews: concurrency
         )
@@ -260,15 +261,23 @@ private actor MultiPullRequestMock: CommandRunning {
         if arguments.starts(with: ["pr", "view"]), arguments.contains("--comments") {
             return result(stdout: "PR conversation")
         }
+        // Must precede the GET branch just below for the same path — otherwise it would
+        // swallow the post before this ever sees it.
+        if arguments.starts(with: ["api", "--method", "POST"]),
+           let reviewsArg = arguments.first(where: { $0.hasSuffix("/reviews") }) {
+            let components = reviewsArg.split(separator: "/")
+            if let pullsIndex = components.firstIndex(of: "pulls"),
+               components.indices.contains(pullsIndex + 1),
+               let number = Int(components[pullsIndex + 1]) {
+                posted.append(number)
+            }
+            return result()
+        }
         if arguments.contains(where: { $0.hasSuffix("/reviews") }) {
             return result(stdout: "No prior reviews")
         }
         if arguments.contains(where: { $0.hasSuffix("/comments") }) {
             return result(stdout: "No inline comments")
-        }
-        if arguments.starts(with: ["pr", "review"]), let number = Int(arguments[2]) {
-            posted.append(number)
-            return result()
         }
         XCTFail("Unexpected gh command: \(arguments.joined(separator: " "))")
         return result(exitCode: 127)

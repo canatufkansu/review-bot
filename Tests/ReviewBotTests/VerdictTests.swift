@@ -140,6 +140,50 @@ final class VerdictTests: XCTestCase {
         XCTAssertEqual(DecisionEvaluator.decision(for: .clean, policy: .default), .approve)
     }
 
+    func testWithholdingApprovalFromPartialPanelDowngradesAnApprovalWithAMissingVerdict() {
+        let results = [
+            result(.claude, verdict: .clean),
+            result(.codex, verdict: nil),
+        ]
+        XCTAssertEqual(
+            DecisionEvaluator.withholdingApprovalFromPartialPanel(.approve, results: results),
+            .comment
+        )
+    }
+
+    func testWithholdingApprovalFromPartialPanelLeavesAFullPanelsApprovalAlone() {
+        let results = [
+            result(.claude, verdict: .clean),
+            result(.codex, verdict: .nitsOnly),
+        ]
+        XCTAssertEqual(
+            DecisionEvaluator.withholdingApprovalFromPartialPanel(.approve, results: results),
+            .approve
+        )
+    }
+
+    func testWithholdingApprovalFromPartialPanelLeavesRequestChangesAlone() {
+        let results = [
+            result(.claude, verdict: .blocking),
+            result(.codex, verdict: nil),
+        ]
+        XCTAssertEqual(
+            DecisionEvaluator.withholdingApprovalFromPartialPanel(.requestChanges, results: results),
+            .requestChanges
+        )
+    }
+
+    func testWithholdingApprovalFromPartialPanelLeavesCommentAlone() {
+        let results = [
+            result(.claude, verdict: .shouldFix),
+            result(.codex, verdict: nil),
+        ]
+        XCTAssertEqual(
+            DecisionEvaluator.withholdingApprovalFromPartialPanel(.comment, results: results),
+            .comment
+        )
+    }
+
     func testDecisionForReconciledVerdictHonoursPolicy() {
         let policy = DecisionPolicy(shouldFix: .approve, nitsOnly: .requestChanges, clean: .approve)
         XCTAssertEqual(DecisionEvaluator.decision(for: .shouldFix, policy: policy), .approve)
@@ -156,6 +200,7 @@ final class VerdictTests: XCTestCase {
             "API Error: 401 {\"type\":\"authentication_error\"}",
             "Not authenticated. Please run `codex login`.",
             "Your credit balance is too low to access the API.",
+            "You've hit your weekly limit · resets 4pm (Europe/London)",
             // DeepSeek reaches the engine over HTTP rather than as a CLI, so its own wording for
             // a rejected key and an empty account has to be recognised too — a full agent loop
             // is the most expensive thing in the panel to retry for nothing.
