@@ -10,7 +10,7 @@ enum ReviewEngineError: LocalizedError {
         switch self {
         case let .commandFailed(message): message
         case let .invalidResponse(message): message
-        case .noReviewersEnabled: "Enable Claude, Codex, or opencode before running reviews."
+        case .noReviewersEnabled: "Enable Claude, Codex, opencode, or Gemini before running reviews."
         case let .reviewIncomplete(message): message
         }
     }
@@ -70,7 +70,8 @@ actor ReviewEngine {
         }
         guard configuration.claude.enabled
             || configuration.codex.enabled
-            || configuration.opencode.enabled else {
+            || configuration.opencode.enabled
+            || configuration.gemini.enabled else {
             await onStatus(ReviewEngineError.noReviewersEnabled.localizedDescription)
             return
         }
@@ -420,6 +421,10 @@ actor ReviewEngine {
 
             let headBranchTip = try await checkOutPullRequest(pendingReview, at: worktree)
             worktreeAdded = true
+            // Before any reviewer is started, not inside `runGemini`: the reviewers run
+            // concurrently in this one worktree, so the checkout has to be settled while
+            // nothing is reading it.
+            try ownGeminiWorkspaceConfiguration(in: worktree)
 
             let priorHead = lastReviewed.head(
                 for: "\(repository.githubSlug)#\(pullRequest.number)"
@@ -755,6 +760,58 @@ actor ReviewEngine {
         return headTip
     }
 
+    /// Replaces the pull request's own Gemini configuration in the scratch checkout
+    /// with Review Bot's.
+    ///
+    /// Gemini CLI reads `<workspace>/.gemini/settings.json` as *executable*
+    /// configuration: `hooks` entries are shell commands it runs around the agent
+    /// loop, and `mcpServers` entries are child processes it spawns. Neither is a
+    /// tool call, so the read-only `--policy` never sees them, and a `SessionStart`
+    /// hook runs before the model is asked anything — the review's own prompt and
+    /// verdict are irrelevant to it. The worktree is checked out at the pull
+    /// request's head, so leaving that path to the branch under review hands it a
+    /// shell on the machine running Review Bot. A `.env` beside it is the same
+    /// story one step removed: the CLI loads it into the environment those children
+    /// inherit.
+    ///
+    /// No flag closes this. The worktree must be *trusted* — a headless run in an
+    /// untrusted folder aborts outright — and trusted is exactly the state in which
+    /// Gemini honours the workspace's settings. Nor can a higher settings tier take
+    /// a hook back: `hooks` entries concatenate across tiers and `mcpServers`
+    /// shallow-merge, so a later tier can only add. What Review Bot does own is the
+    /// checkout it prepared, so it owns this path in it: the branch's `.gemini` and
+    /// `.env` are removed and Review Bot's own settings are written in their place.
+    /// Nothing is hidden from the review — every one of those files is in
+    /// `.review-bot-diff.patch`, which is what the reviewers are told to read.
+    ///
+    /// Done for every review rather than only when Gemini is enabled: the cost is a
+    /// directory in a throwaway checkout, and the alternative is a sandbox that
+    /// silently depends on a settings toggle elsewhere.
+    private func ownGeminiWorkspaceConfiguration(in worktree: URL) throws {
+        let manager = FileManager.default
+        let directory = worktree.appendingPathComponent(".gemini", isDirectory: true)
+        // `removeItem` throws when the path is absent, which is the ordinary case.
+        try? manager.removeItem(at: directory)
+        try? manager.removeItem(at: worktree.appendingPathComponent(".env"))
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Gemini CLI strips comments before parsing, so the file can say why it is
+        // here to whoever opens the worktree — or to a reviewer that reads it.
+        let settings = """
+        // Written by Review Bot, replacing whatever this pull request shipped at
+        // this path. Gemini CLI runs `hooks` as shell commands and spawns
+        // `mcpServers` as child processes, so the branch under review must not own
+        // this file. MCP is blocked at the command line as well.
+        {
+          "hooksConfig": { "enabled": false },
+          "advanced": { "ignoreLocalEnv": true }
+        }
+        """
+        try Data(settings.utf8).write(
+            to: directory.appendingPathComponent("settings.json"),
+            options: .atomic
+        )
+    }
+
     private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
         let watching = "Watching \(repositoryCount) repositor\(repositoryCount == 1 ? "y" : "ies")"
         guard deferredRequests > 0 else { return watching }
@@ -890,13 +947,16 @@ actor ReviewEngine {
             : ""
 
         // What the diff cannot show: how this pull request interacts with a base branch that has
-        // moved since it was cut. Best-effort — a repository whose base ref could not be resolved
-        // still gets a review, just without the merge section.
+        // moved since it was cut. Best-effort in one direction only — a repository whose base ref
+        // could not be resolved still gets a review, just without the merge section. Writing the
+        // file is not best-effort: the alternative to a written preview is a *removed* one, since
+        // this is the single context file the bot does not always overwrite and the prompt reads
+        // its absence as "the PR is current with its base".
+        let mergePreviewFile = worktree.appendingPathComponent(".review-bot-merge.md")
         if let preview = await mergePreview(repository: repository, metadata: metadata) {
-            try? Data(preview.render().utf8).write(
-                to: worktree.appendingPathComponent(".review-bot-merge.md"),
-                options: .atomic
-            )
+            try Data(preview.render().utf8).write(to: mergePreviewFile, options: .atomic)
+        } else {
+            try removePullRequestCopy(of: mergePreviewFile)
         }
 
         async let conversation = captureCommand {
@@ -950,6 +1010,25 @@ actor ReviewEngine {
             options: .atomic
         )
         return ReviewContext(thread: thread, diff: diffText)
+    }
+
+    /// Removes a Review Bot context file that the pull request itself committed at the same path.
+    ///
+    /// The review worktree is checked out at the pull request's head, so every `.review-bot-*`
+    /// path is content the author controls until the bot overwrites it — and the prompt presents
+    /// those files to the reviewers as Review Bot's own evidence, verdict lines included. Files
+    /// the bot always writes are safe by construction; this is for the ones it may not write.
+    /// A removal that fails throws: reviewing against planted context is worse than not reviewing.
+    private func removePullRequestCopy(of file: URL) throws {
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: file)
+        } catch {
+            throw ReviewEngineError.commandFailed(
+                "Could not remove the \(file.lastPathComponent) committed by the pull request: "
+                    + error.localizedDescription
+            )
+        }
     }
 
     /// How this pull request interacts with a base branch that may have moved since it was cut, or
@@ -1132,11 +1211,12 @@ actor ReviewEngine {
         )
 
         // Runs every enabled reviewer in parallel, preserving a deterministic
-        // output order (Claude, Codex, opencode) regardless of completion order.
+        // output order (Claude, Codex, opencode, Gemini) regardless of completion order.
         let enabled: [(ReviewerName, ReviewerConfiguration)] = [
             (.claude, configuration.claude),
             (.codex, configuration.codex),
             (.opencode, configuration.opencode),
+            (.gemini, configuration.gemini),
         ].filter { $0.1.enabled }
 
         let order = Dictionary(uniqueKeysWithValues: enabled.enumerated().map { ($0.element.0, $0.offset) })
@@ -1239,6 +1319,8 @@ actor ReviewEngine {
             await runCodex(configuration: configuration, prompt: prompt, worktree: worktree)
         case .opencode:
             await runOpencode(configuration: configuration, prompt: prompt, worktree: worktree)
+        case .gemini:
+            await runGemini(configuration: configuration, prompt: prompt, worktree: worktree)
         }
     }
 
@@ -1266,7 +1348,7 @@ actor ReviewEngine {
         }
         let prompt = DefaultPrompt.reconciliation(reviews: panel, pullRequestFacts: pullRequestFacts)
         // Reviewers are enabled whenever verdicts disagree; prefer Claude as
-        // adjudicator, then Codex, then opencode.
+        // adjudicator, then Codex, then Gemini, then opencode.
         if configuration.claude.enabled {
             return await runClaude(
                 configuration: configuration.claude,
@@ -1277,6 +1359,13 @@ actor ReviewEngine {
         if configuration.codex.enabled {
             return await runCodex(
                 configuration: configuration.codex,
+                prompt: prompt,
+                worktree: worktree
+            )
+        }
+        if configuration.gemini.enabled {
+            return await runGemini(
+                configuration: configuration.gemini,
                 prompt: prompt,
                 worktree: worktree
             )
@@ -1386,6 +1475,11 @@ actor ReviewEngine {
     ) async -> ReviewerResult {
         let outputFile = worktree.appendingPathComponent(".review-bot-codex.md")
         do {
+            // codex writes its review here, but the worktree is the pull request's head: a PR can
+            // commit its own `.review-bot-codex.md`, and a run that exits 0 without producing one
+            // would be read back as codex's review, planted verdict line included. Clear it first,
+            // so the only file this reviewer can read is the one this run wrote.
+            try removePullRequestCopy(of: outputFile)
             let result = try await runner.run(
                 "codex",
                 arguments: [
@@ -1493,6 +1587,115 @@ actor ReviewEngine {
         } catch {
             return false
         }
+    }
+
+    private func runGemini(
+        configuration: ReviewerConfiguration,
+        prompt: String,
+        worktree: URL
+    ) async -> ReviewerResult {
+        guard ensureGeminiPolicy() else {
+            return failedReviewer(
+                .gemini,
+                configuration,
+                message: "could not write the read-only Gemini policy file"
+            )
+        }
+        do {
+            let result = try await runner.run(
+                "gemini",
+                arguments: [
+                    "--model", configuration.model,
+                    "--policy", paths.geminiPolicyFile.path,
+                    // The worktree is a scratch checkout the user has never opened,
+                    // so Gemini would otherwise refuse it as an untrusted folder.
+                    // Trusting it is also what makes `ownGeminiWorkspaceConfiguration`
+                    // necessary: a trusted workspace's `.gemini` is configuration the
+                    // CLI executes.
+                    "--skip-trust",
+                    // Reviews must not depend on whichever extensions the user
+                    // happens to have installed — or on ones the branch ships.
+                    "--extensions", "none",
+                    // Gemini has no `--disallowedTools mcp__*`: the only lever is an
+                    // allowlist, and a name no server answers to blocks every one of
+                    // them. That includes the user's own — an MCP tool is not one of
+                    // the names the read-only policy denies, so a configured server
+                    // would hand a reviewer of untrusted code a way out of Read,
+                    // Grep and Glob. The name is generated per run so that a pull
+                    // request cannot claim it by naming a server after the constant.
+                    "--allowed-mcp-server-names", "review-bot-no-mcp-\(UUID().uuidString)",
+                    "--output-format", "json",
+                    "--prompt", prompt,
+                ],
+                currentDirectory: worktree,
+                timeout: 900
+            )
+            guard result.succeeded else {
+                return failedReviewer(.gemini, configuration, message: conciseError(result))
+            }
+            let output = Self.geminiResponse(result.stdout)
+            return ReviewerResult(
+                reviewer: .gemini,
+                model: configuration.model,
+                output: output,
+                verdict: VerdictParser.parse(output),
+                failure: nil
+            )
+        } catch {
+            return failedReviewer(.gemini, configuration, error: error)
+        }
+    }
+
+    /// Writes the policy that keeps the Gemini reviewer read-only. Returns `false`
+    /// (and the reviewer then fails cleanly) if the file cannot be created.
+    ///
+    /// `--policy` loads it into Gemini's *user* tier, which outranks the
+    /// `.gemini/` settings and policies a pull request can ship in its own tree
+    /// (those are workspace tier). Headless Gemini already denies the mutating
+    /// tools, so this is a second lock on the same door — except for the plan-mode
+    /// pair, which is not belt-and-braces: a non-interactive run auto-approves
+    /// `exit_plan_mode`, and leaving plan mode switches the CLI into YOLO.
+    private func ensureGeminiPolicy() -> Bool {
+        let file = paths.geminiPolicyFile
+        do {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let policy = """
+            [[rule]]
+            toolName = [
+              "run_shell_command",
+              "write_file",
+              "replace",
+              "activate_skill",
+              "web_fetch",
+              "google_web_search",
+              "enter_plan_mode",
+              "exit_plan_mode"
+            ]
+            decision = "deny"
+            priority = 900
+            """
+            try Data(policy.utf8).write(to: file, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// `gemini --output-format json` wraps the answer in `{"response": …}`, which
+    /// keeps the reviewer's Markdown clean of the CLI's own chatter. Falls back to
+    /// raw stdout so a build that prints plain text still yields a parsable verdict.
+    static func geminiResponse(_ stdout: String) -> String {
+        struct Payload: Decodable { let response: String }
+        guard let payload = try? JSONDecoder().decode(
+            Payload.self,
+            from: Data(stdout.utf8)
+        ) else {
+            return stdout
+        }
+        return payload.response
     }
 
     private func failedReviewer(
@@ -1710,6 +1913,10 @@ actor ReviewEngine {
         }
         if configuration.opencode.enabled {
             reviewers.append("opencode (\(configuration.opencode.effort.label))")
+        }
+        // No effort for Gemini: its CLI has no such flag, so naming one would lie.
+        if configuration.gemini.enabled {
+            reviewers.append("Gemini")
         }
         return "Running " + reviewers.joined(separator: " and ") + "."
     }
