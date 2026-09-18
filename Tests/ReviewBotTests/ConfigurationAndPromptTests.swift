@@ -323,6 +323,53 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(prompt.hasSuffix("--- END REVIEW.md ---"))
     }
 
+    func testPullRequestFactsAreOrderedBeforeCustomizationAndRepositoryRules() throws {
+        let prompt = DefaultPrompt.combined(
+            with: "Custom",
+            repositoryRules: "Rule",
+            pullRequestFacts: "## Pull request facts\n\nX"
+        )
+
+        let factsRange = try XCTUnwrap(prompt.range(of: "## Pull request facts"))
+        let developerRange = try XCTUnwrap(prompt.range(of: "## Developer-specific review instructions"))
+        let rulesRange = try XCTUnwrap(prompt.range(of: "## Mandatory repository review rules"))
+        XCTAssertTrue(prompt.contains("X"))
+        XCTAssertTrue(factsRange.lowerBound < developerRange.lowerBound)
+        XCTAssertTrue(developerRange.lowerBound < rulesRange.lowerBound)
+    }
+
+    /// Without facts the prompt must be exactly what it was before facts existed: the contract,
+    /// then the developer's instructions, with nothing inserted between them.
+    func testCombinedWithoutFactsIsUnchanged() {
+        XCTAssertEqual(DefaultPrompt.combined(with: "", repositoryRules: nil), DefaultPrompt.text)
+        XCTAssertEqual(
+            DefaultPrompt.combined(with: "Custom", repositoryRules: nil, pullRequestFacts: nil),
+            DefaultPrompt.text + "\n\n## Developer-specific review instructions\nCustom"
+        )
+        XCTAssertEqual(
+            DefaultPrompt.combined(with: "Custom", repositoryRules: "Rule", pullRequestFacts: "  \n"),
+            DefaultPrompt.combined(with: "Custom", repositoryRules: "Rule")
+        )
+    }
+
+    func testReconciliationWithFactsIncludesThemAndWithoutDoesNot() {
+        let reviews: [(reviewer: String, body: String, verdict: String)] = [
+            (reviewer: "Claude", body: "None.", verdict: "CLEAN"),
+        ]
+
+        let withFacts = DefaultPrompt.reconciliation(
+            reviews: reviews,
+            pullRequestFacts: "## Pull request facts\n\nX"
+        )
+        let withoutFacts = DefaultPrompt.reconciliation(reviews: reviews)
+
+        XCTAssertTrue(withFacts.contains("## Pull request facts"))
+        XCTAssertTrue(withFacts.contains("reach the network.\n\n## Pull request facts\n\nX\n\nHere are the reviews to reconcile."))
+        XCTAssertFalse(withoutFacts.contains("Pull request facts"))
+        // Nothing is inserted between the two paragraphs when there are no facts.
+        XCTAssertTrue(withoutFacts.contains("reach the network.\n\nHere are the reviews to reconcile."))
+    }
+
     func testReconciliationMakesADowngradeJustifyItself() {
         let prompt = DefaultPrompt.reconciliation(reviews: [
             (reviewer: "Claude", body: "## Findings\nShould-fix: the count is wrong.", verdict: "SHOULD_FIX"),

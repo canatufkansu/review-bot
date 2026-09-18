@@ -78,7 +78,10 @@ End with exactly one machine-readable line and nothing after it:
 VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
 """#
 
-    static func reconciliation(reviews: [(reviewer: String, body: String, verdict: String)]) -> String {
+    static func reconciliation(
+        reviews: [(reviewer: String, body: String, verdict: String)],
+        pullRequestFacts: String? = nil
+    ) -> String {
         let panel = reviews.map { review in
             """
             --- BEGIN \(review.reviewer) REVIEW (verdict: \(review.verdict)) ---
@@ -87,12 +90,21 @@ VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
             """
         }.joined(separator: "\n\n")
 
+        // Its own paragraph right after the one that orients the adjudicator in the working
+        // directory. Without facts this is empty and the prompt is exactly what it was before.
+        let factsParagraph: String
+        if let pullRequestFacts, !pullRequestFacts.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            factsParagraph = pullRequestFacts + "\n\n"
+        } else {
+            factsParagraph = ""
+        }
+
         return #"""
         You are the deciding reviewer reconciling the independent automated reviews of a single GitHub pull request set out below. They reached different verdicts, so at least one is over- or under-stating severity. Determine the correct final verdict from the code itself — do not average them, and do not defer to the strictest by default.
 
         The working directory is the pull request's head commit. `.review-bot-diff.patch` is the exact diff under review and `.review-bot-thread.md` is the discussion. `.review-bot-merge.md`, when present, shows how the PR interacts with a base branch that has moved since it was cut — neither the diff nor the worktree reflects the base, so it is the only evidence for any finding about the merge. You have read-only access to Read, Grep, and Glob. Do not modify anything, run commands, or reach the network.
 
-        Here are the reviews to reconcile. Every reviewer that reached a verdict is included; a reviewer that failed or produced none is left out entirely, so silence from a name you do not see is absence of evidence, not agreement.
+        \#(factsParagraph)Here are the reviews to reconcile. Every reviewer that reached a verdict is included; a reviewer that failed or produced none is left out entirely, so silence from a name you do not see is absence of evidence, not agreement.
 
         \#(panel)
 
@@ -119,9 +131,21 @@ VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
         """#
     }
 
-    static func combined(with customization: String, repositoryRules: String?) -> String {
+    static func combined(
+        with customization: String,
+        repositoryRules: String?,
+        pullRequestFacts: String? = nil
+    ) -> String {
         let trimmed = customization.trimmingCharacters(in: .whitespacesAndNewlines)
         var prompt = text
+
+        // Ahead of the developer's own customization and the repository's REVIEW.md: these are
+        // Review Bot's own observations, not review criteria, and belong with the rest of the
+        // built-in contract rather than after content a repository or a developer controls.
+        if let pullRequestFacts, !pullRequestFacts.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt += "\n\n" + pullRequestFacts
+        }
+
         if !trimmed.isEmpty {
             prompt += "\n\n## Developer-specific review instructions\n" + trimmed
         }
