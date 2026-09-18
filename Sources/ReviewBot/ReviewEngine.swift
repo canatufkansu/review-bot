@@ -22,6 +22,9 @@ actor ReviewEngine {
 
     private let paths: StoragePaths
     private let runner: any CommandRunning
+    /// Only ever read through `ResolvedCredentials.resolve`, which takes the blocking Keychain
+    /// call off this actor's executor. Nothing here may call `apiKey(for:)` directly.
+    private let credentialStore: any CredentialStoring
     private let reviewedState: ReviewedStateStore
     private let lastReviewed: LastReviewedStore
     private let attempts: ReviewAttemptStore
@@ -38,13 +41,19 @@ actor ReviewEngine {
         let reviewKey: String
     }
 
+    /// Every seam has a production default, so the app constructs the engine with `paths` alone
+    /// while tests replace the pieces they need: `runner` for the CLIs and git/gh, `credentials`
+    /// for the Keychain, and `now` for the retry backoff, which is otherwise untestable in a
+    /// poll-interval-sized test.
     init(
         paths: StoragePaths,
         runner: any CommandRunning = ProcessRunner(),
+        credentials: any CredentialStoring = KeychainCredentialStore(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.paths = paths
         self.runner = runner
+        credentialStore = credentials
         self.now = now
         reviewedState = ReviewedStateStore(paths: paths)
         lastReviewed = LastReviewedStore(paths: paths)
@@ -448,6 +457,16 @@ actor ReviewEngine {
             )
             await announce("Reviewing \(repository.name) #\(pullRequest.number)…")
 
+            // Resolved once, here, before any reviewer starts — and off this actor. Reading a
+            // Keychain item is a synchronous call that can block on a modal prompt, so doing it
+            // from inside a reviewer's run method would stall its siblings and the poll loop
+            // behind them. One resolution also means at most one prompt per reviewer per
+            // review, and it covers the adjudicator `runReconciliation` may pick below.
+            let credentials = await ResolvedCredentials.resolve(
+                Self.reviewersNeedingKeys(in: configuration),
+                from: credentialStore
+            )
+
             let results = await runReviewers(
                 configuration: configuration,
                 worktree: worktree,
@@ -455,7 +474,8 @@ actor ReviewEngine {
                     repository: repository,
                     baseCommitSHA: metadata.baseRefOid
                 ),
-                pullRequestFacts: facts
+                pullRequestFacts: facts,
+                credentials: credentials
             )
 
             // Post as long as *someone* finished. A reviewer that failed is named in the posted
@@ -497,7 +517,8 @@ actor ReviewEngine {
                     results: results,
                     configuration: configuration,
                     worktree: worktree,
-                    pullRequestFacts: facts
+                    pullRequestFacts: facts,
+                    credentials: credentials
                 )
                 if let verdict = adjudicated.verdict {
                     decision = DecisionEvaluator.decision(for: verdict, policy: policy)
@@ -1146,7 +1167,8 @@ actor ReviewEngine {
         configuration: ReviewBotConfiguration,
         worktree: URL,
         repositoryRules: String?,
-        pullRequestFacts: String?
+        pullRequestFacts: String?,
+        credentials: ResolvedCredentials
     ) async -> [ReviewerResult] {
         let prompt = DefaultPrompt.combined(
             with: configuration.customPrompt,
@@ -1171,7 +1193,8 @@ actor ReviewEngine {
                         name,
                         configuration: reviewer,
                         prompt: prompt,
-                        worktree: worktree
+                        worktree: worktree,
+                        credentials: credentials
                     )
                 }
             }
@@ -1192,13 +1215,15 @@ actor ReviewEngine {
         _ name: ReviewerName,
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         var result = await runReviewerOnce(
             name,
             configuration: configuration,
             prompt: prompt,
-            worktree: worktree
+            worktree: worktree,
+            credentials: credentials
         )
         var attempt = 1
         while attempt < Self.reviewerAttemptsPerReview, result.isWorthRetrying {
@@ -1209,7 +1234,8 @@ actor ReviewEngine {
                 name,
                 configuration: configuration,
                 prompt: prompt,
-                worktree: worktree
+                worktree: worktree,
+                credentials: credentials
             )
             attempt += 1
         }
@@ -1221,21 +1247,47 @@ actor ReviewEngine {
         return result
     }
 
+    /// The single door every reviewer run goes through — the panel's and reconciliation's alike —
+    /// which is what lets the credential check live here rather than in each `run…` method.
     private func runReviewerOnce(
         _ name: ReviewerName,
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
+        if let missing = missingCredential(
+            for: name,
+            configuration: configuration,
+            credentials: credentials
+        ) {
+            return failedReviewer(name, configuration, message: missing)
+        }
         switch name {
         case .claude:
-            await runClaude(configuration: configuration, prompt: prompt, worktree: worktree)
+            return await runClaude(
+                configuration: configuration,
+                prompt: prompt,
+                worktree: worktree,
+                credentials: credentials
+            )
         case .codex:
-            await runCodex(configuration: configuration, prompt: prompt, worktree: worktree)
+            return await runCodex(
+                configuration: configuration,
+                prompt: prompt,
+                worktree: worktree,
+                credentials: credentials
+            )
         case .opencode:
-            await runOpencode(configuration: configuration, prompt: prompt, worktree: worktree)
+            return await runOpencode(
+                configuration: configuration,
+                prompt: prompt,
+                worktree: worktree,
+                credentials: credentials
+            )
         case .gemini:
-            await runGemini(configuration: configuration, prompt: prompt, worktree: worktree)
+            // Session-only (see `ReviewerName.apiKeyEnvironmentVariable`), so no credentials.
+            return await runGemini(configuration: configuration, prompt: prompt, worktree: worktree)
         }
     }
 
@@ -1243,7 +1295,8 @@ actor ReviewEngine {
         results: [ReviewerResult],
         configuration: ReviewBotConfiguration,
         worktree: URL,
-        pullRequestFacts: String?
+        pullRequestFacts: String?,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         // Only reviewers that reached a verdict are adjudicated. `results` keeps the ones that
         // failed so the posted body can disclose a partial panel, but a failed reviewer has no
@@ -1274,6 +1327,12 @@ actor ReviewEngine {
         // only runs when two reviewers parsed verdicts, so it always has a candidate that
         // finished, and the fallback below keeps the old configuration-only order for any
         // caller where none did.
+        // Dispatching through `runReviewerOnce` rather than reaching for a `run…`
+        // method directly is what keeps the credential check in one place: an
+        // adjudicator must not start under a login it was not configured to use
+        // either. It is `runReviewerOnce` and not `runReviewer` because
+        // reconciliation is a single extra pass — a retry here would double the
+        // adjudication, not rescue it.
         let enabled: [(name: ReviewerName, configuration: ReviewerConfiguration)] = [
             (.claude, configuration.claude),
             (.codex, configuration.codex),
@@ -1292,7 +1351,8 @@ actor ReviewEngine {
             adjudicator.name,
             configuration: adjudicator.configuration,
             prompt: prompt,
-            worktree: worktree
+            worktree: worktree,
+            credentials: credentials
         )
     }
 
@@ -1349,10 +1409,59 @@ actor ReviewEngine {
     ///
     /// An older `claude` CLI that rejects one of these flags fails the reviewer outright, which
     /// the posted review discloses like any other reviewer failure.
+    /// The reviewers this review may have to hand a key to. Reconciliation picks its adjudicator
+    /// from the enabled reviewers too, so one resolution covers the panel and the adjudicator
+    /// both. A reviewer left on session auth is not asked about at all: reading a Keychain item
+    /// can raise a modal prompt, and someone who chose the signed-in CLIs should never see one.
+    private static func reviewersNeedingKeys(
+        in configuration: ReviewBotConfiguration
+    ) -> [ReviewerName] {
+        ReviewerName.allCases.filter { reviewer in
+            let settings = configuration.settings(for: reviewer)
+            return settings.enabled && reviewer.supportsAPIKeyAuth && settings.authMode == .apiKey
+        }
+    }
+    /// The environment a CLI reviewer runs with. In `.apiKey` mode the resolved key is injected;
+    /// in `.session` mode the variable is explicitly removed, so the CLI uses its own login even
+    /// when a key is exported in the developer's shell. A reviewer with no key variable at all —
+    /// opencode, which is credentialed through its own config directory — gets no changes, which
+    /// is why it needs `OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT` merged in on top.
+    private func environmentOverrides(
+        for reviewer: ReviewerName,
+        configuration: ReviewerConfiguration,
+        credentials: ResolvedCredentials
+    ) -> EnvironmentOverrides {
+        guard let variable = reviewer.apiKeyEnvironmentVariable else { return [:] }
+        guard configuration.authMode == .apiKey else { return [variable: nil] }
+        return [variable: credentials.apiKey(for: reviewer)]
+    }
+    /// `nil` when the reviewer is ready to run, or a message explaining what is missing.
+    /// Checked in `runReviewerOnce`, which both the panel and `runReconciliation` dispatch
+    /// through — an adjudicator must not start under a login it was not configured to use
+    /// either. The message is one `ReviewerFailureClass.classify` calls terminal, so the
+    /// in-review retry does not spend a second call — nor the review-level failure budget — on
+    /// something only Settings can fix.
+    private func missingCredential(
+        for reviewer: ReviewerName,
+        configuration: ReviewerConfiguration,
+        credentials: ResolvedCredentials
+    ) -> String? {
+        // A reviewer Review Bot cannot hand a key to can never be missing one, whatever mode a
+        // hand-edited or migrated `config.json` claims it is in.
+        guard reviewer.supportsAPIKeyAuth else { return nil }
+        guard configuration.authMode == .apiKey else { return nil }
+        guard credentials.apiKey(for: reviewer) == nil else { return nil }
+        // A denied Keychain prompt is indistinguishable from an absent item here, and denial is
+        // easy to hit because each rebuild re-signs the app and re-triggers the prompt.
+        return "\(reviewer.rawValue) is set to API-key auth but its key could not be read — "
+            + "either none is saved, or macOS Keychain access was denied. "
+            + "Check Settings → Reviewers, or switch it back to the signed-in CLI."
+    }
     private func runClaude(
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         do {
             let result = try await runner.run(
@@ -1370,6 +1479,11 @@ actor ReviewEngine {
                     "--output-format", "text",
                 ],
                 currentDirectory: worktree,
+                environment: environmentOverrides(
+                    for: .claude,
+                    configuration: configuration,
+                    credentials: credentials
+                ),
                 timeout: 900
             )
             guard result.succeeded else {
@@ -1390,7 +1504,8 @@ actor ReviewEngine {
     private func runCodex(
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         let outputFile = worktree.appendingPathComponent(".review-bot-codex.md")
         do {
@@ -1411,6 +1526,11 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
+                environment: environmentOverrides(
+                    for: .codex,
+                    configuration: configuration,
+                    credentials: credentials
+                ),
                 timeout: 900
             )
             guard result.succeeded,
@@ -1432,7 +1552,8 @@ actor ReviewEngine {
     private func runOpencode(
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         // The opencode reviewer runs as a dedicated read-only agent defined in
         // Review Bot's own data directory (never inside the worktree, so a pull
@@ -1447,6 +1568,21 @@ actor ReviewEngine {
             )
         }
         let permissions = #"{"permission":{"*":"deny","read":"allow","grep":"allow","glob":"allow"}}"#
+        // opencode reads no API key of its own, so `environmentOverrides` contributes nothing
+        // here today. It is still the base of the merge rather than a hardcoded pair, so
+        // opencode stays the same shape as every other CLI reviewer if that ever changes; the
+        // sandbox variables win any collision, since they are what makes the run read-only.
+        let environment = environmentOverrides(
+            for: .opencode,
+            configuration: configuration,
+            credentials: credentials
+        )
+            .merging(
+                [
+                    "OPENCODE_CONFIG_DIR": paths.opencodeConfigDirectory.path,
+                    "OPENCODE_CONFIG_CONTENT": permissions,
+                ]
+            ) { _, sandbox in sandbox }
         do {
             let result = try await runner.run(
                 "opencode",
@@ -1459,11 +1595,8 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
-                timeout: 900,
-                environment: [
-                    "OPENCODE_CONFIG_DIR": paths.opencodeConfigDirectory.path,
-                    "OPENCODE_CONFIG_CONTENT": permissions,
-                ]
+                environment: environment,
+                timeout: 900
             )
             guard result.succeeded else {
                 return failedReviewer(.opencode, configuration, message: conciseError(result))
