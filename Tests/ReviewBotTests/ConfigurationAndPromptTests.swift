@@ -257,7 +257,11 @@ final class ConfigurationAndPromptTests: XCTestCase {
 
         // Claude's CLI prints a usage envelope; Codex and opencode print the review and nothing
         // else, so claiming otherwise would promise the usage report a figure nothing collects.
-        XCTAssertEqual(ReviewerName.allCases.map(\.reportsTokenUsage), [true, false, false])
+        // Gemini prints no usage envelope Review Bot reads, so it joins Codex and opencode.
+        XCTAssertEqual(
+            ReviewerName.allCases.map(\.reportsTokenUsage),
+            [true, false, false, false]
+        )
     }
 
     func testTokenSummaryTreatsCachedTokensAsASubsetOfInput() {

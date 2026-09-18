@@ -597,7 +597,9 @@ final class ReviewEngineFeatureTests: XCTestCase {
                     "--settings", #"{"disableAllHooks":true}"#,
                     "--strict-mcp-config",
                     "--disallowedTools", "mcp__*",
-                    "--output-format", "text",
+                    // JSON, not text: this branch reads the CLI's own token and cost figures
+                    // out of that envelope.
+                    "--output-format", "json",
                 ]
             )
             XCTAssertFalse(arguments.contains("--allowedTools"))
