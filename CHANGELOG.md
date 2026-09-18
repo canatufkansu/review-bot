@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-18
+
 ### Changed
 
 - **A partial panel can no longer approve a pull request.** When an enabled reviewer failed, timed out, or returned no verdict while at least one other reviewer finished, Review Bot posted whatever the survivors decided — including an approval — with only a blockquote in the review body disclosing that the panel was incomplete. On a production release pull request, one reviewer hit a terminal failure ("You've hit your weekly limit · resets 4pm (Europe/London)") and the surviving reviewer's clean verdict posted as **Approved**, indistinguishable at a glance from a full panel's approval. `DecisionEvaluator.withholdingApprovalFromPartialPanel` now downgrades an approval reached by a partial panel to a neutral comment that names the missing reviewer and why no approval was given; a partial panel can still request changes or comment, since those findings are still real. A review with no verdict at all is unaffected — nothing is posted, as before. `ReviewerFailureClass.classify` also recognizes the exhausted-weekly-quota message as terminal, so that failure is not retried within the same review.
@@ -179,7 +181,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/melihucar/review-bot/compare/v0.1.16...v0.2.0
 [0.1.16]: https://github.com/melihucar/review-bot/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/melihucar/review-bot/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/melihucar/review-bot/compare/v0.1.13...v0.1.14
