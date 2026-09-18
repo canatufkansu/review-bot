@@ -1262,31 +1262,35 @@ actor ReviewEngine {
             }
         }
         let prompt = DefaultPrompt.reconciliation(reviews: panel, pullRequestFacts: pullRequestFacts)
-        // Reviewers are enabled whenever verdicts disagree; prefer Claude as
-        // adjudicator, then Codex, then Gemini, then opencode.
-        if configuration.claude.enabled {
-            return await runClaude(
-                configuration: configuration.claude,
-                prompt: prompt,
-                worktree: worktree
+
+        // Among the enabled reviewers, prefer Claude as adjudicator, then Codex, then Gemini,
+        // then opencode — but only among the ones that just produced a verdict on this pull
+        // request. A reviewer whose panel run failed is unlikely to answer this call either, and
+        // an adjudicator that fails falls back to the strictest verdict, which is the lone
+        // blocker reconciliation exists to check. The case that made this concrete: Claude out
+        // of quota, Codex `SHOULD_FIX`, opencode `CLEAN` — the disagreement reconciles through
+        // Claude, Claude fails again, and the blocker gates the pull request unexamined. Codex
+        // adjudicates it instead. Preferring a survivor never weakens the check: reconciliation
+        // only runs when two reviewers parsed verdicts, so it always has a candidate that
+        // finished, and the fallback below keeps the old configuration-only order for any
+        // caller where none did.
+        let enabled: [(name: ReviewerName, configuration: ReviewerConfiguration)] = [
+            (.claude, configuration.claude),
+            (.codex, configuration.codex),
+            (.gemini, configuration.gemini),
+            (.opencode, configuration.opencode),
+        ].filter { $0.configuration.enabled }
+        let finished = Set(results.filter { $0.verdict != nil }.map(\.reviewer))
+        let preferred = enabled.first ?? (name: .opencode, configuration: configuration.opencode)
+        let adjudicator = enabled.first { finished.contains($0.name) } ?? preferred
+        if adjudicator.name != preferred.name {
+            await logger.append(
+                "\(preferred.name.rawValue) produced no verdict on this pull request, so \(adjudicator.name.rawValue) adjudicates the disagreement instead."
             )
         }
-        if configuration.codex.enabled {
-            return await runCodex(
-                configuration: configuration.codex,
-                prompt: prompt,
-                worktree: worktree
-            )
-        }
-        if configuration.gemini.enabled {
-            return await runGemini(
-                configuration: configuration.gemini,
-                prompt: prompt,
-                worktree: worktree
-            )
-        }
-        return await runOpencode(
-            configuration: configuration.opencode,
+        return await runReviewerOnce(
+            adjudicator.name,
+            configuration: adjudicator.configuration,
             prompt: prompt,
             worktree: worktree
         )
