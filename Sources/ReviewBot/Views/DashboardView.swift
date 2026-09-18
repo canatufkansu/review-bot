@@ -542,7 +542,7 @@ private struct DecisionPolicySettingsView: View {
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "info.circle")
                     .foregroundStyle(.secondary)
-                Text("“Leave it to me” posts a neutral comment — no approval and no change request — so you make the call. A reviewer that fails or returns an unreadable verdict always falls back to a neutral comment.")
+                Text("“Leave it to me” posts a neutral comment — no approval and no change request — so you make the call. If a reviewer fails or returns an unreadable verdict, the review never approves: the other reviewers' findings still post, as a neutral comment unless they request changes.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

@@ -478,7 +478,7 @@ actor ReviewEngine {
                 await logger.append(
                     "Posting \(repository.githubSlug)#\(pullRequest.number) without "
                         + unfinished.map(\.reviewer.rawValue).joined(separator: ", ")
-                        + "; the review discloses that it is a partial panel."
+                        + "; the review discloses that it is a partial panel and will not approve."
                 )
             }
 
@@ -503,6 +503,15 @@ actor ReviewEngine {
                     )
                 }
             }
+            // An approval reached without every enabled reviewer weighing in is capped to a
+            // neutral comment — see `DecisionEvaluator.withholdingApprovalFromPartialPanel`.
+            // This runs after reconciliation, so an adjudicated approval from a partial panel is
+            // capped too, and before the injection guard below, which then only has to consider
+            // a decision that can still approve.
+            let uncapped = decision
+            decision = DecisionEvaluator.withholdingApprovalFromPartialPanel(decision, results: results)
+            let approvalWithheld = uncapped == .approve && decision != .approve
+
             var guardReason: InjectionGuard.Reason?
             if decision == .approve {
                 guardReason = InjectionGuard.flagIfApproveUnsafe(
@@ -521,7 +530,8 @@ actor ReviewEngine {
                 results: results,
                 decision: decision,
                 adjudication: adjudication,
-                guardReason: guardReason
+                guardReason: guardReason,
+                approvalWithheldForPartialPanel: approvalWithheld
             )
             let reviewFile = try saveReview(
                 reviewBody,
@@ -558,11 +568,12 @@ actor ReviewEngine {
             let reconciledNote = adjudication.map {
                 " Reconciled by \($0.reviewer.rawValue) → \($0.verdict?.rawValue ?? "unavailable")."
             } ?? ""
+            let withheldNote = approvalWithheld ? " Approval withheld: partial panel." : ""
             await emit(
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(withheldNote)",
                 onEvent: onEvent
             )
         } catch {
@@ -1427,7 +1438,8 @@ actor ReviewEngine {
         results: [ReviewerResult],
         decision: ReviewDecision,
         adjudication: ReviewerResult?,
-        guardReason: InjectionGuard.Reason?
+        guardReason: InjectionGuard.Reason?,
+        approvalWithheldForPartialPanel: Bool
     ) -> String {
         let verdictSummary = results.map {
             "\($0.reviewer.rawValue): `\($0.verdict?.rawValue ?? "unavailable")`"
@@ -1451,15 +1463,19 @@ actor ReviewEngine {
         case .requestChanges:
             note = "At least one reviewer found an issue the current decision policy treats as blocking."
         case .comment:
-            note = guardReason == nil
-                ? "This review is neutral under the current decision policy (a reviewer failed, returned an unreadable verdict, or the policy leaves this severity to you)."
-                : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+            if approvalWithheldForPartialPanel {
+                note = "The decision policy would approve this, but **a partial panel never approves**, so it posts as a neutral comment. Re-request the review once every enabled reviewer can run."
+            } else {
+                note = guardReason == nil
+                    ? "This review is neutral because the current decision policy leaves this severity to you."
+                    : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+            }
         }
 
         // A decision reached by part of the panel is a weaker signal than one reached by all of
         // it, and the difference is invisible from the outside — so say it, and say which
-        // reviewer is missing. Without this an approval from one surviving reviewer would be
-        // indistinguishable from a unanimous one.
+        // reviewer is missing. A partial panel can no longer approve, but without this a change
+        // request from one surviving reviewer would still read as the whole panel's.
         var partialPanelDisclosure = ""
         let unfinished = results.filter { $0.verdict == nil }
         if !unfinished.isEmpty {
@@ -1477,7 +1493,7 @@ actor ReviewEngine {
             partialPanelDisclosure = """
 
 
-            > **Partial panel: \(missing) did not contribute a verdict.** The decision above reflects only the reviewers that finished, so it is a weaker signal than a full panel — weigh it accordingly.
+            > **Partial panel: \(missing) did not contribute a verdict to the panel.** The findings below come only from the reviewers that finished, so they are a weaker signal than a full panel's — weigh them accordingly.
             """
         }
 

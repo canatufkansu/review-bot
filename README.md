@@ -95,15 +95,17 @@ Every enabled reviewer must end with one verdict:
 - `NITS_ONLY`
 - `CLEAN`
 
-Review Bot uses the strictest result:
+Each verdict maps to a GitHub action under the configured decision policy (`BLOCKING` is always Request changes; `SHOULD_FIX`, `NITS_ONLY`, and `CLEAN` are each configurable on the dashboard). Review Bot takes the strictest configured action among the reviewers that returned a verdict:
 
 | Results | GitHub action |
 | --- | --- |
-| Every enabled reviewer returns a verdict; the strictest is `BLOCKING` or `SHOULD_FIX` | Request changes |
-| Every enabled reviewer returns `NITS_ONLY` or `CLEAN` | Approve |
-| Any enabled reviewer fails or returns no parseable verdict | Nothing is posted; the request is retried on the next poll |
+| Every enabled reviewer returns a verdict (a full panel) | The strictest configured action among them |
+| Some enabled reviewer fails or returns no parseable verdict, but at least one returns a verdict (a partial panel) | The strictest configured action among the reviewers that finished — except an approval is downgraded to a neutral comment, since a partial panel never approves. Request changes and comments still post as decided. |
+| No enabled reviewer returns a parseable verdict (an empty panel) | Nothing is posted; the request is retried on a later poll, within the failure budget |
 
-Review Bot only posts when every enabled reviewer finishes with a parseable verdict. A failure (for example a reviewer timing out) posts nothing and leaves the request unmarked, so a later poll retries it rather than submitting a partial or broken review.
+A partial panel's posted review names the missing reviewer and why it is missing (failed, timed out, or returned no verdict), so a change request or comment reached without the whole panel is never mistaken for a unanimous one.
+
+An approval can also be withheld by a deterministic injection check: if a reviewer's verdict matches a `VERDICT:` line planted in the pull request's thread or diff, or a permissive reviewer's own prose describes a merge blocker, the approval posts as a neutral comment instead and the review says why.
 
 When two reviewers disagree across the gate — one wants changes while the other approves — Review Bot runs one more read-only reconciliation pass that re-checks each blocking finding against the actual diff and its scope, then uses that adjudicated verdict instead of blindly taking the strictest. This keeps one reviewer's mistaken blocker from stopping a correct pull request. The pass is run by a reviewer that actually returned a verdict on this pull request, so a reviewer that is down — out of quota, signed out — is not asked to adjudicate a disagreement it could not take part in. The reconciliation and its verdict are shown in the posted review.
 
@@ -120,10 +122,12 @@ Generated reviews clearly identify each reviewer and preserve their findings in 
 5. Save the unified diff and existing PR discussion inside the worktree.
 6. Load trusted `REVIEW.md` rules from the base commit.
 7. Run enabled reviewers with read-only tools and a 15-minute timeout.
-8. If any enabled reviewer fails or returns no parseable verdict, post nothing and leave the request unmarked so a later poll retries it.
+8. If no enabled reviewer returns a parseable verdict, post nothing and leave the request unmarked so a later poll retries it.
 9. If the reviewers disagree across the gate, run one read-only reconciliation pass and use its adjudicated verdict.
-10. Otherwise aggregate the verdicts, save the Markdown, and submit the resulting decision through the authenticated GitHub CLI.
-11. Mark the request completed only after GitHub accepts it, then remove the worktree.
+10. If that decision is an approval but some enabled reviewer failed, timed out, or returned no verdict, downgrade it to a neutral comment naming who is missing — a partial panel never approves.
+11. If it is still an approval, run the injection check, which can downgrade it to a neutral comment.
+12. Aggregate the verdicts, save the Markdown, and submit the resulting decision through the authenticated GitHub CLI.
+13. Mark the request completed only after GitHub accepts it, then remove the worktree.
 
 If submission fails, the request is not marked complete and will be retried during a later poll.
 

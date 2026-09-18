@@ -363,6 +363,7 @@ enum ReviewerFailureClass: Equatable {
             "please run `codex login`",
             "please run `claude login`",
             "credit balance is too low",
+            "hit your weekly limit",
         ]
         return terminalMarkers.contains { haystack.contains($0) } ? .terminal : .transient
     }
