@@ -278,13 +278,15 @@ final class ConfigurationAndPromptTests: XCTestCase {
             nil,
         ])
         // Outbound: what a CLI child process is handed. opencode and Gemini take none — both
-        // are credentialed through their own CLI rather than a key Review Bot injects.
+        // are credentialed through their own CLI rather than a key Review Bot injects — and
+        // DeepSeek takes none either, for the opposite reason: it has no child process at all,
+        // so its key is used in-process rather than handed anywhere.
         XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyEnvironmentVariable), [
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             nil,
             nil,
-            "DEEPSEEK_API_KEY",
+            nil,
         ])
         // Inbound: what Review Bot itself reads a key from, ahead of the Keychain. Total, so it
         // names one even for opencode, which never consults it.
