@@ -224,6 +224,7 @@ final class ConfigurationAndPromptTests: XCTestCase {
         configuration.claude.enabled = true
         configuration.codex.enabled = true
         configuration.opencode.enabled = true
+        configuration.gemini.enabled = true
         configuration.deepseek.enabled = true
 
         // This order is `ReviewerName`'s declaration order, and it is load-bearing twice over: it
@@ -232,7 +233,7 @@ final class ConfigurationAndPromptTests: XCTestCase {
         // reviewer that always bills a key never adjudicates while a CLI is available.
         XCTAssertEqual(
             configuration.enabledReviewers.map(\.name),
-            [.claude, .codex, .opencode, .deepseek]
+            [.claude, .codex, .opencode, .gemini, .deepseek]
         )
         XCTAssertEqual(configuration.enabledReviewers.map(\.name), ReviewerName.allCases)
 
@@ -240,18 +241,19 @@ final class ConfigurationAndPromptTests: XCTestCase {
         configuration.codex.enabled = false
         XCTAssertEqual(
             configuration.enabledReviewers.map(\.name),
-            [.claude, .opencode, .deepseek]
+            [.claude, .opencode, .gemini, .deepseek]
         )
     }
 
     func testSettingsLookupReturnsEachReviewersOwnConfiguration() {
-        // `settings(for:)` is a four-arm switch over identically typed properties, so a
+        // `settings(for:)` is a switch over identically typed properties, one arm per reviewer, so a
         // copy-paste there would hand one reviewer another's model, effort, and auth mode with
         // nothing to catch it. `enabledReviewers` is built on top of it.
         var configuration = ReviewBotConfiguration.default
         configuration.claude.model = "model-claude"
         configuration.codex.model = "model-codex"
         configuration.opencode.model = "model-opencode"
+        configuration.gemini.model = "model-gemini"
         configuration.deepseek.model = "model-deepseek"
 
         for reviewer in ReviewerName.allCases {
@@ -272,13 +274,17 @@ final class ConfigurationAndPromptTests: XCTestCase {
             "claude",
             "codex",
             "opencode",
+            "gemini",
             nil,
         ])
+        // Outbound: what a CLI child process is handed. opencode and Gemini take none — both
+        // are credentialed through their own CLI rather than a key Review Bot injects.
         XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyEnvironmentVariable), [
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             nil,
             nil,
+            "DEEPSEEK_API_KEY",
         ])
         // Inbound: what Review Bot itself reads a key from, ahead of the Keychain. Total, so it
         // names one even for opencode, which never consults it.
@@ -286,37 +292,45 @@ final class ConfigurationAndPromptTests: XCTestCase {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "OPENCODE_API_KEY",
+            "GEMINI_API_KEY",
             "DEEPSEEK_API_KEY",
         ])
         let inbound = ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable)
         XCTAssertEqual(Set(inbound).count, inbound.count, "two reviewers would share a key")
 
         // Only a CLI can borrow a login; only a reviewer Review Bot can hand a key to may be put
-        // in key mode. opencode is the one reviewer that is neither, which is why it needs both
-        // predicates rather than one.
-        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true, false])
-        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false, true])
+        // in key mode. opencode and Gemini borrow a CLI login and take no key; DeepSeek is
+        // the reverse — a key and no CLI to sign in with — so both predicates are needed.
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true, true, false])
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false, false, true])
         XCTAssertFalse(
             ReviewerName.allCases.contains { !$0.supportsSessionAuth && !$0.supportsAPIKeyAuth },
             "a reviewer with neither auth mode could never be credentialed at all"
         )
 
-        // Claude's CLI prints a usage envelope and DeepSeek's API reports tokens; Codex and
-        // opencode print the review and nothing else, so claiming otherwise would promise the
-        // usage report a figure nothing collects.
-        XCTAssertEqual(ReviewerName.allCases.map(\.reportsTokenUsage), [true, false, false, true])
+        // Claude's CLI prints a usage envelope and DeepSeek's API reports tokens; Codex,
+        // opencode and Gemini print the review and nothing else, so claiming otherwise would
+        // promise the usage report a figure nothing collects.
+        XCTAssertEqual(
+            ReviewerName.allCases.map(\.reportsTokenUsage),
+            [true, false, false, false, true]
+        )
         XCTAssertEqual(
             ReviewerName.allCases.map(\.needsConfiguredPricing),
-            [false, false, false, true],
+            [false, false, false, false, true],
             "only a provider that reports tokens but no price needs configured rates"
         )
         // The rates belong to the case, not to the settings row: a Reset button written against
         // a hardcoded `.deepSeekDefault` would hand a second such provider DeepSeek's prices.
         XCTAssertEqual(
             ReviewerName.allCases.map(\.defaultPricing),
-            [nil, nil, nil, .deepSeekDefault]
+            [nil, nil, nil, nil, .deepSeekDefault]
         )
-        XCTAssertEqual(ReviewerName.allCases.map(\.usesEffortSetting), [true, true, true, false])
+        // Gemini's CLI takes no effort flag, and DeepSeek is called over HTTP with none.
+        XCTAssertEqual(
+            ReviewerName.allCases.map(\.usesEffortSetting),
+            [true, true, true, false, false]
+        )
 
         for reviewer in ReviewerName.allCases {
             XCTAssertEqual(
