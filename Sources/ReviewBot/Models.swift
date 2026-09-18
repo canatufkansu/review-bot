@@ -566,7 +566,10 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
     }
 
     /// DeepSeek is called through the chat-completions API, which has no effort control.
-    var usesEffortSetting: Bool { self != .deepseek }
+    /// Derived from `efforts` rather than listed separately: Gemini's CLI takes no effort flag
+    /// and DeepSeek is called over HTTP with none, and the two properties disagreeing would
+    /// show a picker with nothing in it (or hide one that works).
+    var usesEffortSetting: Bool { !efforts.isEmpty }
 
     /// Whether the reviewer tells us what it spent. Claude's CLI reports both tokens and a
     /// dollar figure under `--output-format json`; DeepSeek's API reports tokens, though never a
