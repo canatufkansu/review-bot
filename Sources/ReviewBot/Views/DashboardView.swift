@@ -337,7 +337,7 @@ private struct ReviewersSettingsView: View {
                 }
 
                 HStack {
-                    Text("At least one AI reviewer must be enabled. opencode is off by default; it runs the free `opencode/deepseek-v4-flash-free` model at max reasoning effort in a read-only sandbox. DeepSeek is off by default too — it has no CLI, so it needs an API key saved on its card above before it can review.")
+                    Text("At least one AI reviewer must be enabled. opencode, Gemini, and DeepSeek are off by default: opencode runs the free `opencode/deepseek-v4-flash-free` model, Gemini needs its own CLI signed in, and DeepSeek always bills the API key you give it.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -355,6 +355,7 @@ private struct ReviewersSettingsView: View {
         case .claude: $settings.configuration.claude
         case .codex: $settings.configuration.codex
         case .opencode: $settings.configuration.opencode
+        case .gemini: $settings.configuration.gemini
         case .deepseek: $settings.configuration.deepseek
         }
     }
@@ -682,7 +683,7 @@ private struct DecisionPolicySettingsView: View {
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "info.circle")
                     .foregroundStyle(.secondary)
-                Text("“Leave it to me” posts a neutral comment — no approval and no change request — so you make the call. A reviewer that fails or returns an unreadable verdict always falls back to a neutral comment.")
+                Text("“Leave it to me” posts a neutral comment — no approval and no change request — so you make the call. If a reviewer fails or returns an unreadable verdict, the review never approves: the other reviewers' findings still post, as a neutral comment unless they request changes.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

@@ -434,8 +434,12 @@ actor ReviewEngine {
             )
             worktreeURL = worktree
 
-            try await checkOutPullRequest(pendingReview, at: worktree)
+            let headBranchTip = try await checkOutPullRequest(pendingReview, at: worktree)
             worktreeAdded = true
+            // Before any reviewer is started, not inside `runGemini`: the reviewers run
+            // concurrently in this one worktree, so the checkout has to be settled while
+            // nothing is reading it.
+            try ownGeminiWorkspaceConfiguration(in: worktree)
 
             let priorHead = lastReviewed.head(
                 for: "\(repository.githubSlug)#\(pullRequest.number)"
@@ -448,6 +452,7 @@ actor ReviewEngine {
                 priorHead: priorHead,
                 metadata: metadata
             )
+            let facts = PullRequestFacts(metadata: metadata, headBranchTip: headBranchTip).render()
 
             await emit(
                 kind: .reviewStarted,
@@ -475,6 +480,7 @@ actor ReviewEngine {
                     repository: repository,
                     baseCommitSHA: metadata.baseRefOid
                 ),
+                pullRequestFacts: facts,
                 credentials: credentials
             )
 
@@ -511,7 +517,7 @@ actor ReviewEngine {
                 await logger.append(
                     "Posting \(repository.githubSlug)#\(pullRequest.number) without "
                         + unfinished.map(\.reviewer.rawValue).joined(separator: ", ")
-                        + "; the review discloses that it is a partial panel."
+                        + "; the review discloses that it is a partial panel and will not approve."
                 )
             }
 
@@ -532,6 +538,7 @@ actor ReviewEngine {
                     results: results,
                     configuration: configuration,
                     worktree: worktree,
+                    pullRequestFacts: facts,
                     credentials: credentials
                 )
                 adjudicationSpend = adjudicated
@@ -549,6 +556,15 @@ actor ReviewEngine {
                     configuration: configuration
                 )
             }
+            // An approval reached without every enabled reviewer weighing in is capped to a
+            // neutral comment — see `DecisionEvaluator.withholdingApprovalFromPartialPanel`.
+            // This runs after reconciliation, so an adjudicated approval from a partial panel is
+            // capped too, and before the injection guard below, which then only has to consider
+            // a decision that can still approve.
+            let uncapped = decision
+            decision = DecisionEvaluator.withholdingApprovalFromPartialPanel(decision, results: results)
+            let approvalWithheld = uncapped == .approve && decision != .approve
+
             var guardReason: InjectionGuard.Reason?
             if decision == .approve {
                 // The guard sees Review Bot's own copies of the thread and the diff, which is
@@ -574,6 +590,7 @@ actor ReviewEngine {
                 decision: decision,
                 adjudication: adjudication,
                 guardReason: guardReason,
+                approvalWithheldForPartialPanel: approvalWithheld,
                 usageReport: usageReport(
                     results: results,
                     adjudication: adjudicationSpend,
@@ -587,13 +604,34 @@ actor ReviewEngine {
                 commitSHA: metadata.headRefOid
             )
 
+            // Never post a review onto a commit it did not read. A review takes minutes, and a
+            // push can land meanwhile: an approval of the old commit may still count toward the
+            // new one's required approvals, so the re-read is the real protection — if the head
+            // moved, post nothing. The request stays open, the next poll discovers the new head
+            // under a fresh dedup key, and this failure count, keyed to the old head, never
+            // matters again. `commit_id` is the backstop for the second or so between the re-read
+            // and the post: GitHub attaches a review that names no commit (all `gh pr review` can
+            // send) to whatever the head is by then, while a pinned one lands on the commit it
+            // describes. GitHub clears the review request on any review, so a review that loses
+            // that race needs a re-request. A head that moves faster than a review completes is
+            // reviewed again each poll — accepted over posting a stale approval.
+            let current = try await pullRequestMetadata(number: pullRequest.number, repository: repository)
+            guard current.headRefOid == metadata.headRefOid else {
+                throw ReviewEngineError.reviewIncomplete(
+                    "Not posted — the head moved from \(metadata.headRefOid.prefix(8)) to "
+                        + "\(current.headRefOid.prefix(8)) while the review ran. The next poll "
+                        + "reviews the new head. Saved at \(reviewFile.path)"
+                )
+            }
+
             let post = try await runner.run(
                 "gh",
                 arguments: [
-                    "pr", "review", String(pullRequest.number),
-                    "--repo", repository.githubSlug,
-                    decision.ghArgument,
-                    "--body-file", reviewFile.path,
+                    "api", "--method", "POST",
+                    "repos/\(repository.githubSlug)/pulls/\(pullRequest.number)/reviews",
+                    "-f", "commit_id=\(metadata.headRefOid)",
+                    "-f", "event=\(decision.reviewEvent)",
+                    "-F", "body=@\(reviewFile.path)",
                 ],
                 timeout: 120
             )
@@ -615,6 +653,7 @@ actor ReviewEngine {
             let reconciledNote = adjudication.map {
                 " Reconciled by \($0.reviewer.rawValue) → \($0.verdict?.rawValue ?? "unavailable")."
             } ?? ""
+            let withheldNote = approvalWithheld ? " Approval withheld: partial panel." : ""
             // Recorded whether or not the report is posted, so spend stays traceable either way.
             let total = spent
             let usageNote = total.map { usage in
@@ -626,7 +665,7 @@ actor ReviewEngine {
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(usageNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(withheldNote)\(usageNote)",
                 usage: total,
                 onEvent: onEvent
             )
@@ -689,31 +728,76 @@ actor ReviewEngine {
     /// them fetching into the same clone contend for git's ref locks. The gate must be
     /// released on every path — an early `throw` that skipped it would strand every
     /// other pull request in the repository for the rest of the poll.
+    ///
+    /// Returns the head branch's tip as read back from the clone's `origin` remote right after
+    /// fetching it — only non-`nil` for a same-repository pull request with a reported head name,
+    /// which is the only case the head branch is fetched at all (see
+    /// `PullRequestMetadata.fetchableHeadRefName`); `nil` otherwise, including when the read-back
+    /// itself failed. `PullRequestFacts` renders whichever of these actually happened into the
+    /// reviewers' prompt.
     private func checkOutPullRequest(
         _ pendingReview: PendingPullRequest,
         at worktree: URL
-    ) async throws {
+    ) async throws -> String? {
         let repository = pendingReview.repository
+        let metadata = pendingReview.metadata
+        let headRefName = metadata.fetchableHeadRefName
+        var headTip: String?
         await gitGate.acquire(repository.githubSlug)
         do {
-            let fetch = try await runner.run(
-                "git",
-                arguments: [
-                    "-C", repository.path,
-                    "fetch", "--quiet", "origin",
-                    "refs/pull/\(pendingReview.summary.number)/head",
-                    // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
-                    // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
-                    // merely an opportunistic side effect of the clone's configured fetch
-                    // refspec. `mergePreview` reads that remote-tracking ref, so name it here
-                    // rather than depending on how this particular clone happens to be set up.
-                    "+refs/heads/\(pendingReview.metadata.baseRefName)"
-                        + ":refs/remotes/origin/\(pendingReview.metadata.baseRefName)",
-                ],
-                timeout: 180
-            )
+            var fetchArguments = [
+                "-C", repository.path,
+                "fetch", "--quiet", "origin",
+                "refs/pull/\(pendingReview.summary.number)/head",
+                // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
+                // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
+                // merely an opportunistic side effect of the clone's configured fetch
+                // refspec. `mergePreview` reads that remote-tracking ref, so name it here
+                // rather than depending on how this particular clone happens to be set up.
+                "+refs/heads/\(metadata.baseRefName)"
+                    + ":refs/remotes/origin/\(metadata.baseRefName)",
+            ]
+            if let headRefName {
+                // A same-repository head branch must exist while its pull request stays open —
+                // deleting it closes the PR — so a failure fetching it here is a closed-PR race,
+                // not a transient error, and failing the review is acceptable.
+                fetchArguments.append(
+                    "+refs/heads/\(headRefName):refs/remotes/origin/\(headRefName)"
+                )
+            }
+            let fetch = try await runner.run("git", arguments: fetchArguments, timeout: 180)
             guard fetch.succeeded else {
                 throw ReviewEngineError.commandFailed("Git fetch failed: \(conciseError(fetch))")
+            }
+
+            // Resolved here, inside the gate, rather than after releasing it: a concurrent review
+            // of another pull request sharing this clone could move the ref the moment the gate
+            // opened, and a read taken outside the lock could then answer for the wrong review.
+            // Best-effort: a read-back that fails leaves `headTip` nil, and the facts say so.
+            if let headRefName,
+               let revParse = try? await runner.run(
+                   "git",
+                   arguments: [
+                       "-C", repository.path,
+                       "rev-parse", "--verify", "--quiet",
+                       "refs/remotes/origin/\(headRefName)^{commit}",
+                   ],
+                   timeout: 30
+               ),
+               revParse.succeeded {
+                let trimmed = revParse.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                headTip = trimmed.isEmpty ? nil : trimmed
+            }
+
+            // `metadata` was captured at discovery, and a queued review can start many minutes
+            // later. If the head branch has moved on since, the commit we would check out is no
+            // longer what the pull request proposes, and the review would describe a stale head —
+            // so abort before creating the worktree. The old dedup key never recurs and the next
+            // discovery keys the new head, so the review is deferred, not lost.
+            if let headTip, headTip != metadata.headRefOid {
+                throw ReviewEngineError.reviewIncomplete(
+                    "The head moved from \(metadata.headRefOid.prefix(8)) to \(headTip.prefix(8)) before the review started; the next poll reviews the new head."
+                )
             }
 
             let addWorktree = try await runner.run(
@@ -721,7 +805,7 @@ actor ReviewEngine {
                 arguments: [
                     "-C", repository.path,
                     "worktree", "add", "--quiet", "--detach",
-                    worktree.path, pendingReview.metadata.headRefOid,
+                    worktree.path, metadata.headRefOid,
                 ],
                 timeout: 60
             )
@@ -735,6 +819,59 @@ actor ReviewEngine {
             throw error
         }
         await gitGate.release(repository.githubSlug)
+        return headTip
+    }
+
+    /// Replaces the pull request's own Gemini configuration in the scratch checkout
+    /// with Review Bot's.
+    ///
+    /// Gemini CLI reads `<workspace>/.gemini/settings.json` as *executable*
+    /// configuration: `hooks` entries are shell commands it runs around the agent
+    /// loop, and `mcpServers` entries are child processes it spawns. Neither is a
+    /// tool call, so the read-only `--policy` never sees them, and a `SessionStart`
+    /// hook runs before the model is asked anything — the review's own prompt and
+    /// verdict are irrelevant to it. The worktree is checked out at the pull
+    /// request's head, so leaving that path to the branch under review hands it a
+    /// shell on the machine running Review Bot. A `.env` beside it is the same
+    /// story one step removed: the CLI loads it into the environment those children
+    /// inherit.
+    ///
+    /// No flag closes this. The worktree must be *trusted* — a headless run in an
+    /// untrusted folder aborts outright — and trusted is exactly the state in which
+    /// Gemini honours the workspace's settings. Nor can a higher settings tier take
+    /// a hook back: `hooks` entries concatenate across tiers and `mcpServers`
+    /// shallow-merge, so a later tier can only add. What Review Bot does own is the
+    /// checkout it prepared, so it owns this path in it: the branch's `.gemini` and
+    /// `.env` are removed and Review Bot's own settings are written in their place.
+    /// Nothing is hidden from the review — every one of those files is in
+    /// `.review-bot-diff.patch`, which is what the reviewers are told to read.
+    ///
+    /// Done for every review rather than only when Gemini is enabled: the cost is a
+    /// directory in a throwaway checkout, and the alternative is a sandbox that
+    /// silently depends on a settings toggle elsewhere.
+    private func ownGeminiWorkspaceConfiguration(in worktree: URL) throws {
+        let manager = FileManager.default
+        let directory = worktree.appendingPathComponent(".gemini", isDirectory: true)
+        // `removeItem` throws when the path is absent, which is the ordinary case.
+        try? manager.removeItem(at: directory)
+        try? manager.removeItem(at: worktree.appendingPathComponent(".env"))
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Gemini CLI strips comments before parsing, so the file can say why it is
+        // here to whoever opens the worktree — or to a reviewer that reads it.
+        let settings = """
+        // Written by Review Bot, replacing whatever this pull request shipped at
+        // this path. Gemini CLI runs `hooks` as shell commands and spawns
+        // `mcpServers` as child processes, so the branch under review must not own
+        // this file. MCP is blocked at the command line as well.
+        {
+          "hooksConfig": { "enabled": false },
+          "advanced": { "ignoreLocalEnv": true }
+        }
+        """
+        try Data(settings.utf8).write(
+            to: directory.appendingPathComponent("settings.json"),
+            options: .atomic
+        )
     }
 
     private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
@@ -753,7 +890,7 @@ actor ReviewEngine {
             arguments: [
                 "pr", "view", String(number),
                 "--repo", repository.githubSlug,
-                "--json", "title,headRefOid,baseRefName,baseRefOid,url",
+                "--json", "title,headRefOid,headRefName,isCrossRepository,baseRefName,baseRefOid,url",
             ],
             timeout: 60
         )
@@ -861,13 +998,16 @@ actor ReviewEngine {
             : ""
 
         // What the diff cannot show: how this pull request interacts with a base branch that has
-        // moved since it was cut. Best-effort — a repository whose base ref could not be resolved
-        // still gets a review, just without the merge section.
+        // moved since it was cut. Best-effort in one direction only — a repository whose base ref
+        // could not be resolved still gets a review, just without the merge section. Writing the
+        // file is not best-effort: the alternative to a written preview is a *removed* one, since
+        // this is the single context file the bot does not always overwrite and the prompt reads
+        // its absence as "the PR is current with its base".
+        let mergePreviewFile = worktree.appendingPathComponent(".review-bot-merge.md")
         if let preview = await mergePreview(repository: repository, metadata: metadata) {
-            try? Data(preview.render().utf8).write(
-                to: worktree.appendingPathComponent(".review-bot-merge.md"),
-                options: .atomic
-            )
+            try Data(preview.render().utf8).write(to: mergePreviewFile, options: .atomic)
+        } else {
+            try removePullRequestCopy(of: mergePreviewFile)
         }
 
         async let conversation = captureCommand {
@@ -921,6 +1061,25 @@ actor ReviewEngine {
             options: .atomic
         )
         return ReviewContext(thread: thread, diff: diffText)
+    }
+
+    /// Removes a Review Bot context file that the pull request itself committed at the same path.
+    ///
+    /// The review worktree is checked out at the pull request's head, so every `.review-bot-*`
+    /// path is content the author controls until the bot overwrites it — and the prompt presents
+    /// those files to the reviewers as Review Bot's own evidence, verdict lines included. Files
+    /// the bot always writes are safe by construction; this is for the ones it may not write.
+    /// A removal that fails throws: reviewing against planted context is worse than not reviewing.
+    private func removePullRequestCopy(of file: URL) throws {
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: file)
+        } catch {
+            throw ReviewEngineError.commandFailed(
+                "Could not remove the \(file.lastPathComponent) committed by the pull request: "
+                    + error.localizedDescription
+            )
+        }
     }
 
     /// How this pull request interacts with a base branch that may have moved since it was cut, or
@@ -979,6 +1138,19 @@ actor ReviewEngine {
         let behind = lines(await git(["rev-list", "--count", "\(mergeBase)..\(base)"])).first
             .flatMap(Int.init) ?? 0
         guard behind > 0 else { return nil }
+
+        // Commits are not content. A release pull request (base `main`, head `develop`) is merged
+        // with a merge commit, so `main` collects commits `develop` never receives while its tree
+        // stays equal to the `develop` commit each release shipped. `behind` counts every one of
+        // those merges, so on its own it describes a base that "moved" without changing a line —
+        // noise that grows with every release, and that reviewers have read as evidence the pull
+        // request is a stale side branch. Exit 0 here means the base changed no content since the
+        // merge base, so there is nothing to preview and "behind N" is never reported. Exit 1 is
+        // a real change; any other answer is unknown, and unknown is not clean — both fall
+        // through. `--no-ext-diff` keeps a configured external diff driver out of a probe whose
+        // exit code decides control flow.
+        let baseTreeDiff = await git(["diff", "--quiet", "--no-ext-diff", mergeBase, base], timeout: 120)
+        if baseTreeDiff?.exitCode == 0 { return nil }
 
         // `merge-tree` exits 1 on conflicts and >1 on real errors (notably a git older than 2.38,
         // which has no `--write-tree`). Only treat 0 and 1 as an answer.
@@ -1044,11 +1216,13 @@ actor ReviewEngine {
         configuration: ReviewBotConfiguration,
         worktree: URL,
         repositoryRules: String?,
+        pullRequestFacts: String?,
         credentials: ResolvedCredentials
     ) async -> [ReviewerResult] {
         let prompt = DefaultPrompt.combined(
             with: configuration.customPrompt,
-            repositoryRules: repositoryRules
+            repositoryRules: repositoryRules,
+            pullRequestFacts: pullRequestFacts
         )
         let reviewers = configuration.enabledReviewers
         guard !reviewers.isEmpty else { return [] }
@@ -1181,6 +1355,9 @@ actor ReviewEngine {
                 worktree: worktree,
                 credentials: credentials
             )
+        case .gemini:
+            // Session-only (see `ReviewerName.apiKeyEnvironmentVariable`), so no credentials.
+            return await runGemini(configuration: settings, prompt: prompt, worktree: worktree)
         }
     }
 
@@ -1188,6 +1365,7 @@ actor ReviewEngine {
         results: [ReviewerResult],
         configuration: ReviewBotConfiguration,
         worktree: URL,
+        pullRequestFacts: String?,
         credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         // Only reviewers that reached a verdict are adjudicated. `results` keeps the ones that
@@ -1206,26 +1384,38 @@ actor ReviewEngine {
                 )
             }
         }
-        let prompt = DefaultPrompt.reconciliation(reviews: panel)
+        let prompt = DefaultPrompt.reconciliation(reviews: panel, pullRequestFacts: pullRequestFacts)
 
-        // The adjudicator is the first *enabled* CLI reviewer in `ReviewerName` order — Claude,
-        // then Codex, then opencode. Expressed over `enabledReviewers` rather than as an
-        // if-ladder ending in an unconditional `runOpencode`, which would spawn the opencode
-        // process with a disabled configuration whenever neither of the first two was on.
+        // Among the enabled reviewers, prefer Claude as adjudicator, then Codex, then Gemini,
+        // then opencode — but only among the ones that just produced a verdict on this pull
+        // request. A reviewer whose panel run failed is unlikely to answer this call either, and
+        // an adjudicator that fails falls back to the strictest verdict, which is the lone
+        // blocker reconciliation exists to check.
+        //
         // DeepSeek is deliberately not a candidate: it is the reviewer that always bills a key,
         // and giving the last word to an extra metered pass is the wrong default. With none of
-        // the three enabled there is nobody to ask, and the caller keeps the strictest verdict.
+        // the others enabled there is nobody to ask, and the caller keeps the strictest verdict.
+        //
+        // Dispatching through `runReviewerOnce` rather than reaching for a `run…` method
+        // directly is what keeps the credential check in one place: an adjudicator must not
+        // start under a login it was not configured to use either. It is `runReviewerOnce` and
+        // not `runReviewer` because reconciliation is a single extra pass — a retry here would
+        // double the adjudication, not rescue it.
         let enabled = configuration.enabledReviewers
-        let preference: [ReviewerName] = [.claude, .codex, .opencode]
-        guard let adjudicator = preference
-            .lazy
-            .compactMap({ name in enabled.first { $0.name == name } })
-            .first
-        else {
+        let preference: [ReviewerName] = [.claude, .codex, .gemini, .opencode]
+        let candidates = preference.compactMap { name in enabled.first { $0.name == name } }
+        guard let preferred = candidates.first else {
             return failedReviewer(
                 .claude,
                 configuration.claude,
                 message: "No reviewer was available to reconcile the disagreement."
+            )
+        }
+        let finished = Set(results.filter { $0.verdict != nil }.map(\.reviewer))
+        let adjudicator = candidates.first { finished.contains($0.name) } ?? preferred
+        if adjudicator.name != preferred.name {
+            await logger.append(
+                "\(preferred.name.rawValue) produced no verdict on this pull request, so \(adjudicator.name.rawValue) adjudicates the disagreement instead."
             )
         }
         // Dispatching through `runReviewerOnce` rather than reaching for a `run…` method
@@ -1260,6 +1450,41 @@ actor ReviewEngine {
         return rules.isEmpty ? nil : rules
     }
 
+    /// Hooks are switched off through `--settings` because no tool or permission flag governs
+    /// them, and a hook runs as a command on the reviewer's machine with the pull request's
+    /// worktree as its working directory. `disableAllHooks` turns hooks off from the user, project
+    /// and local sources, the developer's own included. Organization-managed settings outrank
+    /// `--settings` and can still override it; that policy belongs to whoever manages them.
+    private static let claudeSandboxSettingsJSON = #"{"disableAllHooks":true}"#
+
+    /// `runClaude` backs both an ordinary review and the reconciliation pass
+    /// (`runReconciliation`), so every flag here applies to both. Each one closes a specific way
+    /// the reviewer could act on more than the pull request's diff, verified against Claude Code
+    /// 2.1.212:
+    ///
+    /// - `--tools Read,Grep,Glob` limits the built-in tool set to read-only inspection: no shell,
+    ///   no file edits, no web access, no subagents.
+    /// - `--permission-mode dontAsk` denies anything not pre-approved without prompting, and
+    ///   overrides a developer's own default permission mode. Reads inside the working directory
+    ///   (the worktree) are allowed by default; reads outside it are denied.
+    /// - `--allowedTools` is deliberately absent. An allow rule for `Read` is what let reads
+    ///   escape the worktree in the first place, and `--allowedTools` only ever *adds*
+    ///   permissions — it cannot be used to narrow anything.
+    /// - `--setting-sources user`: project and local settings come from the pull request's own
+    ///   tree and must never load. The developer's user settings still load, so provider
+    ///   configuration kept there (`env`, `apiKeyHelper`) keeps working — the standard `claude`
+    ///   login lives in the macOS Keychain and needs no settings at all. Stated honestly: a
+    ///   directory or read rule a developer grants in their own user settings still applies, so
+    ///   the reviewer is confined to the worktree plus whatever the developer's own settings —
+    ///   or an organization's managed settings, which always load — explicitly allow.
+    /// - `--settings claudeSandboxSettingsJSON` turns off hooks, the developer's own included —
+    ///   see `claudeSandboxSettingsJSON` above.
+    /// - `--strict-mcp-config`, with no `--mcp-config` supplied, loads no MCP servers at all —
+    ///   neither the developer's nor an `.mcp.json` the pull request ships.
+    /// - `--disallowedTools mcp__*` is defense in depth in case an MCP server is loaded anyway.
+    ///
+    /// An older `claude` CLI that rejects one of these flags fails the reviewer outright, which
+    /// the posted review discloses like any other reviewer failure.
     /// The reviewers this review may have to hand a key to. Reconciliation picks its adjudicator
     /// from the enabled reviewers too, so one resolution covers the panel and the adjudicator
     /// both. A reviewer left on session auth is not asked about at all: reading a Keychain item
@@ -1272,7 +1497,6 @@ actor ReviewEngine {
             return settings.enabled && reviewer.supportsAPIKeyAuth && settings.authMode == .apiKey
         }
     }
-
     /// The environment a CLI reviewer runs with. In `.apiKey` mode the resolved key is injected;
     /// in `.session` mode the variable is explicitly removed, so the CLI uses its own login even
     /// when a key is exported in the developer's shell. A reviewer with no key variable at all —
@@ -1287,9 +1511,7 @@ actor ReviewEngine {
         guard configuration.authMode == .apiKey else { return [variable: nil] }
         return [variable: credentials.apiKey(for: reviewer)]
     }
-
     /// `nil` when the reviewer is ready to run, or a message explaining what is missing.
-    ///
     /// Checked in `runReviewerOnce`, which both the panel and `runReconciliation` dispatch
     /// through — an adjudicator must not start under a login it was not configured to use
     /// either. The message is one `ReviewerFailureClass.classify` calls terminal, so the
@@ -1311,7 +1533,6 @@ actor ReviewEngine {
             + "either none is saved, or macOS Keychain access was denied. "
             + "Check Settings → Reviewers, or switch it back to the signed-in CLI."
     }
-
     private func runClaude(
         configuration: ReviewerConfiguration,
         prompt: String,
@@ -1325,7 +1546,12 @@ actor ReviewEngine {
                     "-p", prompt,
                     "--model", configuration.model,
                     "--effort", configuration.effort.rawValue,
-                    "--allowedTools", "Read", "Grep", "Glob",
+                    "--tools", "Read,Grep,Glob",
+                    "--permission-mode", "dontAsk",
+                    "--setting-sources", "user",
+                    "--settings", Self.claudeSandboxSettingsJSON,
+                    "--strict-mcp-config",
+                    "--disallowedTools", "mcp__*",
                     // JSON rather than text so the CLI's own token counts and dollar cost come
                     // back with the review. Parsed defensively — see `claudeOutput`.
                     "--output-format", "json",
@@ -1459,6 +1685,11 @@ actor ReviewEngine {
     ) async -> ReviewerResult {
         let outputFile = worktree.appendingPathComponent(".review-bot-codex.md")
         do {
+            // codex writes its review here, but the worktree is the pull request's head: a PR can
+            // commit its own `.review-bot-codex.md`, and a run that exits 0 without producing one
+            // would be read back as codex's review, planted verdict line included. Clear it first,
+            // so the only file this reviewer can read is the one this run wrote.
+            try removePullRequestCopy(of: outputFile)
             let result = try await runner.run(
                 "codex",
                 arguments: [
@@ -1586,6 +1817,114 @@ actor ReviewEngine {
         }
     }
 
+    private func runGemini(
+        configuration: ReviewerConfiguration,
+        prompt: String,
+        worktree: URL
+    ) async -> ReviewerResult {
+        guard ensureGeminiPolicy() else {
+            return failedReviewer(
+                .gemini,
+                configuration,
+                message: "could not write the read-only Gemini policy file"
+            )
+        }
+        do {
+            let result = try await runner.run(
+                "gemini",
+                arguments: [
+                    "--model", configuration.model,
+                    "--policy", paths.geminiPolicyFile.path,
+                    // The worktree is a scratch checkout the user has never opened,
+                    // so Gemini would otherwise refuse it as an untrusted folder.
+                    // Trusting it is also what makes `ownGeminiWorkspaceConfiguration`
+                    // necessary: a trusted workspace's `.gemini` is configuration the
+                    // CLI executes.
+                    "--skip-trust",
+                    // Reviews must not depend on whichever extensions the user
+                    // happens to have installed — or on ones the branch ships.
+                    "--extensions", "none",
+                    // Gemini has no `--disallowedTools mcp__*`: the only lever is an
+                    // allowlist, and a name no server answers to blocks every one of
+                    // them. That includes the user's own — an MCP tool is not one of
+                    // the names the read-only policy denies, so a configured server
+                    // would hand a reviewer of untrusted code a way out of Read,
+                    // Grep and Glob. The name is generated per run so that a pull
+                    // request cannot claim it by naming a server after the constant.
+                    "--allowed-mcp-server-names", "review-bot-no-mcp-\(UUID().uuidString)",
+                    "--output-format", "json",
+                    "--prompt", prompt,
+                ],
+                currentDirectory: worktree,
+                timeout: 900
+            )
+            guard result.succeeded else {
+                return failedReviewer(.gemini, configuration, message: conciseError(result))
+            }
+            let output = Self.geminiResponse(result.stdout)
+            return ReviewerResult(
+                reviewer: .gemini,
+                model: configuration.model,
+                output: output,
+                verdict: VerdictParser.parse(output),
+                failure: nil
+            )
+        } catch {
+            return failedReviewer(.gemini, configuration, error: error)
+        }
+    }
+
+    /// Writes the policy that keeps the Gemini reviewer read-only. Returns `false`
+    /// (and the reviewer then fails cleanly) if the file cannot be created.
+    ///
+    /// `--policy` loads it into Gemini's *user* tier, which outranks the
+    /// `.gemini/` settings and policies a pull request can ship in its own tree
+    /// (those are workspace tier). Headless Gemini already denies the mutating
+    /// tools, so this is a second lock on the same door — except for the plan-mode
+    /// pair, which is not belt-and-braces: a non-interactive run auto-approves
+    /// `exit_plan_mode`, and leaving plan mode switches the CLI into YOLO.
+    private func ensureGeminiPolicy() -> Bool {
+        let file = paths.geminiPolicyFile
+        do {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let policy = """
+            [[rule]]
+            toolName = [
+              "run_shell_command",
+              "write_file",
+              "replace",
+              "activate_skill",
+              "web_fetch",
+              "google_web_search",
+              "enter_plan_mode",
+              "exit_plan_mode"
+            ]
+            decision = "deny"
+            priority = 900
+            """
+            try Data(policy.utf8).write(to: file, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// `gemini --output-format json` wraps the answer in `{"response": …}`, which
+    /// keeps the reviewer's Markdown clean of the CLI's own chatter. Falls back to
+    /// raw stdout so a build that prints plain text still yields a parsable verdict.
+    static func geminiResponse(_ stdout: String) -> String {
+        struct Payload: Decodable { let response: String }
+        guard let payload = try? JSONDecoder().decode(
+            Payload.self,
+            from: Data(stdout.utf8)
+        ) else {
+            return stdout
+        }
+        return payload.response
+    }
     /// How much longer than its own budget the engine gives a DeepSeek review before cancelling
     /// it outright.
     ///
@@ -1846,6 +2185,7 @@ actor ReviewEngine {
         decision: ReviewDecision,
         adjudication: ReviewerResult?,
         guardReason: InjectionGuard.Reason?,
+        approvalWithheldForPartialPanel: Bool,
         usageReport: String?
     ) -> String {
         let verdictSummary = results.map {
@@ -1870,15 +2210,19 @@ actor ReviewEngine {
         case .requestChanges:
             note = "At least one reviewer found an issue the current decision policy treats as blocking."
         case .comment:
-            note = guardReason == nil
-                ? "This review is neutral under the current decision policy (a reviewer failed, returned an unreadable verdict, or the policy leaves this severity to you)."
-                : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+            if approvalWithheldForPartialPanel {
+                note = "The decision policy would approve this, but **a partial panel never approves**, so it posts as a neutral comment. Re-request the review once every enabled reviewer can run."
+            } else {
+                note = guardReason == nil
+                    ? "This review is neutral because the current decision policy leaves this severity to you."
+                    : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+            }
         }
 
         // A decision reached by part of the panel is a weaker signal than one reached by all of
         // it, and the difference is invisible from the outside — so say it, and say which
-        // reviewer is missing. Without this an approval from one surviving reviewer would be
-        // indistinguishable from a unanimous one.
+        // reviewer is missing. A partial panel can no longer approve, but without this a change
+        // request from one surviving reviewer would still read as the whole panel's.
         var partialPanelDisclosure = ""
         let unfinished = results.filter { $0.verdict == nil }
         if !unfinished.isEmpty {
@@ -1896,7 +2240,7 @@ actor ReviewEngine {
             partialPanelDisclosure = """
 
 
-            > **Partial panel: \(missing) did not contribute a verdict.** The decision above reflects only the reviewers that finished, so it is a weaker signal than a full panel — weigh it accordingly.
+            > **Partial panel: \(missing) did not contribute a verdict to the panel.** The findings below come only from the reviewers that finished, so they are a weaker signal than a full panel's — weigh them accordingly.
             """
         }
 

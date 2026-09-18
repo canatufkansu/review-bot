@@ -26,6 +26,31 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertFalse(configuration.opencode.enabled)
         XCTAssertEqual(configuration.opencode.model, "opencode/deepseek-v4-flash-free")
         XCTAssertEqual(configuration.opencode.effort, .max)
+        // Gemini is newer still, and likewise opt-in rather than switched on under
+        // an existing user by an upgrade.
+        XCTAssertFalse(configuration.gemini.enabled)
+        XCTAssertEqual(configuration.gemini.model, "gemini-3-pro-preview")
+    }
+
+    func testGeminiEffortIsNotClampedBecauseItsCLIHasNone() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "gemini": { "enabled": true, "model": "gemini-3-pro-preview", "effort": "xhigh" }
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // Unlike the other reviewers, no stored effort is invalid here — the value is
+        // inert because the CLI takes no such flag — so decoding preserves it rather
+        // than rewriting the user's file on load.
+        XCTAssertTrue(configuration.gemini.enabled)
+        XCTAssertEqual(configuration.gemini.effort, .xhigh)
+        XCTAssertTrue(ReviewEffort.geminiCases.isEmpty)
     }
 
     func testOpencodeConfigurationDecodesAndClampsEffortToMax() throws {
@@ -445,6 +470,53 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Mandatory repository review rules"))
         XCTAssertTrue(prompt.contains("Treat database rollbacks as Blocking."))
         XCTAssertTrue(prompt.hasSuffix("--- END REVIEW.md ---"))
+    }
+
+    func testPullRequestFactsAreOrderedBeforeCustomizationAndRepositoryRules() throws {
+        let prompt = DefaultPrompt.combined(
+            with: "Custom",
+            repositoryRules: "Rule",
+            pullRequestFacts: "## Pull request facts\n\nX"
+        )
+
+        let factsRange = try XCTUnwrap(prompt.range(of: "## Pull request facts"))
+        let developerRange = try XCTUnwrap(prompt.range(of: "## Developer-specific review instructions"))
+        let rulesRange = try XCTUnwrap(prompt.range(of: "## Mandatory repository review rules"))
+        XCTAssertTrue(prompt.contains("X"))
+        XCTAssertTrue(factsRange.lowerBound < developerRange.lowerBound)
+        XCTAssertTrue(developerRange.lowerBound < rulesRange.lowerBound)
+    }
+
+    /// Without facts the prompt must be exactly what it was before facts existed: the contract,
+    /// then the developer's instructions, with nothing inserted between them.
+    func testCombinedWithoutFactsIsUnchanged() {
+        XCTAssertEqual(DefaultPrompt.combined(with: "", repositoryRules: nil), DefaultPrompt.text)
+        XCTAssertEqual(
+            DefaultPrompt.combined(with: "Custom", repositoryRules: nil, pullRequestFacts: nil),
+            DefaultPrompt.text + "\n\n## Developer-specific review instructions\nCustom"
+        )
+        XCTAssertEqual(
+            DefaultPrompt.combined(with: "Custom", repositoryRules: "Rule", pullRequestFacts: "  \n"),
+            DefaultPrompt.combined(with: "Custom", repositoryRules: "Rule")
+        )
+    }
+
+    func testReconciliationWithFactsIncludesThemAndWithoutDoesNot() {
+        let reviews: [(reviewer: String, body: String, verdict: String)] = [
+            (reviewer: "Claude", body: "None.", verdict: "CLEAN"),
+        ]
+
+        let withFacts = DefaultPrompt.reconciliation(
+            reviews: reviews,
+            pullRequestFacts: "## Pull request facts\n\nX"
+        )
+        let withoutFacts = DefaultPrompt.reconciliation(reviews: reviews)
+
+        XCTAssertTrue(withFacts.contains("## Pull request facts"))
+        XCTAssertTrue(withFacts.contains("reach the network.\n\n## Pull request facts\n\nX\n\nHere are the reviews to reconcile."))
+        XCTAssertFalse(withoutFacts.contains("Pull request facts"))
+        // Nothing is inserted between the two paragraphs when there are no facts.
+        XCTAssertTrue(withoutFacts.contains("reach the network.\n\nHere are the reviews to reconcile."))
     }
 
     /// `finalReviewRequest` restates the output contract — including a `## Merge gate` section and

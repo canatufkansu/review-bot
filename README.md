@@ -1,6 +1,6 @@
 # Review Bot
 
-Review Bot is a native macOS menu-bar app that watches local GitHub repositories for pull requests requesting a review from the signed-in `gh` user. It reviews each new request in an isolated Git worktree with Claude, Codex, opencode, DeepSeek, or any combination, then submits an approval, change request, or neutral review to GitHub.
+Review Bot is a native macOS menu-bar app that watches local GitHub repositories for pull requests requesting a review from the signed-in `gh` user. It reviews each new request in an isolated Git worktree with Claude, Codex, opencode, Gemini, or any combination, then submits an approval, change request, or neutral review to GitHub.
 
 GitHub access always goes through your authenticated `gh` CLI — the app never handles GitHub credentials. AI access defaults to the same model: each reviewer CLI uses its own existing login. If you would rather bill a specific API key, Claude and Codex accept one and DeepSeek requires one; keys are stored in the macOS Keychain and never written to `config.json`.
 
@@ -11,13 +11,13 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
 - Pause and resume automatic monitoring from the menu bar or settings.
 - See explicit Pending and Running review queues in the menu-bar popover.
 - Run an immediate manual check even while monitoring is paused.
-- Independently enable Claude, Codex, opencode, and DeepSeek and configure each model and effort level.
+- Independently enable Claude, Codex, opencode, Gemini, and DeepSeek and configure each model and effort level.
 - Choose per reviewer whether to use its signed-in CLI or an API key held in the macOS Keychain (Claude and Codex; DeepSeek is key-only, and opencode authenticates through its own configuration).
 - Track tokens and cost per review for the reviewers billed per token, and optionally publish that in the review.
 - Append a small developer-specific instruction prompt to every review.
 - Enforce repository-specific rules from `REVIEW.md`.
 - Run enabled reviewers independently in a read-only worktree.
-- Post the strictest reviewer decision through `gh pr review`.
+- Post the strictest reviewer decision through the GitHub CLI, pinned to the commit that was reviewed.
 - Keep activity history, detailed logs, and generated review Markdown locally.
 - Avoid duplicate reviews while allowing a new commit or a new review request at the same commit to trigger another review.
 - Optionally launch at login after the app is installed in `/Applications`.
@@ -27,6 +27,11 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
 - macOS 14 or newer.
 - Xcode 16 or newer, or a compatible Swift toolchain, to build the app.
 - GitHub CLI (`gh`), authenticated with `gh auth login`.
+- At least one authenticated reviewer CLI:
+  - `claude`
+  - `codex`
+  - `opencode` (opt-in reviewer; defaults to the free `opencode/deepseek-v4-flash-free` model at max effort)
+  - `gemini` (opt-in reviewer; defaults to `gemini-3-pro-preview`. Its CLI has no effort setting, so that card has no effort control)
 - At least one reviewer:
   - `claude` — authenticated, or an Anthropic API key.
   - `codex` — authenticated, or an OpenAI API key.
@@ -66,7 +71,11 @@ Launch-at-login registration only works reliably from the packaged app in `/Appl
 1. Open the menu-bar icon and choose **Settings…**.
 2. Add one or more local Git repository folders.
 3. Confirm the inferred `owner/repository` GitHub slug.
-4. Enable the reviewers you want and set their model and effort values. opencode and DeepSeek are off by default.
+4. Enable Claude, Codex, opencode, or Gemini and set their model and effort values. opencode and Gemini are off by default.
+5. Choose a polling interval.
+6. Optionally add global custom review instructions.
+7. Select **Run now** to verify the setup.
+4. Enable the reviewers you want and set their model and effort values. opencode, Gemini, and DeepSeek are off by default.
 5. For each reviewer, choose **Signed-in CLI** or **API key**. DeepSeek is key-only; paste its key and select **Save**. opencode uses its own configuration and has no key field.
 6. Choose a polling interval.
 7. Optionally add global custom review instructions.
@@ -133,16 +142,19 @@ Every enabled reviewer must end with one verdict:
 - `NITS_ONLY`
 - `CLEAN`
 
-Review Bot uses the strictest result:
+Each verdict maps to a GitHub action under the configured decision policy (`BLOCKING` is always Request changes; `SHOULD_FIX`, `NITS_ONLY`, and `CLEAN` are each configurable on the dashboard). Review Bot takes the strictest configured action among the reviewers that returned a verdict:
 
 | Results | GitHub action |
 | --- | --- |
-| Every enabled reviewer returns a verdict; the strictest is `BLOCKING` or `SHOULD_FIX` | Request changes |
-| Every enabled reviewer returns `NITS_ONLY` or `CLEAN` | Approve |
-| Any enabled reviewer fails or returns no parseable verdict | Nothing is posted; the request is retried on the next poll |
+| Every enabled reviewer returns a verdict (a full panel) | The strictest configured action among them |
+| Some enabled reviewer fails or returns no parseable verdict, but at least one returns a verdict (a partial panel) | The strictest configured action among the reviewers that finished — except an approval is downgraded to a neutral comment, since a partial panel never approves. Request changes and comments still post as decided. |
+| No enabled reviewer returns a parseable verdict (an empty panel) | Nothing is posted; the request is retried on a later poll, within the failure budget |
 
-Review Bot only posts when every enabled reviewer finishes with a parseable verdict. A failure (for example a reviewer timing out) posts nothing and leaves the request unmarked, so a later poll retries it rather than submitting a partial or broken review.
+A partial panel's posted review names the missing reviewer and why it is missing (failed, timed out, or returned no verdict), so a change request or comment reached without the whole panel is never mistaken for a unanimous one.
 
+An approval can also be withheld by a deterministic injection check: if a reviewer's verdict matches a `VERDICT:` line planted in the pull request's thread or diff, or a permissive reviewer's own prose describes a merge blocker, the approval posts as a neutral comment instead and the review says why.
+
+When two reviewers disagree across the gate — one wants changes while the other approves — Review Bot runs one more read-only reconciliation pass that re-checks each blocking finding against the actual diff and its scope, then uses that adjudicated verdict instead of blindly taking the strictest. This keeps one reviewer's mistaken blocker from stopping a correct pull request. The pass is run by a reviewer that actually returned a verdict on this pull request, so a reviewer that is down — out of quota, signed out — is not asked to adjudicate a disagreement it could not take part in. The reconciliation and its verdict are shown in the posted review.
 When reviewers disagree across the gate — at least one wants changes while another approves — Review Bot runs one more read-only reconciliation pass that re-checks each blocking finding against the actual diff and its scope, then uses that adjudicated verdict instead of blindly taking the strictest. The adjudicator is the first enabled reviewer in the order Claude, Codex, opencode; DeepSeek is never asked to adjudicate, because it is the one reviewer that always bills a key and the last word should not cost an extra metered pass. This keeps one reviewer's mistaken blocker from stopping a correct pull request. The reconciliation and its verdict are shown in the posted review.
 
 Every finding is also held to a scope gate: a defect may only block or request changes when it lives on a line the pull request adds or changes. Pre-existing issues, code outside the diff, and behavior owned by third-party dependencies are surfaced as notes, never as merge blockers.
@@ -154,14 +166,16 @@ Generated reviews clearly identify each reviewer and preserve their findings in 
 1. Poll each enabled repository for open PRs with `review-requested:@me`.
 2. Read the head commit and latest matching `review_requested` event.
 3. Skip the request if that exact commit and request event was completed previously.
-4. Fetch the PR head and create a detached worktree under Review Bot's private data directory.
+4. Fetch the PR ref, the base branch, and — for a same-repository PR — its head branch, then create a detached worktree under Review Bot's private data directory; abort instead of reviewing a stale commit if the head branch moved since step 2. The reviewers' prompt states these branch facts (base, head, reviewed commit, and the head branch's freshly fetched tip) explicitly, since the worktree's other refs can be arbitrarily stale.
 5. Save the unified diff and existing PR discussion inside the worktree.
 6. Load trusted `REVIEW.md` rules from the base commit.
 7. Run enabled reviewers with read-only tools and a 15-minute timeout.
-8. If any enabled reviewer fails or returns no parseable verdict, post nothing and leave the request unmarked so a later poll retries it.
+8. If no enabled reviewer returns a parseable verdict, post nothing and leave the request unmarked so a later poll retries it.
 9. If the reviewers disagree across the gate, run one read-only reconciliation pass and use its adjudicated verdict.
-10. Otherwise aggregate the verdicts, save the Markdown, and submit the resulting decision through the authenticated GitHub CLI.
-11. Mark the request completed only after GitHub accepts it, then remove the worktree.
+10. If that decision is an approval but some enabled reviewer failed, timed out, or returned no verdict, downgrade it to a neutral comment naming who is missing — a partial panel never approves.
+11. If it is still an approval, run the injection check, which can downgrade it to a neutral comment.
+12. Aggregate the verdicts and save the Markdown, then re-read the pull request's head; if it moved since discovery, post nothing so the next poll reviews the new commit instead.
+13. Submit the decision through GitHub's pull request reviews API (`gh api`), pinned to the reviewed commit. Mark the request completed only after GitHub accepts it, then remove the worktree.
 
 If submission fails, the request is not marked complete and will be retried during a later poll.
 
@@ -175,6 +189,7 @@ Review Bot writes to:
 ├── history.json
 ├── reviewed.json
 ├── opencode/
+├── gemini/
 ├── logs/
 ├── reviews/
 └── worktrees/
@@ -187,14 +202,16 @@ Review Bot writes to:
 - `reviews/` contains the aggregated Markdown submitted to GitHub.
 - `worktrees/` is temporary and normally empty between reviews.
 - `opencode/` holds the read-only agent definition the opencode reviewer runs under.
+- `gemini/` holds the read-only policy file the Gemini reviewer runs under.
 
 Use **History → Show data folder** to open this location.
 
 ## Privacy and safety
 
-- Source code inspected by Claude, Codex, or opencode is handled according to the account and provider configuration of those CLIs. Code sent to DeepSeek — the diff, the PR discussion, and any file its tools read — leaves your machine over HTTPS to DeepSeek's API, so enable it only where that is acceptable.
+- Source code inspected by Claude, Codex, opencode, Gemini, or DeepSeek is handled according to the account and provider configuration of those CLIs.
 - API keys are held in the macOS Keychain, passed only to the reviewer they belong to, and never written to configuration, history, logs, or a posted review.
 - Review Bot does not start a shell for repository values, PR titles, prompts, or paths; commands are passed as argument arrays.
+- Claude runs with only the `Read`, `Grep`, and `Glob` tools and cannot read outside the review worktree unless the developer's own user settings (or an organization's managed settings) explicitly allow it. It ignores the pull request's own Claude settings and MCP configuration, and runs no hooks or MCP servers from user, project, or local settings. Verified against Claude Code 2.1.212; a current `claude` CLI is required. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled. Gemini runs under a policy loaded at its user tier that denies shell, file writes, and web access, and denies the plan-mode transitions that would otherwise let a headless run drop into YOLO. Extensions are disabled and no MCP server is reachable. The pull request's own `.gemini` directory and `.env` are replaced with Review Bot's before any reviewer starts: a trusted workspace's `.gemini/settings.json` would otherwise run hooks and spawn MCP servers, neither of which a policy covers.
 - Claude is restricted to read/search tools. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled. DeepSeek's tools are implemented in-process, only read, and refuse any path that resolves outside the review worktree.
 - Review work never modifies the developer's current branch or working tree.
 - No review is marked complete until GitHub accepts the submitted result.

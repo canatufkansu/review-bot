@@ -17,10 +17,13 @@ enum ReviewEffort: String, Codable, CaseIterable, Identifiable {
     }
 
     // Claude, Codex, and opencode expose different top-tier effort names, so
-    // each reviewer only offers the levels its CLI accepts.
+    // each reviewer only offers the levels its CLI accepts. Gemini's CLI has no
+    // effort flag at all — its empty list hides the picker rather than offering
+    // a control that would silently do nothing.
     static let claudeCases: [ReviewEffort] = [.low, .medium, .high, .max]
     static let codexCases: [ReviewEffort] = [.low, .medium, .high, .xhigh]
     static let opencodeCases: [ReviewEffort] = [.low, .medium, .high, .max]
+    static let geminiCases: [ReviewEffort] = []
 }
 
 /// How much of a pull request each review looks at.
@@ -214,6 +217,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var claude: ReviewerConfiguration
     var codex: ReviewerConfiguration
     var opencode: ReviewerConfiguration
+    var gemini: ReviewerConfiguration
     var deepseek: ReviewerConfiguration
     var customPrompt: String
     /// Whether the posted review reports what the API-key reviewers consumed.
@@ -264,6 +268,13 @@ struct ReviewBotConfiguration: Codable, Equatable {
             effort: .max,
             authMode: .session
         ),
+        // Gemini is opt-in too. `effort` is stored but unused — the CLI takes no
+        // effort flag — so it keeps the shared default rather than a meaningful value.
+        gemini: ReviewerConfiguration(
+            enabled: false,
+            model: "gemini-3-pro-preview",
+            effort: .high
+        ),
         deepseek: defaultDeepSeek,
         customPrompt: "",
         includeUsageInReview: true,
@@ -286,6 +297,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case claude
         case codex
         case opencode
+        case gemini
         case deepseek
         case customPrompt
         case includeUsageInReview
@@ -303,6 +315,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         claude: ReviewerConfiguration,
         codex: ReviewerConfiguration,
         opencode: ReviewerConfiguration,
+        gemini: ReviewerConfiguration,
         deepseek: ReviewerConfiguration = ReviewBotConfiguration.defaultDeepSeek,
         customPrompt: String,
         includeUsageInReview: Bool = true,
@@ -318,6 +331,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.claude = claude
         self.codex = codex
         self.opencode = opencode
+        self.gemini = gemini
         self.deepseek = deepseek
         self.customPrompt = customPrompt
         self.includeUsageInReview = includeUsageInReview
@@ -351,6 +365,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
             ReviewerConfiguration.self,
             forKey: .opencode
         ) ?? ReviewBotConfiguration.default.opencode
+        gemini = try values.decodeIfPresent(
+            ReviewerConfiguration.self,
+            forKey: .gemini
+        ) ?? ReviewBotConfiguration.default.gemini
         deepseek = try values.decodeIfPresent(
             ReviewerConfiguration.self,
             forKey: .deepseek
@@ -364,6 +382,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         if !ReviewEffort.opencodeCases.contains(opencode.effort) {
             opencode.effort = .max
         }
+        // Gemini has no clamp: its CLI takes no effort flag, so no stored value
+        // is wrong and there is no valid set to snap one back to.
         // `ReviewerConfiguration.init(from:)` decodes a missing `model` to an empty string so a
         // hand-edited config still loads instead of throwing the whole file away. An empty model
         // is not runnable, though — the CLI would be invoked as `--model ""` and fail in a way
@@ -487,6 +507,7 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
     case claude = "Claude"
     case codex = "Codex"
     case opencode = "opencode"
+    case gemini = "Gemini"
     case deepseek = "DeepSeek"
 
     var id: String { rawValue }
@@ -497,6 +518,7 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
         case .claude: "claude"
         case .codex: "codex"
         case .opencode: "opencode"
+        case .gemini: "gemini"
         case .deepseek: nil
         }
     }
@@ -517,8 +539,10 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
         case .claude: "ANTHROPIC_API_KEY"
         case .codex: "OPENAI_API_KEY"
         // opencode is credentialed through OPENCODE_CONFIG_DIR, not through an injected key,
-        // so there is nothing to hand its child process.
-        case .opencode: nil
+        // so there is nothing to hand its child process. Gemini is the same shape: it signs in
+        // through its own CLI and runs under a policy file Review Bot writes, so Review Bot has
+        // nothing to hand it either — it stays session-only.
+        case .opencode, .gemini: nil
         case .deepseek: nil
         }
     }
@@ -536,6 +560,7 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
         case .claude: "ANTHROPIC_API_KEY"
         case .codex: "OPENAI_API_KEY"
         case .opencode: "OPENCODE_API_KEY"
+        case .gemini: "GEMINI_API_KEY"
         case .deepseek: "DEEPSEEK_API_KEY"
         }
     }
@@ -552,6 +577,10 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
         case .claude: true
         case .codex: false
         case .opencode: false
+        // Gemini is asked for `--output-format json`, but `ReviewEngine.geminiResponse` reads
+        // only the `response` field of that envelope — nothing Review Bot sees carries a token
+        // count, so claiming usage here would report a number that was never measured.
+        case .gemini: false
         case .deepseek: true
         }
     }
@@ -561,6 +590,7 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
         case .claude: ReviewEffort.claudeCases
         case .codex: ReviewEffort.codexCases
         case .opencode: ReviewEffort.opencodeCases
+        case .gemini: ReviewEffort.geminiCases
         case .deepseek: []
         }
     }
@@ -570,6 +600,7 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
         case .claude: "brain.head.profile"
         case .codex: "terminal.fill"
         case .opencode: "chevron.left.forwardslash.chevron.right"
+        case .gemini: "sparkle.magnifyingglass"
         case .deepseek: "cloud.fill"
         }
     }
@@ -587,6 +618,7 @@ extension ReviewBotConfiguration {
         case .claude: claude
         case .codex: codex
         case .opencode: opencode
+        case .gemini: gemini
         case .deepseek: deepseek
         }
     }
@@ -647,6 +679,13 @@ enum ReviewerFailureClass: Equatable {
             "please run `codex login`",
             "please run `claude login`",
             "credit balance is too low",
+            "hit your weekly limit",
+            // Gemini: quota, a rejected credential, and a CLI build whose OAuth
+            // client the service no longer accepts — none of which a second call fixes.
+            "resource_exhausted",
+            "error authenticating",
+            "api key not valid",
+            "this client is no longer supported",
             // DeepSeek answers a bad key with "Authentication Fails" and an empty account
             // with "Insufficient Balance"; both arrive wrapped in `DeepSeek returned HTTP …`.
             "authentication fails",
@@ -726,11 +765,12 @@ enum ReviewDecision: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    var ghArgument: String {
+    /// The `event` the pull request reviews API expects for this decision.
+    var reviewEvent: String {
         switch self {
-        case .approve: "--approve"
-        case .requestChanges: "--request-changes"
-        case .comment: "--comment"
+        case .approve: "APPROVE"
+        case .requestChanges: "REQUEST_CHANGES"
+        case .comment: "COMMENT"
         }
     }
 
@@ -775,9 +815,45 @@ struct PullRequestSummary: Decodable {
 struct PullRequestMetadata: Decodable {
     let title: String
     let headRefOid: String
+    /// The head branch's name, or `nil` when GitHub did not report one. Optional (rather than
+    /// required) so a `gh pr view` response missing this key still decodes, matching this
+    /// repository's convention of defensive config/metadata decoding.
+    let headRefName: String?
+    /// Whether the head branch lives outside this repository, as GitHub's `isCrossRepository`
+    /// reports it — `nil` when GitHub did not report it. Read this through `headRepository`
+    /// rather than directly; `false`/`true`/absent map to same-repository/fork/unknown there.
+    let isCrossRepository: Bool?
     let baseRefName: String
     let baseRefOid: String
     let url: String
+
+    /// Where this pull request's head branch lives, as far as GitHub said.
+    var headRepository: HeadRepository {
+        switch isCrossRepository {
+        case .some(false): .sameRepository
+        case .some(true): .fork
+        case .none: .unknown
+        }
+    }
+
+    /// The head branch name to fetch into a remote-tracking ref before a review starts, or `nil`
+    /// when it should not be fetched: a fork (its branch does not live on `origin`, so fetching
+    /// `refs/heads/<name>` there would fetch a different branch that merely shares the name — the
+    /// pull request's head commit is already fetched through `refs/pull/<n>/head`), an unreported
+    /// relationship (treated like a fork), or no reported name at all.
+    var fetchableHeadRefName: String? {
+        guard headRepository == .sameRepository, let headRefName, !headRefName.isEmpty else {
+            return nil
+        }
+        return headRefName
+    }
+}
+
+/// Where a pull request's head branch lives, as far as GitHub said.
+enum HeadRepository: Equatable {
+    case sameRepository
+    case fork
+    case unknown
 }
 
 struct InspectedRepository {
