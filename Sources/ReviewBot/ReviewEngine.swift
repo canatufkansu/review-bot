@@ -418,7 +418,7 @@ actor ReviewEngine {
             )
             worktreeURL = worktree
 
-            try await checkOutPullRequest(pendingReview, at: worktree)
+            let headBranchTip = try await checkOutPullRequest(pendingReview, at: worktree)
             worktreeAdded = true
 
             let priorHead = lastReviewed.head(
@@ -432,6 +432,7 @@ actor ReviewEngine {
                 priorHead: priorHead,
                 metadata: metadata
             )
+            let facts = PullRequestFacts(metadata: metadata, headBranchTip: headBranchTip).render()
 
             await emit(
                 kind: .reviewStarted,
@@ -448,7 +449,8 @@ actor ReviewEngine {
                 repositoryRules: await loadRepositoryReviewRules(
                     repository: repository,
                     baseCommitSHA: metadata.baseRefOid
-                )
+                ),
+                pullRequestFacts: facts
             )
 
             // Post as long as *someone* finished. A reviewer that failed is named in the posted
@@ -484,7 +486,7 @@ actor ReviewEngine {
                 await logger.append(
                     "Posting \(repository.githubSlug)#\(pullRequest.number) without "
                         + unfinished.map(\.reviewer.rawValue).joined(separator: ", ")
-                        + "; the review discloses that it is a partial panel."
+                        + "; the review discloses that it is a partial panel and will not approve."
                 )
             }
 
@@ -497,7 +499,8 @@ actor ReviewEngine {
                 let adjudicated = await runReconciliation(
                     results: results,
                     configuration: configuration,
-                    worktree: worktree
+                    worktree: worktree,
+                    pullRequestFacts: facts
                 )
                 if let verdict = adjudicated.verdict {
                     decision = DecisionEvaluator.decision(for: verdict, policy: policy)
@@ -508,6 +511,15 @@ actor ReviewEngine {
                     )
                 }
             }
+            // An approval reached without every enabled reviewer weighing in is capped to a
+            // neutral comment — see `DecisionEvaluator.withholdingApprovalFromPartialPanel`.
+            // This runs after reconciliation, so an adjudicated approval from a partial panel is
+            // capped too, and before the injection guard below, which then only has to consider
+            // a decision that can still approve.
+            let uncapped = decision
+            decision = DecisionEvaluator.withholdingApprovalFromPartialPanel(decision, results: results)
+            let approvalWithheld = uncapped == .approve && decision != .approve
+
             var guardReason: InjectionGuard.Reason?
             if decision == .approve {
                 guardReason = InjectionGuard.flagIfApproveUnsafe(
@@ -526,7 +538,8 @@ actor ReviewEngine {
                 results: results,
                 decision: decision,
                 adjudication: adjudication,
-                guardReason: guardReason
+                guardReason: guardReason,
+                approvalWithheldForPartialPanel: approvalWithheld
             )
             let reviewFile = try saveReview(
                 reviewBody,
@@ -535,13 +548,34 @@ actor ReviewEngine {
                 commitSHA: metadata.headRefOid
             )
 
+            // Never post a review onto a commit it did not read. A review takes minutes, and a
+            // push can land meanwhile: an approval of the old commit may still count toward the
+            // new one's required approvals, so the re-read is the real protection — if the head
+            // moved, post nothing. The request stays open, the next poll discovers the new head
+            // under a fresh dedup key, and this failure count, keyed to the old head, never
+            // matters again. `commit_id` is the backstop for the second or so between the re-read
+            // and the post: GitHub attaches a review that names no commit (all `gh pr review` can
+            // send) to whatever the head is by then, while a pinned one lands on the commit it
+            // describes. GitHub clears the review request on any review, so a review that loses
+            // that race needs a re-request. A head that moves faster than a review completes is
+            // reviewed again each poll — accepted over posting a stale approval.
+            let current = try await pullRequestMetadata(number: pullRequest.number, repository: repository)
+            guard current.headRefOid == metadata.headRefOid else {
+                throw ReviewEngineError.reviewIncomplete(
+                    "Not posted — the head moved from \(metadata.headRefOid.prefix(8)) to "
+                        + "\(current.headRefOid.prefix(8)) while the review ran. The next poll "
+                        + "reviews the new head. Saved at \(reviewFile.path)"
+                )
+            }
+
             let post = try await runner.run(
                 "gh",
                 arguments: [
-                    "pr", "review", String(pullRequest.number),
-                    "--repo", repository.githubSlug,
-                    decision.ghArgument,
-                    "--body-file", reviewFile.path,
+                    "api", "--method", "POST",
+                    "repos/\(repository.githubSlug)/pulls/\(pullRequest.number)/reviews",
+                    "-f", "commit_id=\(metadata.headRefOid)",
+                    "-f", "event=\(decision.reviewEvent)",
+                    "-F", "body=@\(reviewFile.path)",
                 ],
                 timeout: 120
             )
@@ -563,11 +597,12 @@ actor ReviewEngine {
             let reconciledNote = adjudication.map {
                 " Reconciled by \($0.reviewer.rawValue) → \($0.verdict?.rawValue ?? "unavailable")."
             } ?? ""
+            let withheldNote = approvalWithheld ? " Approval withheld: partial panel." : ""
             await emit(
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(withheldNote)",
                 onEvent: onEvent
             )
         } catch {
@@ -626,31 +661,76 @@ actor ReviewEngine {
     /// them fetching into the same clone contend for git's ref locks. The gate must be
     /// released on every path — an early `throw` that skipped it would strand every
     /// other pull request in the repository for the rest of the poll.
+    ///
+    /// Returns the head branch's tip as read back from the clone's `origin` remote right after
+    /// fetching it — only non-`nil` for a same-repository pull request with a reported head name,
+    /// which is the only case the head branch is fetched at all (see
+    /// `PullRequestMetadata.fetchableHeadRefName`); `nil` otherwise, including when the read-back
+    /// itself failed. `PullRequestFacts` renders whichever of these actually happened into the
+    /// reviewers' prompt.
     private func checkOutPullRequest(
         _ pendingReview: PendingPullRequest,
         at worktree: URL
-    ) async throws {
+    ) async throws -> String? {
         let repository = pendingReview.repository
+        let metadata = pendingReview.metadata
+        let headRefName = metadata.fetchableHeadRefName
+        var headTip: String?
         await gitGate.acquire(repository.githubSlug)
         do {
-            let fetch = try await runner.run(
-                "git",
-                arguments: [
-                    "-C", repository.path,
-                    "fetch", "--quiet", "origin",
-                    "refs/pull/\(pendingReview.summary.number)/head",
-                    // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
-                    // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
-                    // merely an opportunistic side effect of the clone's configured fetch
-                    // refspec. `mergePreview` reads that remote-tracking ref, so name it here
-                    // rather than depending on how this particular clone happens to be set up.
-                    "+refs/heads/\(pendingReview.metadata.baseRefName)"
-                        + ":refs/remotes/origin/\(pendingReview.metadata.baseRefName)",
-                ],
-                timeout: 180
-            )
+            var fetchArguments = [
+                "-C", repository.path,
+                "fetch", "--quiet", "origin",
+                "refs/pull/\(pendingReview.summary.number)/head",
+                // Explicit destination: a bare `refs/heads/<name>` refspec only lands in
+                // FETCH_HEAD, and updating `refs/remotes/origin/<name>` alongside it is
+                // merely an opportunistic side effect of the clone's configured fetch
+                // refspec. `mergePreview` reads that remote-tracking ref, so name it here
+                // rather than depending on how this particular clone happens to be set up.
+                "+refs/heads/\(metadata.baseRefName)"
+                    + ":refs/remotes/origin/\(metadata.baseRefName)",
+            ]
+            if let headRefName {
+                // A same-repository head branch must exist while its pull request stays open —
+                // deleting it closes the PR — so a failure fetching it here is a closed-PR race,
+                // not a transient error, and failing the review is acceptable.
+                fetchArguments.append(
+                    "+refs/heads/\(headRefName):refs/remotes/origin/\(headRefName)"
+                )
+            }
+            let fetch = try await runner.run("git", arguments: fetchArguments, timeout: 180)
             guard fetch.succeeded else {
                 throw ReviewEngineError.commandFailed("Git fetch failed: \(conciseError(fetch))")
+            }
+
+            // Resolved here, inside the gate, rather than after releasing it: a concurrent review
+            // of another pull request sharing this clone could move the ref the moment the gate
+            // opened, and a read taken outside the lock could then answer for the wrong review.
+            // Best-effort: a read-back that fails leaves `headTip` nil, and the facts say so.
+            if let headRefName,
+               let revParse = try? await runner.run(
+                   "git",
+                   arguments: [
+                       "-C", repository.path,
+                       "rev-parse", "--verify", "--quiet",
+                       "refs/remotes/origin/\(headRefName)^{commit}",
+                   ],
+                   timeout: 30
+               ),
+               revParse.succeeded {
+                let trimmed = revParse.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                headTip = trimmed.isEmpty ? nil : trimmed
+            }
+
+            // `metadata` was captured at discovery, and a queued review can start many minutes
+            // later. If the head branch has moved on since, the commit we would check out is no
+            // longer what the pull request proposes, and the review would describe a stale head —
+            // so abort before creating the worktree. The old dedup key never recurs and the next
+            // discovery keys the new head, so the review is deferred, not lost.
+            if let headTip, headTip != metadata.headRefOid {
+                throw ReviewEngineError.reviewIncomplete(
+                    "The head moved from \(metadata.headRefOid.prefix(8)) to \(headTip.prefix(8)) before the review started; the next poll reviews the new head."
+                )
             }
 
             let addWorktree = try await runner.run(
@@ -658,7 +738,7 @@ actor ReviewEngine {
                 arguments: [
                     "-C", repository.path,
                     "worktree", "add", "--quiet", "--detach",
-                    worktree.path, pendingReview.metadata.headRefOid,
+                    worktree.path, metadata.headRefOid,
                 ],
                 timeout: 60
             )
@@ -672,6 +752,7 @@ actor ReviewEngine {
             throw error
         }
         await gitGate.release(repository.githubSlug)
+        return headTip
     }
 
     private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
@@ -690,7 +771,7 @@ actor ReviewEngine {
             arguments: [
                 "pr", "view", String(number),
                 "--repo", repository.githubSlug,
-                "--json", "title,headRefOid,baseRefName,baseRefOid,url",
+                "--json", "title,headRefOid,headRefName,isCrossRepository,baseRefName,baseRefOid,url",
             ],
             timeout: 60
         )
@@ -928,6 +1009,19 @@ actor ReviewEngine {
             .flatMap(Int.init) ?? 0
         guard behind > 0 else { return nil }
 
+        // Commits are not content. A release pull request (base `main`, head `develop`) is merged
+        // with a merge commit, so `main` collects commits `develop` never receives while its tree
+        // stays equal to the `develop` commit each release shipped. `behind` counts every one of
+        // those merges, so on its own it describes a base that "moved" without changing a line —
+        // noise that grows with every release, and that reviewers have read as evidence the pull
+        // request is a stale side branch. Exit 0 here means the base changed no content since the
+        // merge base, so there is nothing to preview and "behind N" is never reported. Exit 1 is
+        // a real change; any other answer is unknown, and unknown is not clean — both fall
+        // through. `--no-ext-diff` keeps a configured external diff driver out of a probe whose
+        // exit code decides control flow.
+        let baseTreeDiff = await git(["diff", "--quiet", "--no-ext-diff", mergeBase, base], timeout: 120)
+        if baseTreeDiff?.exitCode == 0 { return nil }
+
         // `merge-tree` exits 1 on conflicts and >1 on real errors (notably a git older than 2.38,
         // which has no `--write-tree`). Only treat 0 and 1 as an answer.
         let mergeTree = await git(["merge-tree", "--write-tree", "--name-only", base, head], timeout: 120)
@@ -1028,11 +1122,13 @@ actor ReviewEngine {
     private func runReviewers(
         configuration: ReviewBotConfiguration,
         worktree: URL,
-        repositoryRules: String?
+        repositoryRules: String?,
+        pullRequestFacts: String?
     ) async -> [ReviewerResult] {
         let prompt = DefaultPrompt.combined(
             with: configuration.customPrompt,
-            repositoryRules: repositoryRules
+            repositoryRules: repositoryRules,
+            pullRequestFacts: pullRequestFacts
         )
 
         // Runs every enabled reviewer in parallel, preserving a deterministic
@@ -1149,7 +1245,8 @@ actor ReviewEngine {
     private func runReconciliation(
         results: [ReviewerResult],
         configuration: ReviewBotConfiguration,
-        worktree: URL
+        worktree: URL,
+        pullRequestFacts: String?
     ) async -> ReviewerResult {
         // Only reviewers that reached a verdict are adjudicated. `results` keeps the ones that
         // failed so the posted body can disclose a partial panel, but a failed reviewer has no
@@ -1167,7 +1264,7 @@ actor ReviewEngine {
                 )
             }
         }
-        let prompt = DefaultPrompt.reconciliation(reviews: panel)
+        let prompt = DefaultPrompt.reconciliation(reviews: panel, pullRequestFacts: pullRequestFacts)
         // Reviewers are enabled whenever verdicts disagree; prefer Claude as
         // adjudicator, then Codex, then opencode.
         if configuration.claude.enabled {
@@ -1209,6 +1306,41 @@ actor ReviewEngine {
         return rules.isEmpty ? nil : rules
     }
 
+    /// Hooks are switched off through `--settings` because no tool or permission flag governs
+    /// them, and a hook runs as a command on the reviewer's machine with the pull request's
+    /// worktree as its working directory. `disableAllHooks` turns hooks off from the user, project
+    /// and local sources, the developer's own included. Organization-managed settings outrank
+    /// `--settings` and can still override it; that policy belongs to whoever manages them.
+    private static let claudeSandboxSettingsJSON = #"{"disableAllHooks":true}"#
+
+    /// `runClaude` backs both an ordinary review and the reconciliation pass
+    /// (`runReconciliation`), so every flag here applies to both. Each one closes a specific way
+    /// the reviewer could act on more than the pull request's diff, verified against Claude Code
+    /// 2.1.212:
+    ///
+    /// - `--tools Read,Grep,Glob` limits the built-in tool set to read-only inspection: no shell,
+    ///   no file edits, no web access, no subagents.
+    /// - `--permission-mode dontAsk` denies anything not pre-approved without prompting, and
+    ///   overrides a developer's own default permission mode. Reads inside the working directory
+    ///   (the worktree) are allowed by default; reads outside it are denied.
+    /// - `--allowedTools` is deliberately absent. An allow rule for `Read` is what let reads
+    ///   escape the worktree in the first place, and `--allowedTools` only ever *adds*
+    ///   permissions — it cannot be used to narrow anything.
+    /// - `--setting-sources user`: project and local settings come from the pull request's own
+    ///   tree and must never load. The developer's user settings still load, so provider
+    ///   configuration kept there (`env`, `apiKeyHelper`) keeps working — the standard `claude`
+    ///   login lives in the macOS Keychain and needs no settings at all. Stated honestly: a
+    ///   directory or read rule a developer grants in their own user settings still applies, so
+    ///   the reviewer is confined to the worktree plus whatever the developer's own settings —
+    ///   or an organization's managed settings, which always load — explicitly allow.
+    /// - `--settings claudeSandboxSettingsJSON` turns off hooks, the developer's own included —
+    ///   see `claudeSandboxSettingsJSON` above.
+    /// - `--strict-mcp-config`, with no `--mcp-config` supplied, loads no MCP servers at all —
+    ///   neither the developer's nor an `.mcp.json` the pull request ships.
+    /// - `--disallowedTools mcp__*` is defense in depth in case an MCP server is loaded anyway.
+    ///
+    /// An older `claude` CLI that rejects one of these flags fails the reviewer outright, which
+    /// the posted review discloses like any other reviewer failure.
     private func runClaude(
         configuration: ReviewerConfiguration,
         prompt: String,
@@ -1221,7 +1353,12 @@ actor ReviewEngine {
                     "-p", prompt,
                     "--model", configuration.model,
                     "--effort", configuration.effort.rawValue,
-                    "--allowedTools", "Read", "Grep", "Glob",
+                    "--tools", "Read,Grep,Glob",
+                    "--permission-mode", "dontAsk",
+                    "--setting-sources", "user",
+                    "--settings", Self.claudeSandboxSettingsJSON,
+                    "--strict-mcp-config",
+                    "--disallowedTools", "mcp__*",
                     "--output-format", "text",
                 ],
                 currentDirectory: worktree,
@@ -1398,7 +1535,8 @@ actor ReviewEngine {
         results: [ReviewerResult],
         decision: ReviewDecision,
         adjudication: ReviewerResult?,
-        guardReason: InjectionGuard.Reason?
+        guardReason: InjectionGuard.Reason?,
+        approvalWithheldForPartialPanel: Bool
     ) -> String {
         let verdictSummary = results.map {
             "\($0.reviewer.rawValue): `\($0.verdict?.rawValue ?? "unavailable")`"
@@ -1436,15 +1574,19 @@ actor ReviewEngine {
                     + "as approval."
                 break
             }
-            note = guardReason == nil
-                ? "This review is neutral under the current decision policy (a reviewer failed, returned an unreadable verdict, or the policy leaves this severity to you)."
-                : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+            if approvalWithheldForPartialPanel {
+                note = "The decision policy would approve this, but **a partial panel never approves**, so it posts as a neutral comment. Re-request the review once every enabled reviewer can run."
+            } else {
+                note = guardReason == nil
+                    ? "This review is neutral because the current decision policy leaves this severity to you."
+                    : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+            }
         }
 
         // A decision reached by part of the panel is a weaker signal than one reached by all of
         // it, and the difference is invisible from the outside — so say it, and say which
-        // reviewer is missing. Without this an approval from one surviving reviewer would be
-        // indistinguishable from a unanimous one.
+        // reviewer is missing. A partial panel can no longer approve, but without this a change
+        // request from one surviving reviewer would still read as the whole panel's.
         var partialPanelDisclosure = ""
         let unfinished = results.filter { $0.verdict == nil }
         if !unfinished.isEmpty {
@@ -1472,7 +1614,7 @@ actor ReviewEngine {
                 : """
 
 
-            > **Partial panel: \(missing) did not contribute a verdict.** The decision above reflects only the reviewers that finished, so it is a weaker signal than a full panel — weigh it accordingly.
+            > **Partial panel: \(missing) did not contribute a verdict to the panel.** The findings below come only from the reviewers that finished, so they are a weaker signal than a full panel's — weigh them accordingly.
             """
         }
 

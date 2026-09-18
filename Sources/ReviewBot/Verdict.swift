@@ -72,13 +72,34 @@ enum DecisionEvaluator {
         // Decide on whoever finished, and honour the strictest configured action among them
         // (`.comment` if any level is set to "leave it to me", otherwise `.approve`). A reviewer
         // that failed contributes nothing rather than pinning the decision to neutral: an outage
-        // in one CLI would otherwise mean the other reviewer's findings never gate anything, and
-        // the review that says so is posted with the absence disclosed in its body.
+        // in one CLI would otherwise mean the other reviewer's findings never gate anything.
+        // This can still come back `.approve` from a partial panel — that is fine for *this*
+        // function, which only decides on survivors. `withholdingApprovalFromPartialPanel` below
+        // is the actual cap the engine applies afterward, since an approval is the one decision
+        // that needs the whole panel to have weighed in.
         //
         // `worstAction` is nil exactly when no reviewer parsed a verdict, which is the one case
         // with nothing to decide on. The engine declines to post at all there; `.comment` is the
         // safe answer for any other caller.
         return worstAction ?? .comment
+    }
+
+    /// Caps an approval reached by an incomplete panel. An approval is the one decision that
+    /// needs the whole panel: a partial panel may still gate — a `SHOULD_FIX`+ finding from a
+    /// reviewer that did finish is still a real finding, so `.requestChanges` and `.comment`
+    /// pass through unchanged — but it may not clear a pull request when another enabled
+    /// reviewer never weighed in. Waiting for a later poll does not help when the missing
+    /// reviewer failed for a terminal reason, such as an exhausted weekly quota: the failure
+    /// budget would run out first and nothing would ever be posted. So the survivors' findings
+    /// post as a neutral comment instead, naming who is missing and why (`aggregateReview`).
+    static func withholdingApprovalFromPartialPanel(
+        _ decision: ReviewDecision,
+        results: [ReviewerResult]
+    ) -> ReviewDecision {
+        guard decision == .approve, results.contains(where: { $0.verdict == nil }) else {
+            return decision
+        }
+        return .comment
     }
 
     /// True when two or more reviewers parsed a verdict but land on opposite sides of the

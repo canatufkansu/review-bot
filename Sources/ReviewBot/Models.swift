@@ -415,6 +415,7 @@ enum ReviewerFailureClass: Equatable {
             "please run `codex login`",
             "please run `claude login`",
             "credit balance is too low",
+            "hit your weekly limit",
             // A reviewer that reported it could not assess the pull request. Not a provider
             // failure at all — the call succeeded — but a second call re-reads the same
             // unreadable evidence and reaches the same conclusion.
@@ -492,11 +493,12 @@ enum ReviewDecision: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    var ghArgument: String {
+    /// The `event` the pull request reviews API expects for this decision.
+    var reviewEvent: String {
         switch self {
-        case .approve: "--approve"
-        case .requestChanges: "--request-changes"
-        case .comment: "--comment"
+        case .approve: "APPROVE"
+        case .requestChanges: "REQUEST_CHANGES"
+        case .comment: "COMMENT"
         }
     }
 
@@ -541,9 +543,45 @@ struct PullRequestSummary: Decodable {
 struct PullRequestMetadata: Decodable {
     let title: String
     let headRefOid: String
+    /// The head branch's name, or `nil` when GitHub did not report one. Optional (rather than
+    /// required) so a `gh pr view` response missing this key still decodes, matching this
+    /// repository's convention of defensive config/metadata decoding.
+    let headRefName: String?
+    /// Whether the head branch lives outside this repository, as GitHub's `isCrossRepository`
+    /// reports it — `nil` when GitHub did not report it. Read this through `headRepository`
+    /// rather than directly; `false`/`true`/absent map to same-repository/fork/unknown there.
+    let isCrossRepository: Bool?
     let baseRefName: String
     let baseRefOid: String
     let url: String
+
+    /// Where this pull request's head branch lives, as far as GitHub said.
+    var headRepository: HeadRepository {
+        switch isCrossRepository {
+        case .some(false): .sameRepository
+        case .some(true): .fork
+        case .none: .unknown
+        }
+    }
+
+    /// The head branch name to fetch into a remote-tracking ref before a review starts, or `nil`
+    /// when it should not be fetched: a fork (its branch does not live on `origin`, so fetching
+    /// `refs/heads/<name>` there would fetch a different branch that merely shares the name — the
+    /// pull request's head commit is already fetched through `refs/pull/<n>/head`), an unreported
+    /// relationship (treated like a fork), or no reported name at all.
+    var fetchableHeadRefName: String? {
+        guard headRepository == .sameRepository, let headRefName, !headRefName.isEmpty else {
+            return nil
+        }
+        return headRefName
+    }
+}
+
+/// Where a pull request's head branch lives, as far as GitHub said.
+enum HeadRepository: Equatable {
+    case sameRepository
+    case fork
+    case unknown
 }
 
 struct InspectedRepository {
