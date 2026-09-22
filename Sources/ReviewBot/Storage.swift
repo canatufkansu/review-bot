@@ -1,5 +1,16 @@
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
+
+/// `ObservableObject` where Combine exists (the macOS SwiftUI shell observes these stores
+/// directly), and an empty marker where it does not: the Windows shell reads the stores on
+/// demand and serves the dashboard from what it finds, so it needs nothing to subscribe to.
+#if canImport(Combine)
+typealias ObservableStore = ObservableObject
+#else
+protocol ObservableStore: AnyObject {}
+#endif
 
 struct StoragePaths {
     let root: URL
@@ -45,10 +56,16 @@ struct StoragePaths {
 }
 
 @MainActor
-final class SettingsStore: ObservableObject {
+final class SettingsStore: ObservableStore {
+    #if canImport(Combine)
     @Published var configuration: ReviewBotConfiguration {
         didSet { save() }
     }
+    #else
+    var configuration: ReviewBotConfiguration {
+        didSet { save() }
+    }
+    #endif
 
     private let paths: StoragePaths
     private let encoder = JSONEncoder()
@@ -74,7 +91,11 @@ final class SettingsStore: ObservableObject {
     }
 
     func removeRepositories(at offsets: IndexSet) {
-        configuration.repositories.remove(atOffsets: offsets)
+        // Written out rather than `remove(atOffsets:)`, which SwiftUI provides and Foundation
+        // does not — this store is shared with the Windows shell, where SwiftUI is absent.
+        configuration.repositories = configuration.repositories.enumerated()
+            .filter { !offsets.contains($0.offset) }
+            .map(\.element)
     }
 
     func removeRepository(_ id: RepositoryConfiguration.ID) {
@@ -94,8 +115,12 @@ final class SettingsStore: ObservableObject {
 }
 
 @MainActor
-final class HistoryStore: ObservableObject {
+final class HistoryStore: ObservableStore {
+    #if canImport(Combine)
     @Published private(set) var entries: [HistoryEntry]
+    #else
+    private(set) var entries: [HistoryEntry]
+    #endif
 
     private let paths: StoragePaths
     private let encoder = JSONEncoder()
