@@ -1388,7 +1388,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
         // Its own name and model head its panel, so a review from five models is readable.
         XCTAssertTrue(postedBody.contains("Gemini — gemini-pro"), postedBody)
         XCTAssertTrue(postedBody.contains("Gemini: `CLEAN`"), postedBody)
-        XCTAssertEqual(await runner.lastPostArgument(), "--approve")
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(postArgument, "--approve")
         // The endpoint it was given is the one that was typed, not DeepSeek's.
         XCTAssertEqual(
             endpoints.recorded().compactMap { $0.baseURL?.absoluteString },
@@ -1420,16 +1421,10 @@ final class ReviewEngineFeatureTests: XCTestCase {
 
         await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
 
-        XCTAssertEqual(
-            await chatClient.recordedRequests().count,
-            0,
-            "a reviewer with no key must never reach the provider"
-        )
-        XCTAssertNotEqual(
-            await runner.lastPostArgument(),
-            "--approve",
-            "a panel that never ran must not approve"
-        )
+        let requestCount = await chatClient.recordedRequests().count
+        XCTAssertEqual(requestCount, 0, "a reviewer with no key must never reach the provider")
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertNotEqual(postArgument, "--approve", "a panel that never ran must not approve")
     }
 
     func testAReviewerThatCouldNotAssessIsNotRunAgainInsideTheSameReview() async throws {
