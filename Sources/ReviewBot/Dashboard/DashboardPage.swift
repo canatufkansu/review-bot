@@ -494,7 +494,7 @@ enum DashboardPage {
         if (!t) return;
         $('avgReview').textContent = duration(t.averageDurationSeconds);
         $('statsLead').textContent = 'What Review Bot posted in the last ' + t.windowDays + ' days, how fast, and whether its change requests were acted on. Computed from the activity history on this machine.';
-        const cost = t.totalCostUSD != null ? '$' + t.totalCostUSD.toFixed(2) : (t.totalTokens > 0 ? 'unknown' : '—');
+        const cost = t.totalCostUSD != null ? '$' + t.totalCostUSD.toFixed(2) : (t.meteredTokens > 0 ? 'unknown' : '—');
         $('statsBody').innerHTML =
           group('Decisions posted', [
             tile('Reviews', String(t.reviewsPosted), t.failed + ' failed'),
@@ -512,16 +512,24 @@ enum DashboardPage {
             tile('Rounds to approval', t.averageRoundsToApproval != null ? t.averageRoundsToApproval.toFixed(2) : '—', 'change requests before an approval followed', '', '1.00 means every change request was resolved in one round.'),
             tile('Approvals merged', percent(t.approvedThenMerged, t.pullRequestsApproved), t.approvedThenMerged + ' of ' + t.pullRequestsApproved + ' approved pull requests', 'green'),
           ])
-          + group('Metered spend', [
-            tile('Tokens', abbreviate(t.totalTokens), 'reviewers billed per token only'),
-            tile('Cost', cost, t.totalCostUSD == null && t.totalTokens > 0 ? "a review's cost could not be priced" : ''),
+          + group('Tokens and spend', [
+            tile('Tokens', abbreviate(t.totalTokens), abbreviate(t.meteredTokens) + ' on API keys · ' + abbreviate(t.sessionTokens) + ' on subscriptions', '', 'Everything the reviewers reported. Claude reports its tokens in either sign-in mode; Codex and opencode report none.'),
+            tile('Cost', cost, t.totalCostUSD == null && t.meteredTokens > 0 ? "a metered review's cost could not be priced" : 'reviewers billed per token only — a subscription is never priced'),
           ])
           + (t.reviewsPosted === 0 ? '<div class="caption">No reviews were posted in this window yet. Figures fill in as Review Bot reviews pull requests.</div>' : '');
       }
 
       function queueRow(item, cls, state) {
-        return '<div class="queue ' + cls + '"><span>' + (cls === 'running' ? '⟳' : '●') + '</span><div class="grow"><b>' + escapeHTML(item.repositoryName) + ' #' + item.pullRequestNumber + '</b><div class="title">' + escapeHTML(item.pullRequestTitle) + '</div></div><span class="caption">' + state + '</span></div>';
+        const elapsed = item.startedAt ? '<div class="caption elapsed" data-started="' + escapeHTML(item.startedAt) + '">' + elapsedSince(item.startedAt) + '</div>' : '';
+        return '<div class="queue ' + cls + '"><span>' + (cls === 'running' ? '⟳' : '●') + '</span><div class="grow"><b>' + escapeHTML(item.repositoryName) + ' #' + item.pullRequestNumber + '</b><div class="title">' + escapeHTML(item.pullRequestTitle) + '</div></div><div style="text-align:right"><span class="caption">' + state + '</span>' + elapsed + '</div></div>';
       }
+      // How long a running review has been at it, counted up once a second between polls.
+      function elapsedSince(iso) {
+        const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+        const m = Math.floor(s / 60), r = s % 60;
+        return (m >= 60 ? Math.floor(m / 60) + ':' + String(m % 60).padStart(2, '0') + ':' : m + ':') + String(r).padStart(2, '0');
+      }
+      setInterval(() => { document.querySelectorAll('.elapsed').forEach((el) => { el.textContent = elapsedSince(el.dataset.started); }); }, 1000);
 
       function toolBadge(available, command) {
         return available ? '<span class="good">✓ ' + escapeHTML(command) + ' found</span>' : '<span class="warn">⚠ ' + escapeHTML(command) + ' not found</span>';
@@ -937,7 +945,8 @@ enum DashboardPage {
           list.innerHTML = entries.map((e) => {
             const k = kinds[e.kind] || ['•', e.kind, 'blue'];
             const where = e.pullRequestNumber != null ? e.repositoryName + ' #' + e.pullRequestNumber : e.repositoryName;
-            const usage = e.usage ? (e.usage.costUSD != null ? '$' + (e.usage.costUSD >= 1 ? e.usage.costUSD.toFixed(2) : e.usage.costUSD.toFixed(4)) : abbreviate(e.usage.inputTokens + e.usage.cachedInputTokens + e.usage.outputTokens) + ' tok') : '';
+            let usage = e.usage ? (e.usage.costUSD != null ? '$' + (e.usage.costUSD >= 1 ? e.usage.costUSD.toFixed(2) : e.usage.costUSD.toFixed(4)) : abbreviate(e.usage.inputTokens + e.usage.cachedInputTokens + e.usage.outputTokens) + ' tok') : '';
+            if (e.sessionUsage) usage += (usage ? '<br>' : '') + abbreviate(e.sessionUsage.inputTokens + e.sessionUsage.cachedInputTokens + e.sessionUsage.outputTokens) + ' tok · subscription';
             return '<div class="hist"><div class="icon" style="color:var(--' + k[2] + ')">' + k[0] + '</div><div class="body"><b>' + k[1] + '</b> <span class="caption">' + escapeHTML(where) + '</span>'
               + (e.pullRequestTitle ? '<div>' + escapeHTML(e.pullRequestTitle) + '</div>' : '') + '<div class="msg">' + escapeHTML(e.message) + '</div></div>'
               + '<div class="meta">' + escapeHTML(new Date(e.date).toLocaleString()) + (usage ? '<br>' + escapeHTML(usage) : '') + (e.pullRequestURL ? '<br><a href="' + escapeHTML(e.pullRequestURL) + '" target="_blank" rel="noopener">Open PR</a>' : '') + '</div></div>';

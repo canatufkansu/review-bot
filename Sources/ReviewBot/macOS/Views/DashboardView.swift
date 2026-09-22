@@ -1202,16 +1202,20 @@ private struct StatisticsView: View {
                     )
                 }
 
-                StatisticsGroup(title: "Metered spend") {
+                StatisticsGroup(title: "Tokens and spend") {
                     StatisticTile(
                         title: "Tokens",
                         value: TokenUsage.abbreviated(stats.totalTokens),
-                        detail: "reviewers billed per token only"
+                        detail: "\(TokenUsage.abbreviated(stats.meteredTokens)) on API keys · \(TokenUsage.abbreviated(stats.sessionTokens)) on subscriptions",
+                        help: "Everything the reviewers reported. Claude reports its tokens in either sign-in mode; Codex and opencode report none."
                     )
                     StatisticTile(
                         title: "Cost",
-                        value: stats.totalCostUSD.map { String(format: "$%.2f", $0) } ?? (stats.totalTokens > 0 ? "unknown" : "—"),
-                        detail: stats.totalCostUSD == nil && stats.totalTokens > 0 ? "a review's cost could not be priced" : ""
+                        value: stats.totalCostUSD.map { String(format: "$%.2f", $0) } ?? (stats.meteredTokens > 0 ? "unknown" : "—"),
+                        detail: stats.totalCostUSD == nil && stats.meteredTokens > 0
+                            ? "a metered review's cost could not be priced"
+                            : "reviewers billed per token only — a subscription is never priced",
+                        help: "Only reviewers set to API-key auth are billed per review; a signed-in CLI's cost is its subscription."
                     )
                 }
 
@@ -1365,6 +1369,12 @@ private struct HistoryRow: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .help("\(usage.tokenSummary) — metered reviewers only")
+                }
+                if let session = entry.sessionUsage {
+                    Text("\(TokenUsage.abbreviated(session.totalTokens)) tok · subscription")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .help("\(session.tokenSummary) — consumed on a signed-in CLI, covered by its subscription")
                 }
                 if let value = entry.pullRequestURL, let url = URL(string: value) {
                     Link("Open PR", destination: url)

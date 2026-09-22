@@ -11,7 +11,8 @@ final class ReviewStatisticsTests: XCTestCase {
         startedMinutesBefore: Double? = nil,
         requestedMinutesBefore: Double? = nil,
         head: String? = nil,
-        usage: TokenUsage? = nil
+        usage: TokenUsage? = nil,
+        sessionUsage: TokenUsage? = nil
     ) -> HistoryEntry {
         let date = now.addingTimeInterval(-minutesAgo * 60)
         return HistoryEntry(
@@ -24,6 +25,7 @@ final class ReviewStatisticsTests: XCTestCase {
             pullRequestURL: nil,
             message: "",
             usage: usage,
+            sessionUsage: sessionUsage,
             requestedAt: requestedMinutesBefore.map { date.addingTimeInterval(-$0 * 60) },
             startedAt: startedMinutesBefore.map { date.addingTimeInterval(-$0 * 60) },
             headCommit: head
@@ -154,6 +156,30 @@ final class ReviewStatisticsTests: XCTestCase {
         )
         XCTAssertEqual(unknown.totalTokens, 1_800)
         XCTAssertNil(unknown.totalCostUSD, "a rate times unknown tokens is unknown, not free")
+    }
+
+    func testSessionTokensAreCountedApartFromMeteredSpend() {
+        let priced = TokenUsage(inputTokens: 1_000, cachedInputTokens: 0, outputTokens: 500, requests: 1, costUSD: 0.5)
+        let subscription = TokenUsage(inputTokens: 4_000, cachedInputTokens: 1_000, outputTokens: 300, requests: 1)
+
+        let stats = ReviewStatistics.compute(
+            from: [entry(.approved, pullRequest: 1, minutesAgo: 1, usage: priced),
+                   entry(.approved, pullRequest: 2, minutesAgo: 2, sessionUsage: subscription),
+                   entry(.changesRequested, pullRequest: 3, minutesAgo: 3, usage: priced, sessionUsage: subscription)],
+            now: now
+        )
+
+        XCTAssertEqual(stats.meteredTokens, 3_000)
+        XCTAssertEqual(stats.sessionTokens, 10_600)
+        XCTAssertEqual(stats.totalTokens, 13_600)
+        XCTAssertEqual(stats.totalCostUSD, 1.0, "a subscription review neither adds to the cost nor makes it unknown")
+
+        let sessionOnly = ReviewStatistics.compute(
+            from: [entry(.approved, pullRequest: 2, minutesAgo: 2, sessionUsage: subscription)],
+            now: now
+        )
+        XCTAssertEqual(sessionOnly.meteredTokens, 0)
+        XCTAssertNil(sessionOnly.totalCostUSD)
     }
 
     func testAnEmptyHistoryHasNoAveragesRatherThanZeros() {

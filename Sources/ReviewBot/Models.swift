@@ -605,6 +605,11 @@ struct HistoryEntry: Codable, Equatable, Identifiable {
     /// Combined usage for the review this entry describes, so spend can be totalled from
     /// `history.json` later. Absent on entries written before usage was tracked.
     var usage: TokenUsage?
+    /// Tokens consumed by the reviewers on a signed-in CLI — Claude reports them in its JSON
+    /// envelope whatever the sign-in mode. Kept apart from `usage`, which is what was *billed*
+    /// to a key: these are covered by a subscription, so they are counted but never priced,
+    /// and `costUSD` is always `nil` here. Absent when no session reviewer reported any.
+    var sessionUsage: TokenUsage?
     /// When GitHub recorded the review request this review answers — the timestamp of the
     /// `review_requested` event, when the timeline had one. `date - requestedAt` is how long
     /// the author waited for Review Bot. Absent on entries written before it was tracked and
@@ -641,6 +646,9 @@ struct ReviewQueueItem: Codable, Equatable, Identifiable {
     let pullRequestNumber: Int
     let pullRequestTitle: String
     let pullRequestURL: String?
+    /// When the review began, for a running item, so the queue can show how long it has been
+    /// at it. `nil` for a request that is still waiting.
+    let startedAt: Date?
 
     var id: String { "\(repositorySlug)#\(pullRequestNumber)" }
 
@@ -654,6 +662,7 @@ struct ReviewQueueItem: Codable, Equatable, Identifiable {
         pullRequestNumber = number
         pullRequestTitle = title
         pullRequestURL = entry.pullRequestURL
+        startedAt = entry.kind == .reviewStarted ? (entry.startedAt ?? entry.date) : nil
     }
 }
 

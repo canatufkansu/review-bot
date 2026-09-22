@@ -301,9 +301,17 @@ private struct QueueRow: View {
                     .lineLimit(1)
             }
             Spacer()
-            Text(state)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(color)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(state)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(color)
+                if let startedAt = item.startedAt {
+                    // Counts up on its own — how long this review has been at it.
+                    Text(startedAt, style: .timer)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(7)
         .background(color.opacity(0.08))

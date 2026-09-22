@@ -44,10 +44,14 @@ struct ReviewStatistics: Codable, Equatable {
     /// have merged since.
     var pullRequestsApproved: Int
     var approvedThenMerged: Int
-    /// Metered spend across the window's reviews. Tokens are summed over every entry that
-    /// carried usage; the cost is `nil` when any of them could not price theirs.
+    /// Tokens across the window's reviews: everything any reviewer reported, billed or not.
     var totalTokens: Int
+    /// The part of `totalTokens` billed to a key, and what it cost — `nil` when any metered
+    /// review could not price its tokens, so an unknown cost never reads as free.
+    var meteredTokens: Int
     var totalCostUSD: Double?
+    /// The part of `totalTokens` consumed on signed-in CLIs, which a subscription covers.
+    var sessionTokens: Int
 
     var changesRequestedThenApprovedRate: Double? {
         rate(changesRequestedThenApproved, of: pullRequestsWithChangesRequested)
@@ -71,7 +75,8 @@ struct ReviewStatistics: Codable, Equatable {
         lastDurationSeconds: nil, averageResponseSeconds: nil, medianResponseSeconds: nil,
         pullRequestsWithChangesRequested: 0, changesRequestedThenApproved: 0,
         changesRequestedThenMerged: 0, averageRoundsToApproval: nil, pullRequestsApproved: 0,
-        approvedThenMerged: 0, totalTokens: 0, totalCostUSD: nil
+        approvedThenMerged: 0, totalTokens: 0, meteredTokens: 0, totalCostUSD: nil,
+        sessionTokens: 0
     )
 
     /// - Parameters:
@@ -106,11 +111,15 @@ struct ReviewStatistics: Codable, Equatable {
             if let response = entry.responseTime { responses.append(response) }
             if latestPosted.map({ entry.date > $0.date }) ?? true { latestPosted = entry }
             if let usage = entry.usage {
-                stats.totalTokens += usage.totalTokens
+                stats.meteredTokens += usage.totalTokens
                 if let cost = usage.costUSD { stats.totalCostUSD = (stats.totalCostUSD ?? 0) + cost }
                 else { costKnown = false }
             }
+            if let session = entry.sessionUsage {
+                stats.sessionTokens += session.totalTokens
+            }
         }
+        stats.totalTokens = stats.meteredTokens + stats.sessionTokens
         stats.reviewsPosted = stats.approved + stats.changesRequested + stats.commented
         stats.averageDurationSeconds = mean(durations)
         stats.medianDurationSeconds = median(durations)

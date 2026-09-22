@@ -968,6 +968,37 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(decision?.usage?.outputTokens, 200)
     }
 
+    /// Claude reports its tokens in either sign-in mode. In session mode they are not a bill —
+    /// the subscription covers them — so they are recorded beside the metered usage, never in
+    /// it, never priced, and never posted in the usage table.
+    func testSessionModeTokensAreCountedButNeverPricedOrPosted() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeEmitsJSONEnvelope: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .session
+        configuration.includeUsageInReview = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let decision = try XCTUnwrap(events.last)
+        XCTAssertNil(decision.usage, "nothing was billed to a key")
+        let session = try XCTUnwrap(decision.sessionUsage)
+        XCTAssertEqual(session.inputTokens, 1_500)
+        XCTAssertEqual(session.cachedInputTokens, 5_000)
+        XCTAssertEqual(session.outputTokens, 200)
+        XCTAssertNil(session.costUSD, "the envelope's dollar figure is the subscription's arithmetic, not a bill")
+        XCTAssertTrue(decision.message.contains("tokens on a subscription"), decision.message)
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertFalse(postedBody.contains("Token usage and cost"), "the posted table is for metered reviewers only")
+    }
+
     /// A reviewer that returns no verdict is run again inside the same review, and for a metered
     /// reviewer the discarded attempt was billed all the same. Keeping only the second attempt's
     /// figure reports a retried review at roughly half what it cost.

@@ -565,6 +565,9 @@ actor ReviewEngine {
         var worktreeURL: URL?
         var worktreeAdded = false
         var spent: TokenUsage?
+        /// What the session reviewers consumed — counted, never priced. Tracked beside `spent`
+        /// on the same two assignments, so a failure records it too.
+        var sessionSpent: TokenUsage?
 
         do {
             await announce("Preparing \(repository.name) #\(pullRequest.number)…")
@@ -637,6 +640,7 @@ actor ReviewEngine {
             // history entry is the only place that spend can ever be recorded. Re-computed once
             // the adjudicator has run, since reconciliation is a metered call of its own.
             spent = usageTotal(results: results, adjudication: nil, configuration: configuration)
+            sessionSpent = sessionUsageTotal(results: results, adjudication: nil, configuration: configuration)
 
             // Post as long as *someone* finished. A reviewer that failed is named in the posted
             // body rather than suppressing the review: holding the whole panel hostage to one CLI
@@ -704,6 +708,11 @@ actor ReviewEngine {
                     )
                 }
                 spent = usageTotal(
+                    results: results,
+                    adjudication: adjudicationSpend,
+                    configuration: configuration
+                )
+                sessionSpent = sessionUsageTotal(
                     results: results,
                     adjudication: adjudicationSpend,
                     configuration: configuration
@@ -782,12 +791,16 @@ actor ReviewEngine {
                     + (usage.costSummary.map { ", \($0)" } ?? "")
                     + "."
             } ?? ""
+            let sessionNote = sessionSpent.map {
+                " \(TokenUsage.abbreviated($0.totalTokens)) tokens on a subscription."
+            } ?? ""
             await emit(
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(usageNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(usageNote)\(sessionNote)",
                 usage: total,
+                sessionUsage: sessionSpent,
                 requestedAt: pendingReview.requestedAt,
                 startedAt: startedAt,
                 headCommit: metadata.headRefOid,
@@ -817,6 +830,7 @@ actor ReviewEngine {
                     pullRequestURL: pullRequest.url,
                     message: message,
                     usage: spent,
+                    sessionUsage: sessionSpent,
                     requestedAt: pendingReview.requestedAt,
                     startedAt: startedAt,
                     headCommit: metadata.headRefOid
@@ -2180,6 +2194,30 @@ actor ReviewEngine {
         }
     }
 
+    /// What the reviewers on a signed-in CLI consumed, for the panel's token figures. The
+    /// complement of `meteredUsage`: every reported usage `meteredUsage` leaves out, summed,
+    /// with the cost dropped — Claude's envelope carries a dollar figure in session mode too,
+    /// but that is the subscription's arithmetic, not a bill, and showing it would contradict
+    /// the rule that session reviewers are never priced.
+    private func sessionUsageTotal(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> TokenUsage? {
+        let entries = results + (adjudication.map { [$0] } ?? [])
+        let session = entries.compactMap { result -> TokenUsage? in
+            guard configuration.settings(for: result.reviewer).authMode != .apiKey,
+                  let usage = result.usage else {
+                return nil
+            }
+            return usage
+        }
+        guard !session.isEmpty else { return nil }
+        var total = session.reduce(TokenUsage(), +)
+        total.costUSD = nil
+        return total
+    }
+
     private func usageTotal(
         results: [ReviewerResult],
         adjudication: ReviewerResult?,
@@ -2394,6 +2432,7 @@ actor ReviewEngine {
         pullRequest: PullRequestSummary,
         message: String,
         usage: TokenUsage? = nil,
+        sessionUsage: TokenUsage? = nil,
         requestedAt: Date? = nil,
         startedAt: Date? = nil,
         headCommit: String? = nil,
@@ -2408,6 +2447,7 @@ actor ReviewEngine {
             pullRequestURL: pullRequest.url,
             message: message,
             usage: usage,
+            sessionUsage: sessionUsage,
             requestedAt: requestedAt,
             startedAt: startedAt,
             headCommit: headCommit
