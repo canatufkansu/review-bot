@@ -7,12 +7,15 @@ import SwiftUI
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var status = "Starting…"
-    @Published private(set) var isRunning = false
+    /// A discovery pass is in progress. Reviews outlive it — see `isRunning`.
+    @Published private(set) var isPolling = false
     @Published private(set) var lastCheckDate: Date?
     @Published private(set) var toolAvailability: [String: Bool] = [:]
     /// The GitHub accounts `gh` is signed in to, for the account picker.
     @Published private(set) var githubAccounts: GitHubAccounts = .none
-    @Published private(set) var reviewersWithSavedKey: Set<ReviewerName> = []
+    /// Panel seats a key currently resolves for, built-in and custom alike — which is why it
+    /// is keyed by identity rather than by `ReviewerName`.
+    @Published private(set) var reviewersWithSavedKey: Set<ReviewerIdentity> = []
     @Published private(set) var launchAtLoginEnabled: Bool
     @Published private(set) var pendingReviews: [ReviewQueueItem] = []
     /// Every review running right now — a poll reviews several pull requests at once,
@@ -21,6 +24,14 @@ final class AppModel: ObservableObject {
     /// it was still running.
     @Published private(set) var runningReviews: [ReviewQueueItem] = []
     @Published var errorMessage: String?
+    /// Refreshed from the history after every event, so the figures in the menu bar and
+    /// the Statistics tab move the moment a review posts.
+    @Published private(set) var statistics: ReviewStatistics = .empty
+
+    /// Whether Review Bot is doing anything: discovering requests or reviewing one. The
+    /// two are separate now that a poll returns as soon as discovery is done and the
+    /// reviews run on behind it.
+    var isRunning: Bool { isPolling || !runningReviews.isEmpty }
 
     let settings: SettingsStore
     let history: HistoryStore
@@ -44,6 +55,7 @@ final class AppModel: ObservableObject {
         history = HistoryStore(paths: paths)
         engine = ReviewEngine(paths: paths, runner: runner, credentials: credentials)
         launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+        statistics = ReviewStatistics.compute(from: history.entries)
     }
 
     func start() {
@@ -58,10 +70,15 @@ final class AppModel: ObservableObject {
     }
 
     func runNow() {
-        guard !isRunning else { return }
+        guard !isPolling else { return }
         Task { [weak self] in
             await self?.performPoll(manual: true)
         }
+    }
+
+    func clearHistory() {
+        history.clear()
+        statistics = ReviewStatistics.compute(from: history.entries)
     }
 
     func togglePaused() {
@@ -118,9 +135,15 @@ final class AppModel: ObservableObject {
     /// are processes and which are endpoints.
     func isReviewerAvailable(_ reviewer: ReviewerName) -> Bool {
         guard let command = reviewer.commandName else {
-            return reviewersWithSavedKey.contains(reviewer)
+            return reviewersWithSavedKey.contains(.builtIn(reviewer))
         }
         return toolAvailability[command] == true
+    }
+
+    /// A custom reviewer is an endpoint, not a process, so the only question is whether it is
+    /// fully configured and a key resolves for it.
+    func isCustomReviewerAvailable(_ reviewer: CustomReviewerConfiguration) -> Bool {
+        reviewer.isRunnable && reviewersWithSavedKey.contains(reviewer.identity)
     }
 
     /// Which reviewers have a key available — from the Keychain, or from the environment, which
@@ -135,13 +158,16 @@ final class AppModel: ObservableObject {
     /// blocks the thread that raises it until the user answers, and blocking this one freezes
     /// the settings window that is asking the question.
     func refreshSavedKeys() async {
-        let resolved = await ResolvedCredentials.resolve(
-            ReviewerName.allCases.filter { reviewer in
+        let builtIn = ReviewerName.allCases
+            .filter { reviewer in
                 reviewer.supportsAPIKeyAuth
                     && settings.configuration.settings(for: reviewer).authMode == .apiKey
-            },
-            from: credentials
-        )
+            }
+            .map(ReviewerIdentity.builtIn)
+        // Every custom reviewer is an HTTP endpoint, so all of them are key-mode by
+        // construction. Unlike the built-ins there is no session alternative to skip for.
+        let custom = settings.configuration.customReviewers.map(\.identity)
+        let resolved = await ResolvedCredentials.resolve(builtIn + custom, from: credentials)
         reviewersWithSavedKey = resolved.reviewersWithKey
     }
 
@@ -153,12 +179,24 @@ final class AppModel: ObservableObject {
     }
 
     func saveAPIKey(_ key: String, for reviewer: ReviewerName) async {
+        await saveAPIKey(key, for: .builtIn(reviewer), named: reviewer.rawValue)
+    }
+
+    func saveAPIKey(_ key: String, for reviewer: CustomReviewerConfiguration) async {
+        await saveAPIKey(key, for: reviewer.identity, named: reviewer.displayName)
+    }
+
+    func saveAPIKey(
+        _ key: String,
+        for reviewer: ReviewerIdentity,
+        named displayName: String
+    ) async {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         let outcome = await performCredentialWrite(for: reviewer) { store in
             try store.setAPIKey(trimmed, for: reviewer)
         }
         if let failure = outcome.failure {
-            errorMessage = "Could not save the \(reviewer.rawValue) API key: \(failure)"
+            errorMessage = "Could not save the \(displayName) API key: \(failure)"
             return
         }
         updateSavedKeyPanel(outcome, for: reviewer)
@@ -168,29 +206,37 @@ final class AppModel: ObservableObject {
             // the panel below saying no key is saved, and the next review failing for a reason
             // nothing on screen explained.
             status = """
-            Saved the \(reviewer.rawValue) API key, but it could not be read back — allow \
-            Review Bot access when macOS asks, or \(reviewer.rawValue) reviews will fail
+            Saved the \(displayName) API key, but it could not be read back — allow \
+            Review Bot access when macOS asks, or \(displayName) reviews will fail
             """
         } else if outcome.effective != trimmed {
             // The environment takes precedence over the Keychain, so a variable left over in
             // this app's environment would shadow the key that was just saved. Say so rather
             // than report a save that will not be the one used.
             status = """
-            Saved the \(reviewer.rawValue) API key, but \
+            Saved the \(displayName) API key, but \
             \(reviewer.apiKeyOverrideEnvironmentVariable) is set in this app's environment \
             and takes precedence over it
             """
         } else {
-            status = "Saved the \(reviewer.rawValue) API key to your Keychain"
+            status = "Saved the \(displayName) API key to your Keychain"
         }
     }
 
     func removeAPIKey(for reviewer: ReviewerName) async {
+        await removeAPIKey(for: .builtIn(reviewer), named: reviewer.rawValue)
+    }
+
+    func removeAPIKey(for reviewer: CustomReviewerConfiguration) async {
+        await removeAPIKey(for: reviewer.identity, named: reviewer.displayName)
+    }
+
+    func removeAPIKey(for reviewer: ReviewerIdentity, named displayName: String) async {
         let outcome = await performCredentialWrite(for: reviewer) { store in
             try store.removeAPIKey(for: reviewer)
         }
         if let failure = outcome.failure {
-            errorMessage = "Could not remove the \(reviewer.rawValue) API key: \(failure)"
+            errorMessage = "Could not remove the \(displayName) API key: \(failure)"
             return
         }
         updateSavedKeyPanel(outcome, for: reviewer)
@@ -198,18 +244,18 @@ final class AppModel: ObservableObject {
         // and reporting a bare "Removed" would imply the reviewer had stopped being billed.
         if outcome.effective != nil {
             status = """
-            Removed the \(reviewer.rawValue) API key from your Keychain, but \
+            Removed the \(displayName) API key from your Keychain, but \
             \(reviewer.apiKeyOverrideEnvironmentVariable) is still set in this app's \
             environment and will be used
             """
         } else {
-            status = "Removed the \(reviewer.rawValue) API key from your Keychain"
+            status = "Removed the \(displayName) API key from your Keychain"
         }
     }
 
     /// Performs one Keychain write off the main actor and reads back what it left in effect.
     private func performCredentialWrite(
-        for reviewer: ReviewerName,
+        for reviewer: ReviewerIdentity,
         _ body: @escaping @Sendable (any CredentialStoring) throws -> Void
     ) async -> CredentialWriteOutcome {
         let store = credentials
@@ -225,7 +271,10 @@ final class AppModel: ObservableObject {
 
     /// Updates the panel from the write's own read-back rather than a second Keychain round
     /// trip, so a denied read cannot make the status line and the panel tell different stories.
-    private func updateSavedKeyPanel(_ outcome: CredentialWriteOutcome, for reviewer: ReviewerName) {
+    private func updateSavedKeyPanel(
+        _ outcome: CredentialWriteOutcome,
+        for reviewer: ReviewerIdentity
+    ) {
         if outcome.effective == nil {
             reviewersWithSavedKey.remove(reviewer)
         } else {
@@ -307,36 +356,53 @@ final class AppModel: ObservableObject {
             } else {
                 let interval = TimeInterval(max(1, settings.configuration.pollIntervalMinutes) * 60)
                 let pollIsDue = lastCheckDate.map { Date().timeIntervalSince($0) >= interval } ?? true
-                if pollIsDue, !isRunning {
+                // Polling is gated on discovery alone, not on the reviews: they keep
+                // running behind the poll, and a poll that finds a new request while
+                // they do simply queues it behind them.
+                if pollIsDue, !isPolling {
                     await performPoll()
                 }
             }
+            await reconcileQueueWithEngine()
 
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    private func performPoll(manual: Bool = false) async {
-        guard !isRunning else { return }
-        isRunning = true
-        defer {
-            isRunning = false
-            lastCheckDate = Date()
-            // A poll reviews every request it discovers before returning, so nothing
-            // should remain queued afterward. Reset defensively so a missed or
-            // out-of-order terminal event can never leave a stale count in the menu bar.
+    /// Nothing should be shown as queued or running once the engine's queue is empty.
+    /// Reset defensively so a missed or out-of-order terminal event can never leave a
+    /// stale count in the menu bar.
+    private func reconcileQueueWithEngine() async {
+        guard !pendingReviews.isEmpty || !runningReviews.isEmpty else { return }
+        if await engine.isIdle() {
             pendingReviews.removeAll()
             runningReviews.removeAll()
         }
+    }
+
+    private func performPoll(manual: Bool = false) async {
+        guard !isPolling else { return }
+        isPolling = true
+        defer {
+            isPolling = false
+            lastCheckDate = Date()
+        }
 
         let configuration = settings.configuration
+        // Returns once discovery is done; the reviews it queued carry on and report
+        // through the same sinks.
         await engine.poll(
             configuration: configuration,
             manual: manual,
+            awaitCompletion: false,
             onEvent: { [weak self] entry in
                 await MainActor.run {
-                    self?.history.append(entry)
-                    self?.updateQueue(for: entry)
+                    guard let self else { return }
+                    self.history.append(entry)
+                    self.updateQueue(for: entry)
+                    if entry.kind.endsAReview || entry.kind == .merged {
+                        self.statistics = ReviewStatistics.compute(from: self.history.entries)
+                    }
                 }
             },
             onStatus: { [weak self] value in
@@ -361,6 +427,8 @@ final class AppModel: ObservableObject {
         case .approved, .changesRequested, .commented, .failed:
             pendingReviews.removeAll(where: { $0.id == item.id })
             runningReviews.removeAll(where: { $0.id == item.id })
+        case .merged:
+            break
         }
     }
 }

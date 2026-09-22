@@ -1,14 +1,19 @@
 import Foundation
 
-/// Runs one review through DeepSeek's chat-completions API.
+/// Runs one review through an OpenAI-compatible chat-completions API — the built-in DeepSeek
+/// reviewer and every model the developer adds themselves.
 ///
-/// Claude and Codex are agents: they get a prompt and explore the worktree themselves. DeepSeek
-/// is a plain completions endpoint, so the agent loop lives here — the model is offered the
+/// Claude and Codex are agents: they get a prompt and explore the worktree themselves. A
+/// completions endpoint is not, so the agent loop lives here — the model is offered the
 /// read-only `WorktreeTools`, and each round of tool calls is executed locally and fed back until
 /// it produces its final review. The diff, the PR thread, and the merge preview are also inlined in
 /// the opening message so a model that never calls a tool (or cannot) still reviews the right code
 /// with the same evidence the contract assumes it has.
-struct DeepSeekReviewer {
+///
+/// Nothing in here is provider-specific. That is what lets a panel of ten models be ten calls to
+/// this type with ten endpoints rather than ten reviewer implementations, and it is why the
+/// read-only guarantee does not have to be restated per provider.
+struct ChatCompletionsReviewer {
     private enum Limits {
         static let inlinedDiffCharacters = 120_000
         static let inlinedThreadCharacters = 30_000
@@ -21,8 +26,8 @@ struct DeepSeekReviewer {
     }
 
     /// Wall-clock ceiling for one review, matching the 900s `ProcessRunner` gives each CLI
-    /// reviewer. Nothing else bounds this loop from the inside: DeepSeek is not a child process,
-    /// so there is no `perl alarm` behind it, and the round cap bounds calls rather than time —
+    /// reviewer. Nothing else bounds this loop from the inside: an HTTP reviewer is not a child
+    /// process, so there is no `perl alarm` behind it, and the round cap bounds calls rather than time —
     /// sixteen slow rounds can outlast every other reviewer in the panel by a wide margin.
     ///
     /// Not `private`, because `ReviewEngine`'s hard stop has to sit *above* it: reaching this

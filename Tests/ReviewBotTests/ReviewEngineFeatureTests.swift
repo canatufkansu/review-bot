@@ -31,6 +31,56 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(sawPreparedDiff)
     }
 
+    func testAPostedDecisionRecordsWhenItWasRequestedStartedAndAtWhichCommit() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let started = try XCTUnwrap(events.first { $0.kind == .reviewStarted })
+        let approved = try XCTUnwrap(events.first { $0.kind == .approved })
+        // The timeline's `review_requested` timestamp, so the panel can say how long the
+        // author waited; the head commit, so a later approval at another commit reads as
+        // the change request having been acted on.
+        XCTAssertEqual(approved.requestedAt, ReviewEngine.requestDate(from: "2026-07-15T10:00:00Z"))
+        XCTAssertEqual(approved.headCommit, "1234567890abcdef")
+        XCTAssertEqual(approved.startedAt, started.startedAt)
+        let duration = try XCTUnwrap(approved.reviewDuration)
+        XCTAssertGreaterThanOrEqual(duration, 0)
+        XCTAssertLessThan(duration, 60, "a mocked review takes moments, not minutes")
+        XCTAssertNotNil(approved.responseTime)
+        XCTAssertNil(events.first { $0.kind == .requestDetected }?.reviewDuration, "only the entries that end a review have a duration")
+    }
+
+    func testAMergedPullRequestReviewBotReviewedIsRecordedOnce() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        await runner.markMerged([42, 99])
+        for _ in 0..<2 {
+            await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        }
+
+        let events = await recorder.snapshot()
+        let merged = events.filter { $0.kind == .merged }
+        // Once for #42, which Review Bot reviewed — never for #99, which it did not, and not
+        // again on the poll after.
+        XCTAssertEqual(merged.map(\.pullRequestNumber), [42])
+        XCTAssertEqual(merged.first?.message, "Merged after Review Bot's review.")
+        let postCount = await runner.postCount()
+        XCTAssertEqual(postCount, 1, "a merge marker must not re-open the review")
+    }
+
     func testAlreadyReviewedRequestIsNotRunOrPostedAgain() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -1292,6 +1342,96 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(postedBody.contains("is not readable by the available tools"), postedBody)
     }
 
+    /// The panel is no longer a fixed roster: a model the developer added themselves runs as a
+    /// full reviewer, against the endpoint they named, under the key filed against its own id.
+    func testACustomReviewerJoinsThePanelOverItsOwnEndpoint() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([
+            .message("""
+            ## Summary
+            The change is sound.
+
+            ## Findings
+            Blocking: None.
+            Should-fix: None.
+            Nit: None.
+
+            ## Merge gate
+            Mergeable as-is.
+
+            VERDICT: CLEAN
+            """),
+        ])
+        let endpoints = EndpointRecorder()
+        let custom = CustomReviewerConfiguration(
+            name: "Gemini",
+            baseURL: "https://example.test/v1",
+            model: "gemini-pro"
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.custom(custom.id): "sk-custom"]),
+            chatClientFactory: { endpoint in
+                endpoints.record(endpoint)
+                return chatClient
+            }
+        )
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.customReviewers = [custom]
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let postedBody = await runner.lastPostedBody()
+        // Its own name and model head its panel, so a review from five models is readable.
+        XCTAssertTrue(postedBody.contains("Gemini — gemini-pro"), postedBody)
+        XCTAssertTrue(postedBody.contains("Gemini: `CLEAN`"), postedBody)
+        XCTAssertEqual(await runner.lastPostArgument(), "--approve")
+        // The endpoint it was given is the one that was typed, not DeepSeek's.
+        XCTAssertEqual(
+            endpoints.recorded().compactMap { $0.baseURL?.absoluteString },
+            ["https://example.test/v1"]
+        )
+    }
+
+    /// A custom reviewer with no key must fail the way every other key-mode reviewer does:
+    /// terminally, so the in-review retry and the review's failure budget are not spent on
+    /// something only Settings can fix.
+    func testACustomReviewerWithNoKeyFailsWithoutBeingRetried() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let chatClient = StubChatClient([])
+        let custom = CustomReviewerConfiguration(
+            name: "Gemini",
+            baseURL: "https://example.test/v1",
+            model: "gemini-pro"
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(),
+            chatClient: chatClient
+        )
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.customReviewers = [custom]
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        XCTAssertEqual(
+            await chatClient.recordedRequests().count,
+            0,
+            "a reviewer with no key must never reach the provider"
+        )
+        XCTAssertNotEqual(
+            await runner.lastPostArgument(),
+            "--approve",
+            "a panel that never ran must not approve"
+        )
+    }
+
     func testAReviewerThatCouldNotAssessIsNotRunAgainInsideTheSameReview() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -1559,8 +1699,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
     /// a timeout's *wording* as transient, so `isWorthRetrying` says yes without it (see
     /// `VerdictTests.testADeepSeekTimeoutIsExemptedByTheFlagRatherThanByItsWording`). Asserted
     /// here rather than in a unit test because the flag has to survive two conversions —
-    /// `DeepSeekClient` turns a URLSession timeout into `ChatCompletionError.timedOut`, and
-    /// `DeepSeekReviewer` wraps that again once a round has been billed — and only the engine
+    /// `ChatCompletionsClient` turns a URLSession timeout into `ChatCompletionError.timedOut`, and
+    /// `ChatCompletionsReviewer` wraps that again once a round has been billed — and only the engine
     /// sees the end of that chain.
     func testADeepSeekTimeoutIsNotRetriedInsideTheSameReview() async throws {
         let fixture = try FeatureFixture()
@@ -2085,6 +2225,25 @@ private final class TestClock: @unchecked Sendable {
     }
 }
 
+/// Captures the endpoints the engine asked for a client for, so a test can assert that a custom
+/// reviewer reached the base URL it was configured with rather than a default.
+private final class EndpointRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var endpoints: [ChatEndpoint] = []
+
+    func record(_ endpoint: ChatEndpoint) {
+        lock.lock()
+        endpoints.append(endpoint)
+        lock.unlock()
+    }
+
+    func recorded() -> [ChatEndpoint] {
+        lock.lock()
+        defer { lock.unlock() }
+        return endpoints
+    }
+}
+
 private struct FeatureFixture {
     let root: URL
     let paths: StoragePaths
@@ -2170,18 +2329,19 @@ private final class CountingCredentialStore: CredentialStoring, @unchecked Senda
         self.clock = clock
     }
 
-    func apiKey(for reviewer: ReviewerName) -> String? {
+    func apiKey(for reviewer: ReviewerIdentity) -> String? {
         let launches = clock.reviewerLaunches
         lock.lock()
-        reads[reviewer, default: 0] += 1
+        if let name = reviewer.builtInName { reads[name, default: 0] += 1 }
         launchesAtRead.append(launches)
         lock.unlock()
-        return keys[reviewer]
+        guard let name = reviewer.builtInName else { return nil }
+        return keys[name]
     }
 
     // Nothing under test writes credentials; `InMemoryCredentialStore` covers that side.
-    func setAPIKey(_ key: String, for reviewer: ReviewerName) throws {}
-    func removeAPIKey(for reviewer: ReviewerName) throws {}
+    func setAPIKey(_ key: String, for reviewer: ReviewerIdentity) throws {}
+    func removeAPIKey(for reviewer: ReviewerIdentity) throws {}
 
     var readCounts: [ReviewerName: Int] {
         lock.lock()
@@ -2226,6 +2386,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var environmentByExecutable: [String: EnvironmentOverrides] = [:]
     /// The accounts `gh auth token --user` answers for; every other name is "not signed in".
     var ghAccounts: Set<String> = ["alice", "bob"]
+    /// What the merged-pull-request search answers, settable mid-test so a poll can "see"
+    /// a pull request merge after an earlier poll reviewed it.
+    private var mergedPullRequests: [Int] = []
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
@@ -2359,6 +2522,12 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "gh", arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
+        }
+        if executable == "gh", arguments.starts(with: ["search", "prs"]), arguments.contains("--merged") {
+            let entries = mergedPullRequests.map {
+                #"{"number":\#($0),"title":"Improve widgets","url":"https://github.com/acme/widget/pull/\#($0)"}"#
+            }
+            return result(stdout: "[\(entries.joined(separator: ","))]")
         }
         if executable == "gh", arguments.starts(with: ["search", "prs"]) {
             return result(stdout: #"[{"number":42,"title":"Improve widgets","url":"https://github.com/acme/widget/pull/42"}]"#)
@@ -2602,6 +2771,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func localDiffInvocation() -> String? { localDiffRange }
     func timelineCallCount() -> Int { timelineCalls }
+    func markMerged(_ numbers: [Int]) { mergedPullRequests = numbers }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
 
     private func result(

@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import ReviewBot
 
-final class DeepSeekReviewerTests: XCTestCase {
+final class ChatCompletionsReviewerTests: XCTestCase {
     private var worktree: URL!
 
     private let finalReview = """
@@ -34,7 +34,7 @@ final class DeepSeekReviewerTests: XCTestCase {
 
     func testOpeningMessageCarriesTheContractDiffAndThread() async throws {
         let client = StubChatClient([.message(finalReview)])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         _ = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -63,7 +63,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             to: ".review-bot-merge.md"
         )
         let client = StubChatClient([.message(finalReview)])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         _ = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -82,7 +82,7 @@ final class DeepSeekReviewerTests: XCTestCase {
     /// substantiate a merge finding from evidence it never received.
     func testAnAbsentMergePreviewIsStatedRatherThanLeftUnmentioned() async throws {
         let client = StubChatClient([.message(finalReview)])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         _ = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -101,7 +101,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             .toolCall(id: "call-1", name: "read_file", arguments: #"{"path": "Widget.swift"}"#),
             .message(finalReview),
         ])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let output = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -124,7 +124,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             .toolCall(id: "call-1", name: "read_file", arguments: #"{"path": "/etc/hosts"}"#),
             .message(finalReview),
         ])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let output = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -144,7 +144,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             .failure(ChatCompletionError.toolsUnsupported(model: "deepseek-reasoner")),
             .message(finalReview),
         ])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-reasoner")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-reasoner")
 
         let output = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -170,7 +170,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             .failure(ChatCompletionError.toolsUnsupported(model: "deepseek-reasoner")),
             .message(finalReview),
         ])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-reasoner")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-reasoner")
 
         _ = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -198,7 +198,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             .toolCall(id: "c1", name: "read_file", arguments: #"{"path": "Widget.swift"}"#),
             .message(finalReview),
         ])
-        let reviewer = DeepSeekReviewer(
+        let reviewer = ChatCompletionsReviewer(
             client: client,
             model: "deepseek-chat",
             toolRounds: 16,
@@ -232,8 +232,8 @@ final class DeepSeekReviewerTests: XCTestCase {
             ],
             usagePerReply: TokenUsage(inputTokens: 1_000, outputTokens: 100, requests: 1)
         )
-        let meter = DeepSeekReviewer.SpendMeter()
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let meter = ChatCompletionsReviewer.SpendMeter()
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let empty = await meter.total()
         XCTAssertNil(empty, "nothing billed yet must read as no cost, not as a cost of zero")
@@ -267,7 +267,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             ],
             usagePerReply: TokenUsage(inputTokens: 1_000, outputTokens: 100, requests: 1)
         )
-        let reviewer = DeepSeekReviewer(
+        let reviewer = ChatCompletionsReviewer(
             client: client,
             model: "deepseek-chat",
             pricing: TokenPricing.deepSeekDefault
@@ -285,7 +285,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             // every `ReviewerFailureClass.classify` marker are unaffected by the wrapping.
             XCTAssertTrue(error.localizedDescription.contains("500"))
 
-            let outcome = DeepSeekReviewer.outcome(of: error)
+            let outcome = ChatCompletionsReviewer.outcome(of: error)
             XCTAssertTrue(outcome.error is ChatCompletionError)
             let spent = try XCTUnwrap(outcome.usage, "the paid round must survive the failure")
             XCTAssertEqual(spent.requests, 1)
@@ -305,7 +305,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             ],
             usagePerReply: TokenUsage(inputTokens: 500, outputTokens: 50, requests: 1)
         )
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         do {
             _ = try await reviewer.review(
@@ -315,7 +315,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             )
             XCTFail("A provider timeout should not be swallowed")
         } catch {
-            let outcome = DeepSeekReviewer.outcome(of: error)
+            let outcome = ChatCompletionsReviewer.outcome(of: error)
             let chatError = try XCTUnwrap(outcome.error as? ChatCompletionError)
             guard case .timedOut = chatError else {
                 return XCTFail("the timeout must not be flattened into a generic failure")
@@ -336,7 +336,7 @@ final class DeepSeekReviewerTests: XCTestCase {
 
     func testNarrationOnATurnWithoutToolCallsIsNotPostedAsTheReview() async throws {
         let client = StubChatClient([.message(narration), .message(finalReview)])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let output = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -364,7 +364,7 @@ final class DeepSeekReviewerTests: XCTestCase {
 
     func testAConformingReviewIsAcceptedWithoutAnExtraRoundTrip() async throws {
         let client = StubChatClient([.message(finalReview)])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let output = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -382,7 +382,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             .toolCall(id: "c1", name: "read_file", arguments: #"{"path": "Widget.swift"}"#),
             .message(finalReview),
         ])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat", toolRounds: 1)
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat", toolRounds: 1)
 
         let output = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -408,21 +408,21 @@ final class DeepSeekReviewerTests: XCTestCase {
             "##Summary",
             "## Summary of changes",
         ] {
-            let trimmed = DeepSeekReviewer.trimmedToContract(
+            let trimmed = ChatCompletionsReviewer.trimmedToContract(
                 "narration here\n\n\(variant)\n\nFine.\n\nVERDICT: CLEAN"
             )
             XCTAssertFalse(
                 trimmed.contains("narration here"),
                 "the trim should anchor on \(variant)"
             )
-            XCTAssertTrue(DeepSeekReviewer.followsContract(trimmed))
+            XCTAssertTrue(ChatCompletionsReviewer.followsContract(trimmed))
         }
     }
 
     func testFollowsContractRejectsPureNarration() {
-        XCTAssertFalse(DeepSeekReviewer.followsContract(narration))
-        XCTAssertFalse(DeepSeekReviewer.followsContract("I'm confident this is clean."))
-        XCTAssertTrue(DeepSeekReviewer.followsContract(finalReview))
+        XCTAssertFalse(ChatCompletionsReviewer.followsContract(narration))
+        XCTAssertFalse(ChatCompletionsReviewer.followsContract("I'm confident this is clean."))
+        XCTAssertTrue(ChatCompletionsReviewer.followsContract(finalReview))
     }
 
     func testUsageIsAccumulatedAcrossEveryCallInTheLoop() async throws {
@@ -438,7 +438,7 @@ final class DeepSeekReviewerTests: XCTestCase {
                 requests: 1
             )
         )
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let usage = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -469,7 +469,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             cachedInputPerMillion: 0.25,
             outputPerMillion: 4
         )
-        let reviewer = DeepSeekReviewer(
+        let reviewer = ChatCompletionsReviewer(
             client: client,
             model: "deepseek-chat",
             pricing: pricing
@@ -490,7 +490,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             [.message(finalReview)],
             usagePerReply: TokenUsage(inputTokens: 500, outputTokens: 50, requests: 1)
         )
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat", pricing: nil)
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat", pricing: nil)
 
         let usage = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -509,7 +509,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             [.message(finalReview)],
             usagePerReply: TokenUsage(inputTokens: 500, outputTokens: 50, requests: 1)
         )
-        let reviewer = DeepSeekReviewer(
+        let reviewer = ChatCompletionsReviewer(
             client: client,
             model: "deepseek-chat",
             pricing: TokenPricing(
@@ -531,7 +531,7 @@ final class DeepSeekReviewerTests: XCTestCase {
 
     func testUsageStillCountsCallsWhenTheProviderReportsNone() async throws {
         let client = StubChatClient([.message(finalReview)], usagePerReply: nil)
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let usage = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -548,7 +548,7 @@ final class DeepSeekReviewerTests: XCTestCase {
     /// reading as a free review, which is the one outcome cost reporting exists to prevent.
     func testCostIsUnknownRatherThanZeroWhenTheProviderReportsNoTokens() async throws {
         let client = StubChatClient([.message(finalReview)], usagePerReply: nil)
-        let reviewer = DeepSeekReviewer(
+        let reviewer = ChatCompletionsReviewer(
             client: client,
             model: "deepseek-chat",
             pricing: .deepSeekDefault
@@ -578,7 +578,7 @@ final class DeepSeekReviewerTests: XCTestCase {
                 nil,
             ]
         )
-        let reviewer = DeepSeekReviewer(
+        let reviewer = ChatCompletionsReviewer(
             client: client,
             model: "deepseek-chat",
             pricing: .deepSeekDefault
@@ -611,14 +611,14 @@ final class DeepSeekReviewerTests: XCTestCase {
                 requests: 1
             )
         )
-        let meter = DeepSeekReviewer.SpendMeter(
+        let meter = ChatCompletionsReviewer.SpendMeter(
             pricing: TokenPricing(
                 inputPerMillion: 1,
                 cachedInputPerMillion: 0.25,
                 outputPerMillion: 4
             )
         )
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         do {
             _ = try await reviewer.review(
@@ -643,8 +643,8 @@ final class DeepSeekReviewerTests: XCTestCase {
             ],
             usagePerReply: nil
         )
-        let meter = DeepSeekReviewer.SpendMeter(pricing: .deepSeekDefault)
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let meter = ChatCompletionsReviewer.SpendMeter(pricing: .deepSeekDefault)
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         do {
             _ = try await reviewer.review(
@@ -666,7 +666,7 @@ final class DeepSeekReviewerTests: XCTestCase {
         // A chat completion arrives as one blob and often opens with the model thinking out
         // loud. That must not reach the posted GitHub review.
         XCTAssertEqual(
-            DeepSeekReviewer.trimmedToContract(
+            ChatCompletionsReviewer.trimmedToContract(
                 "Let me check the tests.\n\nNow let me finalize.\n\n## Summary\n\nAll good.\n\nVERDICT: CLEAN"
             ),
             "## Summary\n\nAll good.\n\nVERDICT: CLEAN"
@@ -675,18 +675,18 @@ final class DeepSeekReviewerTests: XCTestCase {
 
     func testTrimmingIsANoOpForWellFormedOutput() {
         let clean = "## Summary\n\nAll good.\n\nVERDICT: CLEAN"
-        XCTAssertEqual(DeepSeekReviewer.trimmedToContract(clean), clean)
+        XCTAssertEqual(ChatCompletionsReviewer.trimmedToContract(clean), clean)
     }
 
     func testOutputWithoutTheHeadingIsLeftIntact() {
         // Better to post a slightly untidy review than to discard the whole thing.
         let unstructured = "Some review with no heading.\n\nVERDICT: CLEAN"
-        XCTAssertEqual(DeepSeekReviewer.trimmedToContract(unstructured), unstructured)
+        XCTAssertEqual(ChatCompletionsReviewer.trimmedToContract(unstructured), unstructured)
     }
 
     func testTrimmingAnchorsOnTheFirstHeadingOnly() {
         XCTAssertEqual(
-            DeepSeekReviewer.trimmedToContract(
+            ChatCompletionsReviewer.trimmedToContract(
                 "chatter\n## Summary\n\nfirst\n\n## Summary of risks\n\nsecond\n\nVERDICT: CLEAN"
             ),
             "## Summary\n\nfirst\n\n## Summary of risks\n\nsecond\n\nVERDICT: CLEAN"
@@ -697,7 +697,7 @@ final class DeepSeekReviewerTests: XCTestCase {
         let client = StubChatClient([
             .message("Let me look around first.\n\n## Summary\n\nFine.\n\nVERDICT: CLEAN"),
         ])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         let output = try await reviewer.review(
             prompt: "REVIEW CONTRACT",
@@ -713,7 +713,7 @@ final class DeepSeekReviewerTests: XCTestCase {
         let client = StubChatClient([
             .failure(ChatCompletionError.http(status: 401, message: "invalid api key")),
         ])
-        let reviewer = DeepSeekReviewer(client: client, model: "deepseek-chat")
+        let reviewer = ChatCompletionsReviewer(client: client, model: "deepseek-chat")
 
         do {
             _ = try await reviewer.review(
@@ -726,7 +726,7 @@ final class DeepSeekReviewerTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("401"))
             // Nothing was billed before the first call failed, so the error is handed back bare
             // rather than wrapped in a spend of zero the engine would then report as a cost.
-            let outcome = DeepSeekReviewer.outcome(of: error)
+            let outcome = ChatCompletionsReviewer.outcome(of: error)
             XCTAssertNil(outcome.usage)
             XCTAssertTrue(outcome.error is ChatCompletionError)
         }

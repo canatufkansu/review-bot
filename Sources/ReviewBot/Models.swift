@@ -310,6 +310,11 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var codex: ReviewerConfiguration
     var opencode: ReviewerConfiguration
     var deepseek: ReviewerConfiguration
+    /// Reviewers the developer added themselves, each an OpenAI-compatible `chat/completions`
+    /// endpoint. This is the list that makes the panel arbitrarily wide: the four above are
+    /// backends Review Bot ships support for, these are however many models the developer wants
+    /// reading the pull request.
+    var customReviewers: [CustomReviewerConfiguration]
     var customPrompt: String
     /// Whether the posted review reports what the API-key reviewers consumed.
     var includeUsageInReview: Bool
@@ -365,6 +370,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
             authMode: .session
         ),
         deepseek: defaultDeepSeek,
+        customReviewers: [],
         customPrompt: "",
         includeUsageInReview: true,
         decisionPolicy: .default,
@@ -388,6 +394,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case codex
         case opencode
         case deepseek
+        case customReviewers
         case customPrompt
         case includeUsageInReview
         case decisionPolicy
@@ -406,6 +413,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         codex: ReviewerConfiguration,
         opencode: ReviewerConfiguration,
         deepseek: ReviewerConfiguration = ReviewBotConfiguration.defaultDeepSeek,
+        customReviewers: [CustomReviewerConfiguration] = [],
         customPrompt: String,
         includeUsageInReview: Bool = true,
         decisionPolicy: DecisionPolicy = .default,
@@ -422,6 +430,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.codex = codex
         self.opencode = opencode
         self.deepseek = deepseek
+        self.customReviewers = customReviewers
         self.customPrompt = customPrompt
         self.includeUsageInReview = includeUsageInReview
         self.decisionPolicy = decisionPolicy
@@ -490,6 +499,13 @@ struct ReviewBotConfiguration: Codable, Equatable {
         if deepseek.pricing == nil {
             deepseek.pricing = ReviewerName.deepseek.defaultPricing
         }
+        // Absent from every configuration written before custom reviewers existed, and a list
+        // whose elements each decode defensively — so one unreadable row cannot cost the
+        // developer the rest of their settings.
+        customReviewers = try values.decodeIfPresent(
+            [CustomReviewerConfiguration].self,
+            forKey: .customReviewers
+        ) ?? []
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
         includeUsageInReview = try values.decodeIfPresent(
             Bool.self,
@@ -530,6 +546,10 @@ enum HistoryEventKind: String, Codable {
     case changesRequested
     case commented
     case failed
+    /// A pull request Review Bot had reviewed was merged. Recorded once per pull request,
+    /// from the poll that first sees it merged, so the statistics can say whether a
+    /// change request was followed through rather than only re-reviewed.
+    case merged
 
     var label: String {
         switch self {
@@ -539,6 +559,7 @@ enum HistoryEventKind: String, Codable {
         case .changesRequested: "Changes requested"
         case .commented: "Comment posted"
         case .failed: "Failed"
+        case .merged: "Merged"
         }
     }
 
@@ -550,6 +571,23 @@ enum HistoryEventKind: String, Codable {
         case .changesRequested: "exclamationmark.octagon.fill"
         case .commented: "text.bubble.fill"
         case .failed: "xmark.circle.fill"
+        case .merged: "arrow.triangle.merge"
+        }
+    }
+
+    /// The kinds that end a review: a posted decision or a failure.
+    var endsAReview: Bool {
+        switch self {
+        case .approved, .changesRequested, .commented, .failed: true
+        case .requestDetected, .reviewStarted, .merged: false
+        }
+    }
+
+    /// The kinds that mean a review was posted to GitHub.
+    var isPostedDecision: Bool {
+        switch self {
+        case .approved, .changesRequested, .commented: true
+        case .requestDetected, .reviewStarted, .failed, .merged: false
         }
     }
 }
@@ -567,6 +605,34 @@ struct HistoryEntry: Codable, Equatable, Identifiable {
     /// Combined usage for the review this entry describes, so spend can be totalled from
     /// `history.json` later. Absent on entries written before usage was tracked.
     var usage: TokenUsage?
+    /// When GitHub recorded the review request this review answers — the timestamp of the
+    /// `review_requested` event, when the timeline had one. `date - requestedAt` is how long
+    /// the author waited for Review Bot. Absent on entries written before it was tracked and
+    /// on requests whose marker fell back to the head commit.
+    var requestedAt: Date?
+    /// When the review of this pull request began — set on the entries that end a review, so
+    /// `date - startedAt` is how long the review took from checkout to the posted decision.
+    var startedAt: Date?
+    /// The head commit the review looked at, so a later approval at a *different* commit
+    /// can be told from a re-review of the same one.
+    var headCommit: String?
+
+    /// How long the review took, for the entries that end one.
+    var reviewDuration: TimeInterval? {
+        guard kind.endsAReview, let startedAt else { return nil }
+        return max(0, date.timeIntervalSince(startedAt))
+    }
+
+    /// How long the author waited between requesting the review and the posted decision.
+    var responseTime: TimeInterval? {
+        guard kind.isPostedDecision, let requestedAt else { return nil }
+        return max(0, date.timeIntervalSince(requestedAt))
+    }
+
+    /// `slug#number`, the key the statistics group a pull request's entries by.
+    var pullRequestKey: String? {
+        pullRequestNumber.map { "\(repositorySlug)#\($0)" }
+    }
 }
 
 struct ReviewQueueItem: Codable, Equatable, Identifiable {
@@ -706,10 +772,282 @@ enum ReviewerName: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// A reviewer paired with its settings, so the engine can treat all reviewers uniformly.
-struct ConfiguredReviewer {
-    let name: ReviewerName
+/// A reviewer the developer added themselves, reached over an OpenAI-compatible
+/// `chat/completions` endpoint.
+///
+/// This is what lets one pull request be read by many models. `ReviewerName` is a closed set of
+/// *backends* Review Bot knows how to drive; a custom reviewer is a *panel member* instead — a
+/// base URL, a model name and a key — so a second, third or tenth model joins the panel without
+/// a new enum case, a new switch arm, or a CLI to install. Every one of them runs the same
+/// in-process agent loop the built-in DeepSeek reviewer runs, behind the same read-only
+/// `WorktreeTools` sandbox, so the read-only guarantee is not restated per provider.
+struct CustomReviewerConfiguration: Codable, Equatable, Identifiable {
+    /// Stable for the life of the reviewer, and the only thing its stored key is filed under —
+    /// so renaming a reviewer, or pointing it at a different model, never orphans its credential.
+    var id: UUID
+    /// What the posted panel calls this reviewer.
+    var name: String
+    /// The API root, *without* the `chat/completions` suffix the client appends —
+    /// `https://openrouter.ai/api/v1`, `https://api.z.ai/api/paas/v4`, and so on.
+    var baseURL: String
+    var model: String
+    var enabled: Bool
+    /// Rates in USD per million tokens. Unlike the built-in reviewers there is no default that
+    /// could be right, so a new custom reviewer starts unpriced: `TokenPricing.cost(for:)`
+    /// returns `nil` for all-zero rates, and the review reports tokens without implying the
+    /// call was free.
+    var pricing: TokenPricing?
+    /// How long this reviewer may spend on one review, in minutes — every custom reviewer bills
+    /// a key, so this is also its spend ceiling.
+    var timeoutMinutes: Int
+
+    init(
+        id: UUID = UUID(),
+        name: String = "",
+        baseURL: String = "",
+        model: String = "",
+        enabled: Bool = true,
+        pricing: TokenPricing? = TokenPricing.unpriced,
+        timeoutMinutes: Int = ReviewerConfiguration.defaultTimeoutMinutes
+    ) {
+        self.id = id
+        self.name = name
+        self.baseURL = baseURL
+        self.model = model
+        self.enabled = enabled
+        self.pricing = pricing
+        self.timeoutMinutes = timeoutMinutes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, baseURL, model, enabled, pricing, timeoutMinutes
+    }
+
+    /// Defensive like every other decoder here, with one addition: a row whose id is missing
+    /// gets a fresh one rather than throwing the whole configuration away. That loses the row's
+    /// stored key, which is recoverable; refusing to load `config.json` is not.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try values.decodeIfPresent(String.self, forKey: .name) ?? ""
+        baseURL = try values.decodeIfPresent(String.self, forKey: .baseURL) ?? ""
+        model = try values.decodeIfPresent(String.self, forKey: .model) ?? ""
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        pricing = try values.decodeIfPresent(TokenPricing.self, forKey: .pricing)
+            ?? TokenPricing.unpriced
+        timeoutMinutes = try values.decodeIfPresent(Int.self, forKey: .timeoutMinutes)
+            ?? ReviewerConfiguration.defaultTimeoutMinutes
+    }
+
+    var identity: ReviewerIdentity { .custom(id) }
+
+    /// Never blank: an unnamed reviewer still has to be distinguishable in the posted panel and
+    /// in the activity log, so it falls back to its model and then to a fixed label.
+    var displayName: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? "Custom reviewer" : model
+    }
+
+    /// The endpoint root, or `nil` when what was typed is not a usable http(s) URL.
+    ///
+    /// Checked here rather than at the call site so a half-filled row cannot reach the network:
+    /// `isRunnable` is what `enabledReviewers` filters on, and a row that fails this never runs
+    /// at all instead of failing once per poll with a URL error.
+    var endpointURL: URL? {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              url.host?.isEmpty == false else {
+            return nil
+        }
+        return url
+    }
+
+    /// Whether this row is complete enough to run. An incomplete row is not an error — it is a
+    /// card someone is still filling in.
+    var isRunnable: Bool {
+        endpointURL != nil && !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The uniform settings view the engine works in. Effort is fixed because a
+    /// chat-completions endpoint has no effort control, and the auth mode is fixed because a key
+    /// is the only way in — the same two constraints the built-in DeepSeek reviewer has.
+    var reviewerConfiguration: ReviewerConfiguration {
+        ReviewerConfiguration(
+            enabled: enabled,
+            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
+            effort: .high,
+            authMode: .apiKey,
+            pricing: pricing,
+            timeoutMinutes: timeoutMinutes
+        )
+    }
+}
+
+/// Which panel member a result, a credential, or a settings row belongs to.
+///
+/// `ReviewerName` names a backend; this names a *seat on the panel*, and the two stopped being
+/// the same thing once several custom reviewers could share the one chat-completions backend
+/// with different endpoints, models and keys. Everything downstream — credentials, metering,
+/// the posted panel — keys off this, so putting a second model in front of a pull request does
+/// not mean adding a case to `ReviewerName`.
+enum ReviewerIdentity: Hashable, Sendable, Codable {
+    case builtIn(ReviewerName)
+    case custom(UUID)
+
+    /// The account name the platform credential store files this reviewer's key under.
+    ///
+    /// A built-in keeps its historical account — its `ReviewerName` raw value — so an existing
+    /// Keychain or Credential Manager item survives this change untouched.
+    var credentialAccount: String {
+        switch self {
+        case let .builtIn(name): name.rawValue
+        case let .custom(id): "custom:\(id.uuidString)"
+        }
+    }
+
+    /// The variable Review Bot reads a key from before consulting the platform store. A custom
+    /// reviewer's is derived from its id rather than its name, so renaming the reviewer in
+    /// Settings does not silently stop an exported key from being picked up.
+    var apiKeyOverrideEnvironmentVariable: String {
+        switch self {
+        case let .builtIn(name): name.apiKeyOverrideEnvironmentVariable
+        case let .custom(id):
+            "REVIEW_BOT_KEY_" + id.uuidString.replacingOccurrences(of: "-", with: "_")
+        }
+    }
+
+    /// False only for a reviewer Review Bot has nowhere to put a key for — opencode, which
+    /// authenticates through its own configuration directory. Every custom reviewer is reached
+    /// over HTTP, so a key is the only way in.
+    var acceptsAPIKey: Bool {
+        switch self {
+        case let .builtIn(name): name.supportsAPIKeyAuth
+        case .custom: true
+        }
+    }
+
+    /// A flat string form for JSON and URL paths, where an enum with an associated value would
+    /// force the dashboard's JavaScript to understand Swift's `Codable` shape. A built-in keeps
+    /// its own name; a custom reviewer is its id, and the two can never collide because no
+    /// reviewer is named like a UUID.
+    var wireIdentifier: String {
+        switch self {
+        case let .builtIn(name): name.rawValue
+        case let .custom(id): id.uuidString
+        }
+    }
+
+    init?(wireIdentifier: String) {
+        if let name = ReviewerName(rawValue: wireIdentifier) {
+            self = .builtIn(name)
+        } else if let id = UUID(uuidString: wireIdentifier) {
+            self = .custom(id)
+        } else {
+            return nil
+        }
+    }
+
+    /// The built-in backend, or `nil` for a custom chat-completions reviewer. Callers that can
+    /// only act on the fixed reviewers — the CLI availability badges, the adjudicator
+    /// preference — filter on this rather than assuming every seat is a `ReviewerName`.
+    var builtInName: ReviewerName? {
+        switch self {
+        case let .builtIn(name): name
+        case .custom: nil
+        }
+    }
+}
+
+/// What a panel seat is backed by. The `builtIn` payload is what keeps
+/// `ReviewEngine.runReviewerOnce`'s dispatch exhaustive over `ReviewerName`, which is still the
+/// only compile-time guarantee that a newly added backend is actually invoked.
+enum ReviewerKind: Equatable {
+    case builtIn(ReviewerName)
+    case custom(CustomReviewerConfiguration)
+}
+
+/// A panel seat paired with its settings, so the engine can treat every reviewer uniformly.
+struct ConfiguredReviewer: Equatable {
+    let kind: ReviewerKind
     let configuration: ReviewerConfiguration
+    /// What the posted panel, the reconciliation prompt and the usage table call this seat.
+    /// Usually the reviewer's own name, but `disambiguated(_:)` may qualify it — nothing stops
+    /// two custom rows being given the same name, and two identically labelled panels in one
+    /// review are indistinguishable to a reader and to the adjudicator.
+    let displayName: String
+
+    init(kind: ReviewerKind, configuration: ReviewerConfiguration, displayName: String? = nil) {
+        self.kind = kind
+        self.configuration = configuration
+        self.displayName = displayName ?? Self.defaultDisplayName(for: kind)
+    }
+
+    init(name: ReviewerName, configuration: ReviewerConfiguration) {
+        self.init(kind: .builtIn(name), configuration: configuration)
+    }
+
+    init(custom: CustomReviewerConfiguration) {
+        self.init(kind: .custom(custom), configuration: custom.reviewerConfiguration)
+    }
+
+    private static func defaultDisplayName(for kind: ReviewerKind) -> String {
+        switch kind {
+        case let .builtIn(name): name.rawValue
+        case let .custom(custom): custom.displayName
+        }
+    }
+
+    var identity: ReviewerIdentity {
+        switch kind {
+        case let .builtIn(name): .builtIn(name)
+        case let .custom(custom): custom.identity
+        }
+    }
+
+    /// The built-in backend, or `nil` for a custom reviewer.
+    var name: ReviewerName? { identity.builtInName }
+
+    /// Makes every seat's name unique, in order, without renaming anything the developer can
+    /// see in Settings.
+    ///
+    /// A repeated name is qualified by its model first, because that is the distinction the
+    /// reader actually cares about; if that still collides — the same model added twice — a
+    /// counter is appended. Built-in reviewers can never collide with each other, so in practice
+    /// this only touches custom rows.
+    static func disambiguated(_ reviewers: [ConfiguredReviewer]) -> [ConfiguredReviewer] {
+        let counts = reviewers.reduce(into: [String: Int]()) { counts, reviewer in
+            counts[reviewer.displayName, default: 0] += 1
+        }
+        var used: Set<String> = []
+        return reviewers.map { reviewer in
+            guard counts[reviewer.displayName, default: 0] > 1 else {
+                used.insert(reviewer.displayName)
+                return reviewer
+            }
+            let model = reviewer.configuration.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            var candidate = model.isEmpty
+                ? reviewer.displayName
+                : "\(reviewer.displayName) (\(model))"
+            var suffix = 2
+            while used.contains(candidate) {
+                candidate = model.isEmpty
+                    ? "\(reviewer.displayName) \(suffix)"
+                    : "\(reviewer.displayName) (\(model)) \(suffix)"
+                suffix += 1
+            }
+            used.insert(candidate)
+            return ConfiguredReviewer(
+                kind: reviewer.kind,
+                configuration: reviewer.configuration,
+                displayName: candidate
+            )
+        }
+    }
 }
 
 extension ReviewBotConfiguration {
@@ -722,12 +1060,41 @@ extension ReviewBotConfiguration {
         }
     }
 
-    /// Enabled reviewers in a stable order, so posted reviews and history read the same way
-    /// on every run.
+    /// The settings behind any panel seat, built-in or custom. A custom id that is no longer in
+    /// the list — a reviewer deleted while a review it was part of was still running — resolves
+    /// to a disabled, unmetered configuration rather than trapping.
+    func settings(for identity: ReviewerIdentity) -> ReviewerConfiguration {
+        switch identity {
+        case let .builtIn(name):
+            return settings(for: name)
+        case let .custom(id):
+            guard let custom = customReviewers.first(where: { $0.id == id }) else {
+                return ReviewerConfiguration(
+                    enabled: false,
+                    model: "",
+                    effort: .high,
+                    authMode: .session
+                )
+            }
+            return custom.reviewerConfiguration
+        }
+    }
+
+    /// Enabled reviewers in a stable order, so posted reviews and history read the same way on
+    /// every run: the built-in backends in `ReviewerName` declaration order, then the custom
+    /// reviewers in the order they were added.
+    ///
+    /// A custom row that is still half-filled is skipped rather than run. It has no endpoint to
+    /// reach, so running it would put one failed reviewer in every posted panel until someone
+    /// finished typing.
     var enabledReviewers: [ConfiguredReviewer] {
-        ReviewerName.allCases
+        let builtIn = ReviewerName.allCases
             .map { ConfiguredReviewer(name: $0, configuration: settings(for: $0)) }
             .filter(\.configuration.enabled)
+        let custom = customReviewers
+            .filter { $0.enabled && $0.isRunnable }
+            .map(ConfiguredReviewer.init(custom:))
+        return ConfiguredReviewer.disambiguated(builtIn + custom)
     }
 }
 
@@ -779,15 +1146,23 @@ enum ReviewerFailureClass: Equatable {
             "please run `claude login`",
             "credit balance is too low",
             // DeepSeek answers a bad key with "Authentication Fails" and an empty account
-            // with "Insufficient Balance"; both arrive wrapped in `DeepSeek returned HTTP …`.
+            // with "Insufficient Balance"; both arrive wrapped in `<provider> returned HTTP …`.
             "authentication fails",
             "insufficient balance",
-            "deepseek returned http 401",
-            "deepseek returned http 402",
+            // Deliberately not anchored to a provider name. Every chat-completions reviewer —
+            // DeepSeek and every custom endpoint — phrases its HTTP failures the same way, and
+            // 401 (rejected key) and 402 (no balance) fail identically however often they are
+            // called. Anchoring these to "deepseek" would silently spend the retry budget, and
+            // then the review's failure budget, on every custom reviewer with a bad key.
+            "returned http 401",
+            "returned http 402",
             // Review Bot's own message for a reviewer set to API-key auth whose key is absent
             // or whose Keychain prompt was denied. Only Settings can fix that, so retrying
             // would spend the failure budget on a request that cannot start.
             "key could not be read",
+            // Likewise a custom reviewer whose endpoint does not parse: there is nowhere to send
+            // the request, and a second attempt sends it to the same nowhere.
+            "no usable api base url",
             // A reviewer that reported it could not assess the pull request. Not a provider
             // failure at all — the call succeeded — but a second call re-reads the same
             // unreadable evidence and reaches the same conclusion, and for a metered reviewer
@@ -799,7 +1174,12 @@ enum ReviewerFailureClass: Equatable {
 }
 
 struct ReviewerResult: Equatable {
-    var reviewer: ReviewerName
+    /// Which panel seat produced this, built-in or custom.
+    var reviewer: ReviewerIdentity
+    /// What to call that seat in the posted panel and the log. Carried on the result rather than
+    /// looked up from the configuration, so a review already in flight still names a custom
+    /// reviewer correctly after it is renamed or removed in Settings.
+    var displayName: String
     var model: String
     var output: String
     var verdict: ReviewVerdict?
@@ -833,6 +1213,48 @@ struct ReviewerResult: Equatable {
     var isWorthRetrying: Bool {
         guard !timedOut, failureClass != .terminal else { return false }
         return failure != nil || verdict == nil
+    }
+
+    /// Convenience for the built-in reviewers, whose display name is their `ReviewerName`.
+    init(
+        reviewer: ReviewerName,
+        model: String,
+        output: String,
+        verdict: ReviewVerdict?,
+        failure: String?,
+        timedOut: Bool = false,
+        usage: TokenUsage? = nil
+    ) {
+        self.init(
+            reviewer: .builtIn(reviewer),
+            displayName: reviewer.rawValue,
+            model: model,
+            output: output,
+            verdict: verdict,
+            failure: failure,
+            timedOut: timedOut,
+            usage: usage
+        )
+    }
+
+    init(
+        reviewer: ReviewerIdentity,
+        displayName: String,
+        model: String,
+        output: String,
+        verdict: ReviewVerdict?,
+        failure: String?,
+        timedOut: Bool = false,
+        usage: TokenUsage? = nil
+    ) {
+        self.reviewer = reviewer
+        self.displayName = displayName
+        self.model = model
+        self.output = output
+        self.verdict = verdict
+        self.failure = failure
+        self.timedOut = timedOut
+        self.usage = usage
     }
 }
 

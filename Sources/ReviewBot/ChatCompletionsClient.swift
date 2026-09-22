@@ -120,16 +120,22 @@ enum ChatCompletionError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        // Deliberately provider-neutral. Several reviewers now speak this protocol against
+        // different endpoints, and the reviewer's own name is already on the failure —
+        // `ReviewEngine.failedReviewer` prefixes it — so naming DeepSeek here would mislabel
+        // every other one. The "returned HTTP <status>" wording is load-bearing:
+        // `ReviewerFailureClass.classify` matches 401 and 402 on it to keep a rejected key from
+        // spending the retry budget.
         case let .http(status, message):
-            "DeepSeek returned HTTP \(status): \(message)"
+            "The provider returned HTTP \(status): \(message)"
         case let .toolsUnsupported(model):
             "The model \(model) rejected tool calls."
         case .emptyResponse:
-            "DeepSeek returned no message content."
+            "The provider returned no message content."
         case let .malformedResponse(detail):
-            "Could not read DeepSeek's response: \(detail)"
+            "Could not read the provider's response: \(detail)"
         case let .timedOut(seconds):
-            "DeepSeek did not answer within \(seconds)s."
+            "The provider did not answer within \(seconds)s."
         }
     }
 }
@@ -154,7 +160,30 @@ protocol ChatCompleting: Sendable {
     ) async throws -> ChatCompletionResult
 }
 
-struct DeepSeekClient: ChatCompleting {
+/// One provider's OpenAI-compatible API root.
+///
+/// `providerName` is only ever used in log lines and status text; the base URL is what does the
+/// work. Both are values rather than a hardcoded constant because the panel can now hold any
+/// number of endpoints — DeepSeek is just the one that ships configured.
+struct ChatEndpoint: Sendable, Equatable {
+    let providerName: String
+    /// The API root, without the `chat/completions` suffix the client appends. `nil` when the
+    /// configured URL could not be parsed, which the engine reports as a failed reviewer rather
+    /// than resolving to some default endpoint the developer never named.
+    let baseURL: URL?
+
+    static let deepSeek = ChatEndpoint(
+        providerName: ReviewerName.deepseek.rawValue,
+        baseURL: URL(string: "https://api.deepseek.com")
+    )
+}
+
+/// A client for any OpenAI-compatible `chat/completions` endpoint.
+///
+/// The wire format is the same everywhere — DeepSeek, OpenRouter, Gemini's compatibility layer,
+/// a local server — so one client covers all of them and the differences live in
+/// `ChatEndpoint`, the model name, and the key.
+struct ChatCompletionsClient: ChatCompleting {
     private let baseURL: URL
     private let session: URLSession
     private let maxAttempts: Int

@@ -21,10 +21,10 @@ struct KeychainCredentialStore: CredentialStoring {
         self.environment = environment
     }
 
-    func apiKey(for reviewer: ReviewerName) -> String? {
+    func apiKey(for reviewer: ReviewerIdentity) -> String? {
         // The guard lives in `EnvironmentCredentialOverride` too, but it is restated here so a
         // Keychain item saved for a reviewer that has since lost its key path is not resolved.
-        guard reviewer.supportsAPIKeyAuth else { return nil }
+        guard reviewer.acceptsAPIKey else { return nil }
 
         if let fromEnvironment = EnvironmentCredentialOverride.apiKey(for: reviewer, in: environment) {
             return fromEnvironment
@@ -44,7 +44,7 @@ struct KeychainCredentialStore: CredentialStoring {
         return value.isEmpty ? nil : value
     }
 
-    func setAPIKey(_ key: String, for reviewer: ReviewerName) throws {
+    func setAPIKey(_ key: String, for reviewer: ReviewerIdentity) throws {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             try removeAPIKey(for: reviewer)
@@ -67,9 +67,10 @@ struct KeychainCredentialStore: CredentialStoring {
         }
     }
 
-    /// Deliberately unguarded by `supportsAPIKeyAuth`, unlike `apiKey(for:)`: an item saved by
-    /// an earlier build, or before a reviewer's auth surface changed, must stay removable.
-    func removeAPIKey(for reviewer: ReviewerName) throws {
+    /// Deliberately unguarded by `acceptsAPIKey`, unlike `apiKey(for:)`: an item saved by an
+    /// earlier build, or before a reviewer's auth surface changed, must stay removable. It is
+    /// also what lets a deleted custom reviewer's key be cleaned up after the row is gone.
+    func removeAPIKey(for reviewer: ReviewerIdentity) throws {
         let status = SecItemDelete(baseQuery(for: reviewer) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw Self.error(status)
@@ -84,11 +85,14 @@ struct KeychainCredentialStore: CredentialStoring {
         )
     }
 
-    private func baseQuery(for reviewer: ReviewerName) -> [String: Any] {
+    /// The account is `ReviewerIdentity.credentialAccount`, which is a built-in reviewer's own
+    /// name — so every key saved before custom reviewers existed is found exactly where it was
+    /// left, with no migration.
+    private func baseQuery(for reviewer: ReviewerIdentity) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: reviewer.rawValue,
+            kSecAttrAccount as String: reviewer.credentialAccount,
         ]
     }
 

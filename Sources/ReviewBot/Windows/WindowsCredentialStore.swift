@@ -26,15 +26,15 @@ struct WindowsCredentialStore: CredentialStoring {
         self.environment = environment
     }
 
-    func apiKey(for reviewer: ReviewerName) -> String? {
-        guard reviewer.supportsAPIKeyAuth else { return nil }
+    func apiKey(for reviewer: ReviewerIdentity) -> String? {
+        guard reviewer.acceptsAPIKey else { return nil }
         if let fromEnvironment = EnvironmentCredentialOverride.apiKey(for: reviewer, in: environment) {
             return fromEnvironment
         }
         return read(target(for: reviewer))
     }
 
-    func setAPIKey(_ key: String, for reviewer: ReviewerName) throws {
+    func setAPIKey(_ key: String, for reviewer: ReviewerIdentity) throws {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             try removeAPIKey(for: reviewer)
@@ -43,9 +43,10 @@ struct WindowsCredentialStore: CredentialStoring {
         try write(target(for: reviewer), secret: trimmed)
     }
 
-    /// Deliberately unguarded by `supportsAPIKeyAuth`, unlike `apiKey(for:)`: an item saved by
-    /// an earlier build, or before a reviewer's auth surface changed, must stay removable.
-    func removeAPIKey(for reviewer: ReviewerName) throws {
+    /// Deliberately unguarded by `acceptsAPIKey`, unlike `apiKey(for:)`: an item saved by an
+    /// earlier build, or before a reviewer's auth surface changed, must stay removable. It is
+    /// also what lets a deleted custom reviewer's key be cleaned up after the row is gone.
+    func removeAPIKey(for reviewer: ReviewerIdentity) throws {
         let deleted = target(for: reviewer).withCString(encodedAs: UTF16.self) { name in
             CredDeleteW(name, Self.genericType, 0)
         }
@@ -67,8 +68,10 @@ struct WindowsCredentialStore: CredentialStoring {
     private static let persistLocalMachine: DWORD = 2 // CRED_PERSIST_LOCAL_MACHINE
     private static let errorNotFound: DWORD = 1168 // ERROR_NOT_FOUND
 
-    private func target(for reviewer: ReviewerName) -> String {
-        "\(service)/\(reviewer.rawValue)"
+    /// The target is `ReviewerIdentity.credentialAccount`, which is a built-in reviewer's own
+    /// name — so every key saved before custom reviewers existed is found where it was left.
+    private func target(for reviewer: ReviewerIdentity) -> String {
+        "\(service)/\(reviewer.credentialAccount)"
     }
 
     private func read(_ target: String) -> String? {

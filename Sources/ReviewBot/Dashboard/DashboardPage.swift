@@ -125,6 +125,11 @@ enum DashboardPage {
     footer { color: var(--muted); font-size: 12px; display: flex; gap: 14px; align-items: center; margin-top: 24px; }
     .price { width: 90px; }
     .kv { display: flex; gap: 8px; align-items: center; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+    .tile { padding: 10px 12px; border-radius: 8px; background: color-mix(in srgb, var(--muted) 10%, transparent); min-height: 70px; }
+    .tile .k { color: var(--muted); font-size: 12px; }
+    .tile .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; margin: 2px 0; }
+    .tile .d { color: var(--muted); font-size: 11px; }
     </style>
     </head>
     <body>
@@ -145,6 +150,7 @@ enum DashboardPage {
         <div class="row">
           <span class="chip">✨ Running <b id="runningCount">0</b></span>
           <span class="chip">⏳ Pending <b id="pendingCount">0</b></span>
+          <span class="chip" id="avgReviewChip" title="Checkout to posted decision, averaged over the last 30 days; refreshed after every review.">⏱ Avg review <b id="avgReview">—</b></span>
           <span class="grow"></span>
           <span class="caption" id="configSummary"></span>
         </div>
@@ -156,6 +162,7 @@ enum DashboardPage {
         <button data-tab="reviewers">Reviewers</button>
         <button data-tab="decisions">Decisions</button>
         <button data-tab="prompt">Prompt</button>
+        <button data-tab="stats">Statistics</button>
         <button data-tab="history">History</button>
       </nav>
 
@@ -259,6 +266,14 @@ enum DashboardPage {
 
         <div id="reviewerCards"></div>
 
+        <h2 style="margin-top:26px">More models</h2>
+        <p class="lead">Add any model reachable over an OpenAI-compatible <code>chat/completions</code> endpoint — an aggregator like OpenRouter, a provider's own compatibility endpoint, or a server on this machine. Each one joins the panel as a full reviewer: it runs the same agent loop in the same read-only sandbox, and its verdict counts like any other.</p>
+        <div id="customReviewerCards"></div>
+        <div class="row">
+          <button id="addCustomReviewer">+ Add a model</button>
+          <span class="caption grow">Every model you add reads the whole pull request and is billed to its own key, so the panel's cost grows with it.</span>
+        </div>
+
         <div class="row">
           <span class="caption grow">At least one AI reviewer must be enabled. opencode is off by default; it runs the free <code>opencode/deepseek-v4-flash-free</code> model at max reasoning effort in a read-only sandbox. DeepSeek is off by default too — it has no CLI, so it needs an API key saved on its card above before it can review.</span>
           <button id="refreshTools">Refresh CLI status</button>
@@ -287,6 +302,12 @@ enum DashboardPage {
           <span class="caption" id="promptCount"></span>
           <button id="clearPrompt">Clear</button>
         </div>
+      </section>
+
+      <section class="panel" data-panel="stats">
+        <h2>Review statistics</h2>
+        <p class="lead" id="statsLead">What Review Bot posted in the last 30 days, how fast, and whether its change requests were acted on. Computed from the activity history on this machine.</p>
+        <div id="statsBody"></div>
       </section>
 
       <section class="panel" data-panel="history">
@@ -369,6 +390,14 @@ enum DashboardPage {
         saveTimer = setTimeout(saveConfig, 350);
       }
 
+      // Flushes a queued save immediately. Saving a key for a reviewer that only exists in this
+      // page's copy of the configuration has to happen after the shell has been told the row
+      // exists, or the key is filed against an id nothing will ever look up.
+      async function saveNow() {
+        clearTimeout(saveTimer);
+        await saveConfig();
+      }
+
       async function saveConfig() {
         if (!config) return;
         try {
@@ -419,7 +448,10 @@ enum DashboardPage {
         $('statusDot').className = 'status-dot ' + cls; $('statusDot').textContent = glyph;
         $('statusText').textContent = s.status;
         $('statusBadge').textContent = badge[0]; $('statusBadge').className = 'badge ' + badge[1];
-        $('runNow').disabled = s.isRunning;
+        // Reviews run on behind a poll, and a poll can be asked for while they do — it
+        // queues whatever is new behind them. Only a discovery in progress makes it a no-op.
+        $('runNow').disabled = s.isPolling;
+        renderStatistics(s.statistics);
         $('togglePause').textContent = paused ? '▶ Resume' : '❚❚ Pause';
         $('monitorStatus').innerHTML = '<b>' + escapeHTML(paused ? 'Monitoring is paused' : s.status) + '</b>';
         $('lastChecked').textContent = s.lastCheckDate ? 'Last checked ' + relative(s.lastCheckDate) : '';
@@ -440,6 +472,51 @@ enum DashboardPage {
         renderReviewerLive();
         $('versionLabel').textContent = 'Review Bot ' + s.version;
         $('dataFolder').textContent = s.dataFolder;
+      }
+
+      // ---- statistics --------------------------------------------------------------------
+      // The figures are computed by the app (ReviewStatistics); this only lays them out.
+      function duration(seconds) {
+        if (seconds == null) return '—';
+        const total = Math.round(seconds);
+        if (total < 60) return total + ' s';
+        const minutes = Math.floor(total / 60);
+        if (minutes < 60) return minutes + ' min';
+        const rest = minutes % 60;
+        return Math.floor(minutes / 60) + ' h' + (rest ? ' ' + rest + ' min' : '');
+      }
+      function percent(part, whole) { return whole > 0 ? Math.round(100 * part / whole) + '%' : '—'; }
+      function tile(k, v, d, color, title) {
+        return '<div class="tile"' + (title ? ' title="' + escapeHTML(title) + '"' : '') + '><div class="k">' + escapeHTML(k) + '</div><div class="v"' + (color ? ' style="color:var(--' + color + ')"' : '') + '>' + escapeHTML(v) + '</div>' + (d ? '<div class="d">' + escapeHTML(d) + '</div>' : '') + '</div>';
+      }
+      function group(title, tiles) { return '<div class="box"><h3>' + escapeHTML(title) + '</h3><div class="stats">' + tiles.join('') + '</div></div>'; }
+      function renderStatistics(t) {
+        if (!t) return;
+        $('avgReview').textContent = duration(t.averageDurationSeconds);
+        $('statsLead').textContent = 'What Review Bot posted in the last ' + t.windowDays + ' days, how fast, and whether its change requests were acted on. Computed from the activity history on this machine.';
+        const cost = t.totalCostUSD != null ? '$' + t.totalCostUSD.toFixed(2) : (t.totalTokens > 0 ? 'unknown' : '—');
+        $('statsBody').innerHTML =
+          group('Decisions posted', [
+            tile('Reviews', String(t.reviewsPosted), t.failed + ' failed'),
+            tile('Approved', String(t.approved), '', 'green'),
+            tile('Changes requested', String(t.changesRequested), '', 'orange'),
+            tile('Comments', String(t.commented), '', 'purple'),
+          ])
+          + group('Speed', [
+            tile('Review duration', duration(t.averageDurationSeconds), 'median ' + duration(t.medianDurationSeconds) + ' · last ' + duration(t.lastDurationSeconds), '', 'From checkout to the posted decision, averaged over the window. Refreshed after every review.'),
+            tile('Response time', duration(t.averageResponseSeconds), 'median ' + duration(t.medianResponseSeconds), '', 'From the review request on GitHub to the posted decision — includes time spent waiting for a poll and in the queue.'),
+          ])
+          + group('Follow-through', [
+            tile('Change requests acted on', percent(t.changesRequestedThenApproved, t.pullRequestsWithChangesRequested), t.changesRequestedThenApproved + ' of ' + t.pullRequestsWithChangesRequested + ' pull requests later approved', 'orange', 'A change request counts as acted on when Review Bot later approved the same pull request at a different commit.'),
+            tile('…and merged', percent(t.changesRequestedThenMerged, t.pullRequestsWithChangesRequested), t.changesRequestedThenMerged + ' of ' + t.pullRequestsWithChangesRequested + ' merged after the request', 'orange'),
+            tile('Rounds to approval', t.averageRoundsToApproval != null ? t.averageRoundsToApproval.toFixed(2) : '—', 'change requests before an approval followed', '', '1.00 means every change request was resolved in one round.'),
+            tile('Approvals merged', percent(t.approvedThenMerged, t.pullRequestsApproved), t.approvedThenMerged + ' of ' + t.pullRequestsApproved + ' approved pull requests', 'green'),
+          ])
+          + group('Metered spend', [
+            tile('Tokens', abbreviate(t.totalTokens), 'reviewers billed per token only'),
+            tile('Cost', cost, t.totalCostUSD == null && t.totalTokens > 0 ? "a review's cost could not be priced" : ''),
+          ])
+          + (t.reviewsPosted === 0 ? '<div class="caption">No reviews were posted in this window yet. Figures fill in as Review Bot reviews pull requests.</div>' : '');
       }
 
       function queueRow(item, cls, state) {
@@ -655,7 +732,136 @@ enum DashboardPage {
             queueSave(); renderReviewers();
           };
         });
+        renderCustomReviewers();
         renderReviewerLive();
+      }
+
+      // The open end of the panel: one card per model reached over an OpenAI-compatible
+      // endpoint. Kept apart from renderReviewers because these rows live in an array in the
+      // configuration rather than in a named property per reviewer.
+      function renderCustomReviewers() {
+        const container = $('customReviewerCards');
+        if (!container) return;
+        const rows = config.customReviewers || (config.customReviewers = []);
+        container.innerHTML = rows.map((r, index) => {
+          const draft = reviewerDrafts[r.id] || (reviewerDrafts[r.id] = { key: '' });
+          const hasKey = snapshot.reviewersWithSavedKey.some((id) => id.toLowerCase() === String(r.id).toLowerCase());
+          const name = displayNameFor(r);
+          const urlOK = usableBaseURL(r.baseURL);
+          const p = r.pricing || { inputPerMillion: 0, cachedInputPerMillion: 0, outputPerMillion: 0 };
+          const unpriced = p.inputPerMillion <= 0 && p.cachedInputPerMillion <= 0 && p.outputPerMillion <= 0;
+          let html = '<div class="box" data-config data-custom="' + escapeHTML(r.id) + '">';
+          html += '<div class="row"><label style="font-weight:600"><input type="checkbox" data-cr="' + index + '" data-field="enabled"' + (r.enabled ? ' checked' : '') + '> ' + escapeHTML(name) + '</label><span class="grow"></span><span data-custom-badge="' + escapeHTML(r.id) + '"></span><button class="danger" data-customremove="' + escapeHTML(r.id) + '">Remove</button></div>';
+          html += '<div class="row"><label class="name">Name</label><input type="text" class="grow" style="flex:1" data-cr="' + index + '" data-field="name" placeholder="What to call it in the posted review" value="' + escapeHTML(r.name || '') + '"></div>';
+          html += '<div class="row"><label class="name">API base</label><input type="text" class="mono grow" style="flex:1' + (r.baseURL && !urlOK ? ';color:var(--red)' : '') + '" data-cr="' + index + '" data-field="baseURL" placeholder="https://openrouter.ai/api/v1" value="' + escapeHTML(r.baseURL || '') + '"></div>';
+          html += '<div class="caption">The API root only — Review Bot appends <code>chat/completions</code> itself.</div>';
+          html += '<div class="row"><label class="name">Model</label><input type="text" class="mono grow" style="flex:1" data-cr="' + index + '" data-field="model" placeholder="Model name as the provider spells it" value="' + escapeHTML(r.model || '') + '"></div>';
+          html += '<div class="row"><label class="name">Time limit</label><input type="number" min="1" max="240" style="width:80px" data-cr="' + index + '" data-field="timeoutMinutes" value="' + r.timeoutMinutes + '"> <span>min</span></div>';
+          html += '<div class="caption">How long this model may spend on one review before it is cut off. It is billed to your own key, so the limit is also a spend ceiling — and a review that runs out of time contributes nothing.</div>';
+          html += '<hr style="border:none;border-top:1px solid var(--border);margin:12px 0">';
+          html += '<div class="row"><label class="name">API key</label><input type="password" style="flex:1" data-customdraft="' + escapeHTML(r.id) + '" placeholder="' + (hasKey ? 'A key is saved — type a new one to replace it' : 'Paste the API key for ' + escapeHTML(name)) + '" value="' + escapeHTML(draft.key) + '"><button data-customsavekey="' + escapeHTML(r.id) + '"' + (draft.key.trim() ? '' : ' disabled') + '>Save</button><button class="danger" data-customremovekey="' + escapeHTML(r.id) + '"' + (hasKey ? '' : ' disabled') + '>Remove</button></div>';
+          html += '<div class="' + (hasKey ? 'good' : 'warn') + '">' + (hasKey ? '🔑 Saved in the Windows Credential Manager, never in config.json.' : '⚠ No key saved. ' + escapeHTML(name) + ' reviews will fail until you add one.') + '</div>';
+          html += '<div class="row" style="margin-top:10px"><label class="name">Prices</label>'
+            + customPriceField(index, 'inputPerMillion', 'Input', p.inputPerMillion)
+            + customPriceField(index, 'cachedInputPerMillion', 'Cached', p.cachedInputPerMillion)
+            + customPriceField(index, 'outputPerMillion', 'Output', p.outputPerMillion)
+            + '</div>';
+          html += '<div class="caption">USD per million tokens, written with a dot or a comma. These rates are what turn the reported tokens into a dollar figure — check them against your provider\'s current pricing. Set all three to 0 to report tokens only.</div>';
+          if (unpriced) html += '<div class="warn">⚠ No rates set, so reviews will report tokens with no cost.</div>';
+          if (!urlOK || !String(r.model || '').trim()) {
+            html += '<div class="warn" style="margin-top:8px">⚠ This model needs a valid API base URL and a model name before it will run. Until then it is skipped rather than failed, so it cannot put an error in every review.</div>';
+          }
+          html += '</div>';
+          return html;
+        }).join('');
+
+        container.querySelectorAll('[data-cr][data-field]').forEach((input) => {
+          input.addEventListener('input', () => {
+            const r = config.customReviewers[parseInt(input.dataset.cr, 10)];
+            const field = input.dataset.field;
+            if (input.type === 'checkbox') r[field] = input.checked;
+            else if (input.type === 'number') { const n = parseInt(input.value, 10); if (!isNaN(n)) r[field] = Math.min(240, Math.max(1, n)); }
+            else r[field] = input.value;
+            queueSave();
+          });
+        });
+        container.querySelectorAll('[data-customprice]').forEach((input) => {
+          input.addEventListener('input', () => {
+            const parsed = parseRate(input.value);
+            input.style.color = parsed === null ? 'var(--red)' : '';
+            if (parsed === null) return;
+            const r = config.customReviewers[parseInt(input.dataset.cr, 10)];
+            r.pricing = r.pricing || { inputPerMillion: 0, cachedInputPerMillion: 0, outputPerMillion: 0 };
+            r.pricing[input.dataset.customprice] = parsed;
+            queueSave();
+          });
+          input.addEventListener('blur', () => { if (parseRate(input.value) === null) renderCustomReviewers(); });
+        });
+        container.querySelectorAll('[data-customdraft]').forEach((input) => {
+          input.addEventListener('input', () => {
+            reviewerDrafts[input.dataset.customdraft].key = input.value;
+            const save = container.querySelector('[data-customsavekey="' + input.dataset.customdraft + '"]');
+            if (save) save.disabled = input.value.trim() === '';
+          });
+        });
+        container.querySelectorAll('[data-customsavekey]').forEach((button) => {
+          button.onclick = async () => {
+            const id = button.dataset.customsavekey;
+            const value = reviewerDrafts[id].key;
+            reviewerDrafts[id].key = '';
+            // The row itself may only exist in this page's copy of the configuration, so its
+            // pending save is flushed first — otherwise the key would be filed against an id the
+            // shell has never seen.
+            try { await saveNow(); await api('PUT', 'keys/' + encodeURIComponent(id), { key: value }); await poll(); renderCustomReviewers(); }
+            catch (e) { showError(e.message); }
+          };
+        });
+        container.querySelectorAll('[data-customremovekey]').forEach((button) => {
+          button.onclick = async () => {
+            try { await api('DELETE', 'keys/' + encodeURIComponent(button.dataset.customremovekey)); await poll(); renderCustomReviewers(); }
+            catch (e) { showError(e.message); }
+          };
+        });
+        container.querySelectorAll('[data-customremove]').forEach((button) => {
+          button.onclick = async () => {
+            const id = button.dataset.customremove;
+            config.customReviewers = config.customReviewers.filter((r) => String(r.id) !== String(id));
+            delete reviewerDrafts[id];
+            queueSave();
+            renderCustomReviewers();
+            // The key is filed under the row's id, so dropping the row without it would strand a
+            // secret nothing can reach again — there would be no card left to press Remove on.
+            try { await api('DELETE', 'keys/' + encodeURIComponent(id)); } catch (e) { /* nothing was saved */ }
+          };
+        });
+      }
+
+      function displayNameFor(r) {
+        const name = String(r.name || '').trim();
+        if (name) return name;
+        const model = String(r.model || '').trim();
+        return model || 'Custom reviewer';
+      }
+
+      function usableBaseURL(value) {
+        const trimmed = String(value || '').trim();
+        if (!trimmed) return false;
+        try {
+          const url = new URL(trimmed);
+          return (url.protocol === 'https:' || url.protocol === 'http:') && !!url.host;
+        } catch (e) { return false; }
+      }
+
+      function newReviewerID() {
+        if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          const r = Math.random() * 16 | 0;
+          return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        });
+      }
+
+      function customPriceField(index, field, label, value) {
+        return '<span style="display:inline-grid;gap:2px"><span class="caption" style="margin:0">' + label + '</span><input type="text" class="mono price" data-cr="' + index + '" data-customprice="' + field + '" value="' + renderRate(value) + '"></span>';
       }
 
       function priceField(key, field, label, value, disabled) {
@@ -678,6 +884,14 @@ enum DashboardPage {
           if (d.commandName) el.innerHTML = toolBadge(snapshot.toolAvailability[d.commandName] === true, d.commandName);
           else if (snapshot.reviewersWithSavedKey.includes(d.name)) el.innerHTML = '<span class="caption">🌐 HTTP API — key saved</span>';
           else el.innerHTML = '<span class="warn">🌐 HTTP API — no key saved</span>';
+        });
+        (config.customReviewers || []).forEach((r) => {
+          const el = document.querySelector('[data-custom-badge="' + r.id + '"]');
+          if (!el) return;
+          const hasKey = snapshot.reviewersWithSavedKey.some((id) => id.toLowerCase() === String(r.id).toLowerCase());
+          if (hasKey) el.innerHTML = '<span class="caption">🌐 HTTP API — key saved</span>';
+          else if (usableBaseURL(r.baseURL)) el.innerHTML = '<span class="warn">🌐 HTTP API — no key saved</span>';
+          else el.innerHTML = '<span class="warn">Not configured yet</span>';
         });
       }
 
@@ -711,6 +925,7 @@ enum DashboardPage {
         requestDetected: ['🔔', 'Review requested', 'blue'], reviewStarted: ['✨', 'Review started', 'blue'],
         approved: ['✅', 'Approved', 'green'], changesRequested: ['🛑', 'Changes requested', 'orange'],
         commented: ['💬', 'Comment posted', 'purple'], failed: ['❌', 'Failed', 'red'],
+        merged: ['🔀', 'Merged', 'green'],
       };
       let historyTimer = null;
       async function refreshHistory() {
@@ -768,6 +983,20 @@ enum DashboardPage {
         finally { $('addRepo').disabled = false; }
       };
       $('newRepoPath').onkeydown = (event) => { if (event.key === 'Enter') $('addRepo').click(); };
+      $('addCustomReviewer').onclick = () => {
+        config.customReviewers = config.customReviewers || [];
+        config.customReviewers.push({
+          id: newReviewerID(),
+          name: '',
+          baseURL: '',
+          model: '',
+          enabled: true,
+          pricing: { inputPerMillion: 0, cachedInputPerMillion: 0, outputPerMillion: 0 },
+          timeoutMinutes: 15,
+        });
+        queueSave();
+        renderCustomReviewers();
+      };
       document.querySelectorAll('#customPrompt, #pollInterval, #githubAccount, #maxConcurrent, #includeUsage, #maxRounds, #failureBudget, #newRepoPath').forEach((el) => el.setAttribute('data-config', ''));
 
       poll();

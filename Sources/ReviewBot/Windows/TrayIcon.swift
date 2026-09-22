@@ -5,10 +5,13 @@ import WinSDK
 struct TrayState: Sendable, Equatable {
     var status: String
     var isPaused: Bool
+    /// Discovery is in progress — the one state in which "Run now" would be a no-op.
+    var isPolling: Bool
+    /// Discovering or reviewing; what colours the icon.
     var isRunning: Bool
     var hasFailure: Bool
 
-    static let starting = TrayState(status: "Starting…", isPaused: false, isRunning: false, hasFailure: false)
+    static let starting = TrayState(status: "Starting…", isPaused: false, isPolling: false, isRunning: false, hasFailure: false)
 }
 
 enum TrayAction: Sendable {
@@ -182,7 +185,10 @@ final class TrayIcon: @unchecked Sendable {
         }
         append(1, "Open dashboard")
         _ = AppendMenuW(menu, 0x800, 0, nil) // MF_SEPARATOR
-        append(2, state.isRunning ? "Reviewing…" : "Run now", enabled: !state.isRunning)
+        // Reviews run on behind a poll, and a poll can be asked for while they do — it
+        // queues whatever is new behind them. Only a discovery already in progress makes
+        // the item pointless.
+        append(2, state.isPolling ? "Checking GitHub…" : "Run now", enabled: !state.isPolling)
         append(3, state.isPaused ? "Resume monitoring" : "Pause monitoring")
         append(4, "Open data folder")
         _ = AppendMenuW(menu, 0x800, 0, nil)

@@ -4,12 +4,17 @@ import Foundation
 /// it is kept to what changes; the history list has its own route.
 struct DashboardSnapshot: Codable {
     var status: String
+    /// Discovery is in progress. Reviews run on behind it, so this — not `isRunning` — is
+    /// what disables "Run now".
+    var isPolling: Bool
     var isRunning: Bool
     var lastCheckDate: Date?
     var toolAvailability: [String: Bool]
     /// The accounts `gh` is signed in to, for the account picker.
     var githubAccounts: GitHubAccounts
-    var reviewersWithSavedKey: [ReviewerName]
+    /// Panel seats a key resolves for, as `ReviewerIdentity.wireIdentifier` strings — a
+    /// built-in reviewer's own name, or a custom reviewer's id.
+    var reviewersWithSavedKey: [String]
     var launchAtLoginEnabled: Bool
     var pendingReviews: [ReviewQueueItem]
     /// Every review in flight: a poll reviews several pull requests at once.
@@ -24,6 +29,9 @@ struct DashboardSnapshot: Codable {
     /// The kind of the newest history entry, which is what colours the status: a failure at the
     /// top of the list is what turns the icon red.
     var lastEventKind: HistoryEventKind?
+    /// What the history says about the last 30 days of reviewing, computed here so the page
+    /// never restates the arithmetic.
+    var statistics: ReviewStatistics
     var dataFolder: String
     var version: String
     var reviewers: [ReviewerDescriptor]
@@ -76,8 +84,8 @@ protocol DashboardBackend: AnyObject {
     func togglePaused() async
     func addRepository(folder: String) async throws
     func removeRepository(id: UUID) async
-    func saveAPIKey(_ key: String, for reviewer: ReviewerName) async
-    func removeAPIKey(for reviewer: ReviewerName) async
+    func saveAPIKey(_ key: String, for reviewer: ReviewerIdentity) async
+    func removeAPIKey(for reviewer: ReviewerIdentity) async
     func setLaunchAtLogin(_ enabled: Bool) async
     func clearHistory() async
     func refreshToolAvailability() async
@@ -255,8 +263,10 @@ final class DashboardAPI: @unchecked Sendable {
         }
     }
 
-    private func reviewer(named name: String) throws -> ReviewerName {
-        guard let reviewer = ReviewerName(rawValue: name) else {
+    /// Accepts either form of `ReviewerIdentity.wireIdentifier`: a built-in reviewer's name, or
+    /// a custom reviewer's id.
+    private func reviewer(named name: String) throws -> ReviewerIdentity {
+        guard let reviewer = ReviewerIdentity(wireIdentifier: name) else {
             throw RouteError(status: 404, message: "no reviewer named \(name)")
         }
         return reviewer

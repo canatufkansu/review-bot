@@ -18,6 +18,9 @@ struct DashboardView: View {
             PromptSettingsView(settings: model.settings)
                 .tabItem { Label("Prompt", systemImage: "text.quote") }
 
+            StatisticsView(model: model)
+                .tabItem { Label("Statistics", systemImage: "chart.bar.xaxis") }
+
             HistoryView(model: model, history: model.history)
                 .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
         }
@@ -62,7 +65,7 @@ private struct GeneralSettingsView: View {
                             model.runNow()
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.isRunning)
+                        .disabled(model.isPolling)
                     }
 
                     Divider()
@@ -381,6 +384,8 @@ private struct ReviewersSettingsView: View {
                     )
                 }
 
+                CustomReviewersSection(model: model, settings: settings)
+
                 HStack {
                     Text("At least one AI reviewer must be enabled. opencode is off by default; it runs the free `opencode/deepseek-v4-flash-free` model at max reasoning effort in a read-only sandbox. DeepSeek is off by default too — it has no CLI, so it needs an API key saved on its card above before it can review.")
                         .font(.caption)
@@ -401,6 +406,172 @@ private struct ReviewersSettingsView: View {
         case .codex: $settings.configuration.codex
         case .opencode: $settings.configuration.opencode
         case .deepseek: $settings.configuration.deepseek
+        }
+    }
+}
+
+/// The panel's open end: any number of models reached over an OpenAI-compatible
+/// `chat/completions` endpoint, each its own seat in the review.
+///
+/// One card per model, not per provider — pointing two cards at the same base URL with different
+/// model names is exactly how a developer gets two models reading the same pull request.
+private struct CustomReviewersSection: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var settings: SettingsStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("More models")
+                    .font(.title2.weight(.semibold))
+                Text("Add any model reachable over an OpenAI-compatible `chat/completions` endpoint — an aggregator like OpenRouter, a provider's own compatibility endpoint, or a server on your own machine. Each one joins the panel as a full reviewer: it runs the same agent loop in the same read-only sandbox, and its verdict counts like any other.")
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach($settings.configuration.customReviewers) { $reviewer in
+                CustomReviewerCard(
+                    model: model,
+                    reviewer: $reviewer,
+                    onDelete: { remove(reviewer) }
+                )
+            }
+
+            HStack {
+                Button {
+                    settings.configuration.customReviewers.append(CustomReviewerConfiguration())
+                } label: {
+                    Label("Add a model", systemImage: "plus.circle")
+                }
+                Spacer()
+                Text("Every model you add reads the whole pull request and is billed to its own key, so the panel's cost grows with it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Removes the row and the key saved for it. The key is filed under the reviewer's id, so
+    /// leaving it behind would orphan a secret in the Keychain that nothing can ever reach
+    /// again — there would be no card left to press Remove on.
+    private func remove(_ reviewer: CustomReviewerConfiguration) {
+        settings.configuration.customReviewers.removeAll { $0.id == reviewer.id }
+        Task { await model.removeAPIKey(for: reviewer) }
+    }
+}
+
+private struct CustomReviewerCard: View {
+    @ObservedObject var model: AppModel
+    @Binding var reviewer: CustomReviewerConfiguration
+    let onDelete: () -> Void
+
+    /// The uniform settings view `PricingRow` works in, written straight back into the row's own
+    /// field so the card edits one source of truth.
+    ///
+    /// Only `pricing` is propagated, because that is the only thing `PricingRow` changes and the
+    /// other fields have their own bindings above. Writing them all back would push
+    /// `reviewerConfiguration`'s *trimmed* model over the text the developer is typing, so
+    /// editing a price would quietly reformat the model field.
+    private var configuration: Binding<ReviewerConfiguration> {
+        Binding(
+            get: { reviewer.reviewerConfiguration },
+            set: { reviewer.pricing = $0.pricing }
+        )
+    }
+
+    private var hasUsableURL: Bool { reviewer.endpointURL != nil }
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Toggle("Enable", isOn: $reviewer.enabled)
+                        .font(.headline)
+                    Spacer()
+                    if model.isCustomReviewerAvailable(reviewer) {
+                        Label("HTTP API — key saved", systemImage: "network")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Label(
+                            hasUsableURL ? "HTTP API — no key saved" : "Not configured yet",
+                            systemImage: "network"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
+                    Button(role: .destructive, action: onDelete) {
+                        Label("Remove", systemImage: "trash")
+                            .labelStyle(.iconOnly)
+                    }
+                }
+
+                HStack {
+                    Text("Name")
+                        .frame(width: 70, alignment: .leading)
+                    TextField("What to call it in the posted review", text: $reviewer.name)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                HStack {
+                    Text("API base")
+                        .frame(width: 70, alignment: .leading)
+                    TextField("https://openrouter.ai/api/v1", text: $reviewer.baseURL)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .foregroundStyle(
+                            reviewer.baseURL.isEmpty || hasUsableURL ? Color.primary : Color.red
+                        )
+                }
+
+                Text("The API root only — Review Bot appends `chat/completions` itself.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Text("Model")
+                        .frame(width: 70, alignment: .leading)
+                    TextField("Model name as the provider spells it", text: $reviewer.model)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                }
+
+                HStack {
+                    Text("Time limit")
+                        .frame(width: 70, alignment: .leading)
+                    Stepper(
+                        value: $reviewer.timeoutMinutes,
+                        in: ReviewerConfiguration.timeoutMinutesRange
+                    ) {
+                        Text("\(reviewer.timeoutMinutes) min")
+                            .font(.body.monospaced())
+                    }
+                }
+
+                Text("How long this model may spend on one review before it is cut off. It is billed to your own key, so the limit is also a spend ceiling — and a review that runs out of time contributes nothing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+
+                APIKeyRow(model: model, custom: reviewer)
+
+                PricingRow(displayName: reviewer.displayName, configuration: configuration)
+
+                if !reviewer.isRunnable {
+                    Label(
+                        "This model needs a valid API base URL and a model name before it will "
+                            + "run. Until then it is skipped rather than failed, so it cannot "
+                            + "put an error in every review.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(8)
+        } label: {
+            Label(reviewer.displayName, systemImage: "cpu")
         }
     }
 }
@@ -631,8 +802,29 @@ private struct ReviewerCard: View {
 /// Prices for providers that report tokens but not cost. Editable because published rates change
 /// and a stale built-in number would report the wrong spend without saying so.
 private struct PricingRow: View {
-    let reviewer: ReviewerName
+    /// What the caption calls this reviewer. A string rather than a `ReviewerName` because a
+    /// custom reviewer has no enum case to name it.
+    let displayName: String
+    /// Rates to offer as a Reset, or `nil` when there is no published default that could be
+    /// right — which is every custom endpoint.
+    let defaults: TokenPricing?
     @Binding var configuration: ReviewerConfiguration
+
+    init(reviewer: ReviewerName, configuration: Binding<ReviewerConfiguration>) {
+        displayName = reviewer.rawValue
+        defaults = reviewer.defaultPricing
+        _configuration = configuration
+    }
+
+    init(
+        displayName: String,
+        defaults: TokenPricing? = nil,
+        configuration: Binding<ReviewerConfiguration>
+    ) {
+        self.displayName = displayName
+        self.defaults = defaults
+        _configuration = configuration
+    }
 
     private var pricing: Binding<TokenPricing> {
         Binding(
@@ -656,14 +848,15 @@ private struct PricingRow: View {
                 PriceField(label: "Cached", value: pricing.cachedInputPerMillion)
                 PriceField(label: "Output", value: pricing.outputPerMillion)
                 // The reviewer's own rates, not DeepSeek's: this row is reached through
-                // `needsConfiguredPricing`, which a second such provider would also satisfy.
-                if let defaults = reviewer.defaultPricing {
+                // `needsConfiguredPricing`, which a second such provider would also satisfy —
+                // and a custom endpoint has no defaults at all, so it gets no button.
+                if let defaults {
                     Button("Reset") { configuration.pricing = defaults }
                         .disabled(configuration.pricing == defaults)
                 }
             }
 
-            Text("USD per million tokens, written with a dot or a comma. \(reviewer.rawValue) reports tokens but not cost, so these rates are what turn them into a dollar figure — check them against your provider's current pricing. Set all three to 0 to report tokens only.")
+            Text("USD per million tokens, written with a dot or a comma. \(displayName) reports tokens but not cost, so these rates are what turn them into a dollar figure — check them against your provider's current pricing. Set all three to 0 to report tokens only.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -728,10 +921,23 @@ private struct PriceField: View {
 
 private struct APIKeyRow: View {
     @ObservedObject var model: AppModel
-    let reviewer: ReviewerName
+    let identity: ReviewerIdentity
+    let displayName: String
     @State private var draft = ""
 
-    private var hasSavedKey: Bool { model.reviewersWithSavedKey.contains(reviewer) }
+    init(model: AppModel, reviewer: ReviewerName) {
+        self.model = model
+        identity = .builtIn(reviewer)
+        displayName = reviewer.rawValue
+    }
+
+    init(model: AppModel, custom: CustomReviewerConfiguration) {
+        self.model = model
+        identity = custom.identity
+        displayName = custom.displayName
+    }
+
+    private var hasSavedKey: Bool { model.reviewersWithSavedKey.contains(identity) }
 
     private var trimmedDraft: String {
         draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -745,18 +951,18 @@ private struct APIKeyRow: View {
                 SecureField(
                     hasSavedKey
                         ? "A key is saved — type a new one to replace it"
-                        : "Paste your \(reviewer.rawValue) API key",
+                        : "Paste your \(displayName) API key",
                     text: $draft
                 )
                 .textFieldStyle(.roundedBorder)
                 Button("Save") {
                     let key = draft
                     draft = ""
-                    Task { await model.saveAPIKey(key, for: reviewer) }
+                    Task { await model.saveAPIKey(key, for: identity, named: displayName) }
                 }
                 .disabled(trimmedDraft.isEmpty)
                 Button("Remove", role: .destructive) {
-                    Task { await model.removeAPIKey(for: reviewer) }
+                    Task { await model.removeAPIKey(for: identity, named: displayName) }
                 }
                 .disabled(!hasSavedKey)
             }
@@ -764,7 +970,7 @@ private struct APIKeyRow: View {
             Label(
                 hasSavedKey
                     ? "Saved in your macOS Keychain, never in config.json."
-                    : "No key saved. \(reviewer.rawValue) reviews will fail until you add one.",
+                    : "No key saved. \(displayName) reviews will fail until you add one.",
                 systemImage: hasSavedKey ? "key.fill" : "exclamationmark.triangle.fill"
             )
             .font(.caption)
@@ -932,6 +1138,139 @@ private struct PromptSettingsView: View {
     }
 }
 
+private struct StatisticsView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let stats = model.statistics
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Review statistics")
+                        .font(.title2.weight(.semibold))
+                    Text("What Review Bot posted in the last \(stats.windowDays) days, how fast, and whether its change requests were acted on. Computed from the activity history on this Mac.")
+                        .foregroundStyle(.secondary)
+                }
+
+                StatisticsGroup(title: "Decisions posted") {
+                    StatisticTile(title: "Reviews", value: "\(stats.reviewsPosted)", detail: "\(stats.failed) failed")
+                    StatisticTile(title: "Approved", value: "\(stats.approved)", tint: .green)
+                    StatisticTile(title: "Changes requested", value: "\(stats.changesRequested)", tint: .orange)
+                    StatisticTile(title: "Comments", value: "\(stats.commented)", tint: .purple)
+                }
+
+                StatisticsGroup(title: "Speed") {
+                    StatisticTile(
+                        title: "Review duration",
+                        value: ReviewStatistics.describe(seconds: stats.averageDurationSeconds),
+                        detail: "median \(ReviewStatistics.describe(seconds: stats.medianDurationSeconds)) · last \(ReviewStatistics.describe(seconds: stats.lastDurationSeconds))",
+                        help: "From checkout to the posted decision, averaged over the window. Refreshed after every review."
+                    )
+                    StatisticTile(
+                        title: "Response time",
+                        value: ReviewStatistics.describe(seconds: stats.averageResponseSeconds),
+                        detail: "median \(ReviewStatistics.describe(seconds: stats.medianResponseSeconds))",
+                        help: "From the review request on GitHub to the posted decision — includes time spent waiting for a poll and in the queue."
+                    )
+                }
+
+                StatisticsGroup(title: "Follow-through") {
+                    StatisticTile(
+                        title: "Change requests acted on",
+                        value: ReviewStatistics.describe(rate: stats.changesRequestedThenApprovedRate),
+                        detail: "\(stats.changesRequestedThenApproved) of \(stats.pullRequestsWithChangesRequested) pull requests later approved",
+                        tint: .orange,
+                        help: "A change request counts as acted on when Review Bot later approved the same pull request at a different commit."
+                    )
+                    StatisticTile(
+                        title: "…and merged",
+                        value: ReviewStatistics.describe(rate: stats.changesRequestedThenMergedRate),
+                        detail: "\(stats.changesRequestedThenMerged) of \(stats.pullRequestsWithChangesRequested) merged after the request",
+                        tint: .orange
+                    )
+                    StatisticTile(
+                        title: "Rounds to approval",
+                        value: stats.averageRoundsToApproval.map { String(format: "%.2f", $0) } ?? "—",
+                        detail: "change requests before an approval followed",
+                        help: "1.00 means every change request was resolved in one round."
+                    )
+                    StatisticTile(
+                        title: "Approvals merged",
+                        value: ReviewStatistics.describe(rate: stats.approvedThenMergedRate),
+                        detail: "\(stats.approvedThenMerged) of \(stats.pullRequestsApproved) approved pull requests",
+                        tint: .green
+                    )
+                }
+
+                StatisticsGroup(title: "Metered spend") {
+                    StatisticTile(
+                        title: "Tokens",
+                        value: TokenUsage.abbreviated(stats.totalTokens),
+                        detail: "reviewers billed per token only"
+                    )
+                    StatisticTile(
+                        title: "Cost",
+                        value: stats.totalCostUSD.map { String(format: "$%.2f", $0) } ?? (stats.totalTokens > 0 ? "unknown" : "—"),
+                        detail: stats.totalCostUSD == nil && stats.totalTokens > 0 ? "a review's cost could not be priced" : ""
+                    )
+                }
+
+                if stats.reviewsPosted == 0 {
+                    Text("No reviews were posted in this window yet. Figures fill in as Review Bot reviews pull requests.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.top, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct StatisticsGroup<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 10)], alignment: .leading, spacing: 10) {
+                content
+            }
+        }
+    }
+}
+
+private struct StatisticTile: View {
+    let title: String
+    let value: String
+    var detail: String = ""
+    var tint: Color = .primary
+    var help: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(tint)
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 64, alignment: .topLeading)
+        .padding(10)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+        .help(help)
+    }
+}
+
 private struct HistoryView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryStore
@@ -973,7 +1312,7 @@ private struct HistoryView: View {
             isPresented: $confirmClear,
             titleVisibility: .visible
         ) {
-            Button("Clear history", role: .destructive) { history.clear() }
+            Button("Clear history", role: .destructive) { model.clearHistory() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Generated review files and detailed logs will remain on disk.")

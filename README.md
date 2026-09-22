@@ -9,7 +9,9 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
 - Add and independently enable multiple local Git repositories.
 - Poll every 5, 15, or 30 minutes, or every hour.
 - Pause and resume automatic monitoring from the menu bar or settings.
-- See explicit Pending and Running review queues in the menu-bar popover.
+- See explicit Pending and Running review queues in the menu-bar popover, with the average review time refreshed after every review.
+- A Statistics tab: decisions posted over the last 30 days, review duration, response time from the GitHub request to the decision, and how many of its change requests were acted on and merged.
+- Keeps checking GitHub on its interval while reviews run, so a request that arrives mid-queue joins the queue rather than waiting for it to drain.
 - Run an immediate manual check even while monitoring is paused.
 - Independently enable Claude, Codex, opencode, and DeepSeek and configure each model and effort level.
 - Choose per reviewer whether to use its signed-in CLI or an API key held in the macOS Keychain (Claude and Codex; DeepSeek is key-only, and opencode authenticates through its own configuration).

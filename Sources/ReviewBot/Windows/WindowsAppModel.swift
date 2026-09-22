@@ -7,11 +7,15 @@ import Foundation
 @MainActor
 final class WindowsAppModel: DashboardBackend {
     private(set) var status = "Starting…"
-    private(set) var isRunning = false
+    /// A discovery pass is in progress. Reviews outlive it — see `isRunning`.
+    private(set) var isPolling = false
+    /// Whether Review Bot is doing anything: discovering requests or reviewing one.
+    var isRunning: Bool { isPolling || !runningReviews.isEmpty }
     private(set) var lastCheckDate: Date?
     private(set) var toolAvailability: [String: Bool] = [:]
     private(set) var githubAccounts: GitHubAccounts = .none
-    private(set) var reviewersWithSavedKey: Set<ReviewerName> = []
+    /// Panel seats a key currently resolves for, built-in and custom alike.
+    private(set) var reviewersWithSavedKey: Set<ReviewerIdentity> = []
     private(set) var pendingReviews: [ReviewQueueItem] = []
     /// Every review running right now — a poll reviews several pull requests at once.
     private(set) var runningReviews: [ReviewQueueItem] = []
@@ -69,6 +73,7 @@ final class WindowsAppModel: DashboardBackend {
         TrayState(
             status: status,
             isPaused: settings.configuration.isPaused,
+            isPolling: isPolling,
             isRunning: isRunning,
             hasFailure: history.entries.first?.kind == .failed
         )
@@ -114,11 +119,19 @@ final class WindowsAppModel: DashboardBackend {
         errorMessage = nil
         return DashboardSnapshot(
             status: status,
+            isPolling: isPolling,
             isRunning: isRunning,
             lastCheckDate: lastCheckDate,
             toolAvailability: toolAvailability,
             githubAccounts: githubAccounts,
-            reviewersWithSavedKey: ReviewerName.allCases.filter { reviewersWithSavedKey.contains($0) },
+            // Ordered the way the panel is — built-ins first, then the custom rows as
+            // configured — so the page never has to sort them.
+            reviewersWithSavedKey: (
+                ReviewerName.allCases.map(ReviewerIdentity.builtIn)
+                    + settings.configuration.customReviewers.map(\.identity)
+            )
+            .filter { reviewersWithSavedKey.contains($0) }
+            .map(\.wireIdentifier),
             launchAtLoginEnabled: WindowsShell.LaunchAtLogin.isEnabled,
             pendingReviews: pendingReviews,
             runningReviews: runningReviews,
@@ -127,6 +140,7 @@ final class WindowsAppModel: DashboardBackend {
             configurationVersion: configurationVersion,
             historyCount: history.entries.count,
             lastEventKind: history.entries.first?.kind,
+            statistics: ReviewStatistics.compute(from: history.entries),
             dataFolder: WindowsShell.nativePath(paths.root),
             version: WindowsShell.version,
             reviewers: ReviewerDescriptor.all
@@ -141,16 +155,20 @@ final class WindowsAppModel: DashboardBackend {
         let authModesChanged = ReviewerName.allCases.contains {
             settings.configuration.settings(for: $0).authMode != configuration.settings(for: $0).authMode
         }
+        // A custom reviewer added or removed changes which keys have to be resolved just as an
+        // auth-mode flip does, and the badges on its card read that resolution.
+        let customReviewersChanged = settings.configuration.customReviewers.map(\.id)
+            != configuration.customReviewers.map(\.id)
         settings.configuration = configuration
         configurationChanged()
-        if authModesChanged {
+        if authModesChanged || customReviewersChanged {
             await refreshSavedKeys()
         }
         return configurationVersion
     }
 
     func runNow() {
-        guard !isRunning else { return }
+        guard !isPolling else { return }
         Task { [weak self] in
             await self?.performPoll(manual: true)
         }
@@ -182,50 +200,67 @@ final class WindowsAppModel: DashboardBackend {
         configurationChanged()
     }
 
-    func saveAPIKey(_ key: String, for reviewer: ReviewerName) async {
+    /// What to call a panel seat in a status line. A custom reviewer's name comes from its row;
+    /// a row that has since been deleted falls back to its id so the message still identifies
+    /// something rather than going blank.
+    private func displayName(for reviewer: ReviewerIdentity) -> String {
+        switch reviewer {
+        case let .builtIn(name):
+            return name.rawValue
+        case let .custom(id):
+            return settings.configuration.customReviewers
+                .first { $0.id == id }?
+                .displayName
+                ?? id.uuidString
+        }
+    }
+
+    func saveAPIKey(_ key: String, for reviewer: ReviewerIdentity) async {
+        let name = displayName(for: reviewer)
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         let outcome = await performCredentialWrite(for: reviewer) { store in
             try store.setAPIKey(trimmed, for: reviewer)
         }
         if let failure = outcome.failure {
-            report("Could not save the \(reviewer.rawValue) API key: \(failure)")
+            report("Could not save the \(name) API key: \(failure)")
             return
         }
         updateSavedKeyPanel(outcome, for: reviewer)
         if outcome.effective == nil {
-            status = "Saved the \(reviewer.rawValue) API key, but it could not be read back"
+            status = "Saved the \(name) API key, but it could not be read back"
         } else if outcome.effective != trimmed {
             // The environment takes precedence over the Credential Manager, so a variable set
             // in this app's environment would shadow the key that was just saved. Say so rather
             // than report a save that will not be the one used.
             status = """
-            Saved the \(reviewer.rawValue) API key, but \
+            Saved the \(name) API key, but \
             \(reviewer.apiKeyOverrideEnvironmentVariable) is set in this app's environment \
             and takes precedence over it
             """
         } else {
-            status = "Saved the \(reviewer.rawValue) API key to the Windows Credential Manager"
+            status = "Saved the \(name) API key to the Windows Credential Manager"
         }
         changed()
     }
 
-    func removeAPIKey(for reviewer: ReviewerName) async {
+    func removeAPIKey(for reviewer: ReviewerIdentity) async {
+        let name = displayName(for: reviewer)
         let outcome = await performCredentialWrite(for: reviewer) { store in
             try store.removeAPIKey(for: reviewer)
         }
         if let failure = outcome.failure {
-            report("Could not remove the \(reviewer.rawValue) API key: \(failure)")
+            report("Could not remove the \(name) API key: \(failure)")
             return
         }
         updateSavedKeyPanel(outcome, for: reviewer)
         if outcome.effective != nil {
             status = """
-            Removed the \(reviewer.rawValue) API key, but \
+            Removed the \(name) API key, but \
             \(reviewer.apiKeyOverrideEnvironmentVariable) is still set in this app's \
             environment and will be used
             """
         } else {
-            status = "Removed the \(reviewer.rawValue) API key from the Windows Credential Manager"
+            status = "Removed the \(name) API key from the Windows Credential Manager"
         }
         changed()
     }
@@ -281,13 +316,16 @@ final class WindowsAppModel: DashboardBackend {
     }
 
     func refreshSavedKeys() async {
-        let resolved = await ResolvedCredentials.resolve(
-            ReviewerName.allCases.filter { reviewer in
+        let builtIn = ReviewerName.allCases
+            .filter { reviewer in
                 reviewer.supportsAPIKeyAuth
                     && settings.configuration.settings(for: reviewer).authMode == .apiKey
-            },
-            from: credentials
-        )
+            }
+            .map(ReviewerIdentity.builtIn)
+        // Every custom reviewer is an HTTP endpoint, so all of them are key-mode by
+        // construction — there is no session alternative to skip for.
+        let custom = settings.configuration.customReviewers.map(\.identity)
+        let resolved = await ResolvedCredentials.resolve(builtIn + custom, from: credentials)
         reviewersWithSavedKey = resolved.reviewersWithKey
     }
 
@@ -297,7 +335,7 @@ final class WindowsAppModel: DashboardBackend {
     }
 
     private func performCredentialWrite(
-        for reviewer: ReviewerName,
+        for reviewer: ReviewerIdentity,
         _ body: @escaping @Sendable (any CredentialStoring) throws -> Void
     ) async -> CredentialWriteOutcome {
         let store = credentials
@@ -311,7 +349,10 @@ final class WindowsAppModel: DashboardBackend {
         }.value
     }
 
-    private func updateSavedKeyPanel(_ outcome: CredentialWriteOutcome, for reviewer: ReviewerName) {
+    private func updateSavedKeyPanel(
+        _ outcome: CredentialWriteOutcome,
+        for reviewer: ReviewerIdentity
+    ) {
         if outcome.effective == nil {
             reviewersWithSavedKey.remove(reviewer)
         } else {
@@ -331,33 +372,47 @@ final class WindowsAppModel: DashboardBackend {
             } else {
                 let interval = TimeInterval(max(1, settings.configuration.pollIntervalMinutes) * 60)
                 let pollIsDue = lastCheckDate.map { Date().timeIntervalSince($0) >= interval } ?? true
-                if pollIsDue, !isRunning {
+                // Polling is gated on discovery alone, not on the reviews: they keep running
+                // behind the poll, and a poll that finds a new request while they do simply
+                // queues it behind them.
+                if pollIsDue, !isPolling {
                     await performPoll()
                 }
             }
+            await reconcileQueueWithEngine()
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    private func performPoll(manual: Bool = false) async {
-        guard !isRunning else { return }
-        isRunning = true
-        changed()
-        defer {
-            isRunning = false
-            lastCheckDate = Date()
-            // A poll reviews every request it discovers before returning, so nothing should
-            // remain queued afterward. Reset defensively so a missed or out-of-order terminal
-            // event can never leave a stale count on the page.
+    /// Nothing should be shown as queued or running once the engine's queue is empty. Reset
+    /// defensively so a missed or out-of-order terminal event can never leave a stale count
+    /// on the page.
+    private func reconcileQueueWithEngine() async {
+        guard !pendingReviews.isEmpty || !runningReviews.isEmpty else { return }
+        if await engine.isIdle() {
             pendingReviews.removeAll()
             runningReviews.removeAll()
             changed()
         }
+    }
+
+    private func performPoll(manual: Bool = false) async {
+        guard !isPolling else { return }
+        isPolling = true
+        changed()
+        defer {
+            isPolling = false
+            lastCheckDate = Date()
+            changed()
+        }
 
         let configuration = settings.configuration
+        // Returns once discovery is done; the reviews it queued carry on and report through
+        // the same sinks.
         await engine.poll(
             configuration: configuration,
             manual: manual,
+            awaitCompletion: false,
             onEvent: { [weak self] entry in
                 await MainActor.run {
                     self?.history.append(entry)
@@ -387,6 +442,8 @@ final class WindowsAppModel: DashboardBackend {
         case .approved, .changesRequested, .commented, .failed:
             pendingReviews.removeAll(where: { $0.id == item.id })
             runningReviews.removeAll(where: { $0.id == item.id })
+        case .merged:
+            break
         }
     }
 }

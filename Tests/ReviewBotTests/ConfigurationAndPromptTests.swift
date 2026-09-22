@@ -104,7 +104,7 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertEqual(configuration.codex.authMode, .session)
         XCTAssertFalse(configuration.deepseek.enabled)
         XCTAssertEqual(configuration.deepseek.model, "deepseek-chat")
-        XCTAssertEqual(configuration.enabledReviewers.map(\.name), [.claude])
+        XCTAssertEqual(configuration.enabledReviewers.compactMap(\.name), [.claude])
     }
 
     func testOpencodeIsAlwaysSessionAuthEvenIfConfigSaysOtherwise() throws {
@@ -173,7 +173,7 @@ final class ConfigurationAndPromptTests: XCTestCase {
 
         // There is no DeepSeek CLI to borrow a session from.
         XCTAssertEqual(configuration.deepseek.authMode, .apiKey)
-        XCTAssertEqual(configuration.enabledReviewers.map(\.name), [.deepseek])
+        XCTAssertEqual(configuration.enabledReviewers.compactMap(\.name), [.deepseek])
     }
 
     func testAuthModeRoundTripsAndConfigurationNeverCarriesTheKey() throws {
@@ -206,17 +206,197 @@ final class ConfigurationAndPromptTests: XCTestCase {
         // `runReconciliation` walks when picking an adjudicator. DeepSeek is last so the one
         // reviewer that always bills a key never adjudicates while a CLI is available.
         XCTAssertEqual(
-            configuration.enabledReviewers.map(\.name),
+            configuration.enabledReviewers.compactMap(\.name),
             [.claude, .codex, .opencode, .deepseek]
         )
-        XCTAssertEqual(configuration.enabledReviewers.map(\.name), ReviewerName.allCases)
+        XCTAssertEqual(configuration.enabledReviewers.compactMap(\.name), ReviewerName.allCases)
 
         // Disabling one reviewer removes it without disturbing the order of the rest.
         configuration.codex.enabled = false
         XCTAssertEqual(
-            configuration.enabledReviewers.map(\.name),
+            configuration.enabledReviewers.compactMap(\.name),
             [.claude, .opencode, .deepseek]
         )
+    }
+
+    /// The panel's open end. Custom reviewers sit after the built-ins so the posted review reads
+    /// in a stable order, and a half-filled row is skipped rather than run — otherwise every
+    /// review would carry one failed reviewer for as long as someone was still typing.
+    func testCustomReviewersJoinThePanelAfterTheBuiltInsWhenTheyAreRunnable() {
+        var configuration = ReviewBotConfiguration.default
+        configuration.codex.enabled = false
+        configuration.opencode.enabled = false
+        configuration.deepseek.enabled = false
+
+        let ready = CustomReviewerConfiguration(
+            name: "Gemini",
+            baseURL: "https://example.test/v1",
+            model: "gemini-pro"
+        )
+        let noModel = CustomReviewerConfiguration(
+            name: "Half typed",
+            baseURL: "https://example.test/v1",
+            model: "   "
+        )
+        let badURL = CustomReviewerConfiguration(
+            name: "Bad URL",
+            baseURL: "not a url",
+            model: "some-model"
+        )
+        var switchedOff = ready
+        switchedOff.id = UUID()
+        switchedOff.enabled = false
+
+        configuration.customReviewers = [ready, noModel, badURL, switchedOff]
+
+        let panel = configuration.enabledReviewers
+        XCTAssertEqual(panel.compactMap(\.name), [.claude])
+        XCTAssertEqual(panel.map(\.displayName), ["Claude", "Gemini"])
+        XCTAssertEqual(panel.last?.identity, .custom(ready.id))
+        // Uniform settings: the engine must be able to treat it exactly like DeepSeek.
+        XCTAssertEqual(panel.last?.configuration.model, "gemini-pro")
+        XCTAssertEqual(panel.last?.configuration.authMode, .apiKey)
+    }
+
+    /// Nothing stops two rows being given the same name, and two identically labelled panels in
+    /// one review are indistinguishable — to a reader, and to the adjudicator, which is handed
+    /// each review under its reviewer's name.
+    func testTwoReviewersWithTheSameNameAreDistinguishedInThePanel() {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.opencode.enabled = false
+        configuration.deepseek.enabled = false
+        configuration.customReviewers = [
+            CustomReviewerConfiguration(
+                name: "OpenRouter",
+                baseURL: "https://example.test/v1",
+                model: "gemini-pro"
+            ),
+            CustomReviewerConfiguration(
+                name: "OpenRouter",
+                baseURL: "https://example.test/v1",
+                model: "grok-4"
+            ),
+            CustomReviewerConfiguration(
+                name: "OpenRouter",
+                baseURL: "https://example.test/v1",
+                model: "grok-4"
+            ),
+        ]
+
+        XCTAssertEqual(
+            configuration.enabledReviewers.map(\.displayName),
+            ["OpenRouter (gemini-pro)", "OpenRouter (grok-4)", "OpenRouter (grok-4) 2"]
+        )
+        // Disambiguation is display only: the identity a key is filed under is untouched.
+        XCTAssertEqual(
+            configuration.enabledReviewers.map(\.identity),
+            configuration.customReviewers.map(\.identity)
+        )
+        // A name that is already unique is left exactly as it was typed.
+        configuration.claude.enabled = true
+        XCTAssertEqual(configuration.enabledReviewers.first?.displayName, "Claude")
+    }
+
+    /// A custom reviewer's identity is its id, not its name — so renaming one, or pointing it at
+    /// a different model, must not orphan the key saved for it.
+    func testACustomReviewersCredentialIdentitySurvivesRenaming() {
+        var reviewer = CustomReviewerConfiguration(
+            name: "Gemini",
+            baseURL: "https://example.test/v1",
+            model: "gemini-pro"
+        )
+        let account = reviewer.identity.credentialAccount
+        let variable = reviewer.identity.apiKeyOverrideEnvironmentVariable
+
+        reviewer.name = "Something else"
+        reviewer.model = "another-model"
+
+        XCTAssertEqual(reviewer.identity.credentialAccount, account)
+        XCTAssertEqual(reviewer.identity.apiKeyOverrideEnvironmentVariable, variable)
+        // And it cannot collide with a built-in reviewer's account, which is its own name.
+        XCTAssertFalse(ReviewerName.allCases.map(\.rawValue).contains(account))
+    }
+
+    /// A blank name still has to identify something: the posted panel puts every reviewer's name
+    /// in a heading, and an empty one reads as a review from nobody.
+    func testACustomReviewerAlwaysHasADisplayName() {
+        XCTAssertEqual(
+            CustomReviewerConfiguration(name: "  Kimi  ", model: "kimi-k2").displayName,
+            "Kimi"
+        )
+        XCTAssertEqual(
+            CustomReviewerConfiguration(name: "   ", model: "kimi-k2").displayName,
+            "kimi-k2"
+        )
+        XCTAssertEqual(CustomReviewerConfiguration().displayName, "Custom reviewer")
+    }
+
+    /// Only http(s) reaches the network, and the check happens in the model rather than at the
+    /// call site so a row that cannot run is never scheduled in the first place.
+    func testOnlyAnHTTPBaseURLMakesACustomReviewerRunnable() {
+        func reviewer(_ url: String) -> CustomReviewerConfiguration {
+            CustomReviewerConfiguration(baseURL: url, model: "m")
+        }
+        XCTAssertTrue(reviewer("https://openrouter.ai/api/v1").isRunnable)
+        XCTAssertTrue(reviewer("http://127.0.0.1:1234/v1").isRunnable)
+        XCTAssertFalse(reviewer("file:///etc/passwd").isRunnable)
+        XCTAssertFalse(reviewer("openrouter.ai/api/v1").isRunnable)
+        XCTAssertFalse(reviewer("").isRunnable)
+    }
+
+    /// Custom reviewers are stored in `config.json` like everything else, and decode as
+    /// defensively — a row missing every optional field loads rather than taking the whole
+    /// configuration down with it.
+    func testCustomReviewersRoundTripAndDecodeDefensively() throws {
+        var configuration = ReviewBotConfiguration.default
+        configuration.customReviewers = [
+            CustomReviewerConfiguration(
+                name: "Gemini",
+                baseURL: "https://example.test/v1",
+                model: "gemini-pro",
+                pricing: TokenPricing(
+                    inputPerMillion: 1,
+                    cachedInputPerMillion: 0.5,
+                    outputPerMillion: 2
+                ),
+                timeoutMinutes: 20
+            ),
+        ]
+
+        let data = try JSONEncoder().encode(configuration)
+        let decoded = try JSONDecoder().decode(ReviewBotConfiguration.self, from: data)
+        XCTAssertEqual(decoded.customReviewers, configuration.customReviewers)
+        XCTAssertEqual(
+            decoded.settings(for: .custom(configuration.customReviewers[0].id)).model,
+            "gemini-pro"
+        )
+
+        // A configuration written before custom reviewers existed has no such key at all.
+        let legacy = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(#"{"pollIntervalMinutes":15}"#.utf8)
+        )
+        XCTAssertEqual(legacy.customReviewers, [])
+
+        // A row with nothing but a name still loads, and gets an id of its own.
+        let sparse = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(#"{"customReviewers":[{"name":"Half"}]}"#.utf8)
+        )
+        XCTAssertEqual(sparse.customReviewers.count, 1)
+        XCTAssertEqual(sparse.customReviewers[0].displayName, "Half")
+        XCTAssertFalse(sparse.customReviewers[0].isRunnable)
+    }
+
+    /// A custom id that is no longer in the list — a row deleted while a review it was part of
+    /// was still in flight — must resolve rather than trap, and must not look metered.
+    func testSettingsForADeletedCustomReviewerResolveToADisabledPlaceholder() {
+        let configuration = ReviewBotConfiguration.default
+        let settings = configuration.settings(for: .custom(UUID()))
+        XCTAssertFalse(settings.enabled)
+        XCTAssertEqual(settings.authMode, .session)
     }
 
     func testSettingsLookupReturnsEachReviewersOwnConfiguration() {

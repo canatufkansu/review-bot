@@ -57,16 +57,16 @@ final class DashboardTests: XCTestCase {
         var configuration = ReviewBotConfiguration.default
         var version = 1
         var actions: [String] = []
-        var keys: [ReviewerName: String] = [:]
+        var keys: [ReviewerIdentity: String] = [:]
 
         func snapshot() -> DashboardSnapshot {
             DashboardSnapshot(
-                status: "Watching", isRunning: false, lastCheckDate: nil, toolAvailability: [:],
+                status: "Watching", isPolling: false, isRunning: false, lastCheckDate: nil, toolAvailability: [:],
                 githubAccounts: GitHubAccounts(accounts: ["alice"], active: "alice"),
-                reviewersWithSavedKey: Array(keys.keys), launchAtLoginEnabled: false,
+                reviewersWithSavedKey: keys.keys.map(\.wireIdentifier), launchAtLoginEnabled: false,
                 pendingReviews: [], runningReviews: [], errorMessage: nil,
                 configuration: configuration, configurationVersion: version, historyCount: 0,
-                lastEventKind: nil, dataFolder: "C:\\data", version: "test",
+                lastEventKind: nil, statistics: .empty, dataFolder: "C:\\data", version: "test",
                 reviewers: ReviewerDescriptor.all
             )
         }
@@ -84,8 +84,8 @@ final class DashboardTests: XCTestCase {
             if folder.contains("bad") { throw NotARepository() }
         }
         func removeRepository(id: UUID) { actions.append("remove \(id)") }
-        func saveAPIKey(_ key: String, for reviewer: ReviewerName) { keys[reviewer] = key }
-        func removeAPIKey(for reviewer: ReviewerName) { keys[reviewer] = nil }
+        func saveAPIKey(_ key: String, for reviewer: ReviewerIdentity) { keys[reviewer] = key }
+        func removeAPIKey(for reviewer: ReviewerIdentity) { keys[reviewer] = nil }
         func setLaunchAtLogin(_ enabled: Bool) { actions.append("launch \(enabled)") }
         func clearHistory() { actions.append("clearHistory") }
         func refreshToolAvailability() { actions.append("refreshTools") }
@@ -232,12 +232,31 @@ final class DashboardTests: XCTestCase {
 
         let saved = await api.handle(request("PUT", "/api/keys/DeepSeek", body: "{\"key\":\"sk-1\"}"))
         XCTAssertEqual(saved.status, 204)
-        XCTAssertEqual(backend.keys, [.deepseek: "sk-1"])
+        XCTAssertEqual(backend.keys, [.builtIn(.deepseek): "sk-1"])
 
         let unknown = await api.handle(request("PUT", "/api/keys/Gemini", body: "{\"key\":\"sk-1\"}"))
         XCTAssertEqual(unknown.status, 404)
 
         let removed = await api.handle(request("DELETE", "/api/keys/DeepSeek"))
+        XCTAssertEqual(removed.status, 204)
+        XCTAssertEqual(backend.keys, [:])
+    }
+
+    /// A custom reviewer is addressed by its id on the same route, so the page needs no second
+    /// endpoint for the models a developer adds themselves.
+    @MainActor
+    func testKeysAreSavedForACustomReviewerByItsID() async throws {
+        let backend = FakeBackend()
+        let api = DashboardAPI(backend: backend, token: "secret")
+        let id = UUID()
+
+        let saved = await api.handle(
+            request("PUT", "/api/keys/\(id.uuidString)", body: "{\"key\":\"sk-custom\"}")
+        )
+        XCTAssertEqual(saved.status, 204)
+        XCTAssertEqual(backend.keys, [.custom(id): "sk-custom"])
+
+        let removed = await api.handle(request("DELETE", "/api/keys/\(id.uuidString)"))
         XCTAssertEqual(removed.status, 204)
         XCTAssertEqual(backend.keys, [:])
     }

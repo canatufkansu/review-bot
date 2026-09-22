@@ -10,9 +10,23 @@ import Foundation
 /// the only way in. opencode is neither: it authenticates through its own configuration
 /// directory, so Review Bot has nowhere to put a key for it even if one were stored.
 protocol CredentialStoring: Sendable {
-    func apiKey(for reviewer: ReviewerName) -> String?
-    func setAPIKey(_ key: String, for reviewer: ReviewerName) throws
-    func removeAPIKey(for reviewer: ReviewerName) throws
+    func apiKey(for reviewer: ReviewerIdentity) -> String?
+    func setAPIKey(_ key: String, for reviewer: ReviewerIdentity) throws
+    func removeAPIKey(for reviewer: ReviewerIdentity) throws
+}
+
+/// The built-in reviewers are addressed by name in most of the app, so the identity wrapping is
+/// done here rather than at two dozen call sites.
+extension CredentialStoring {
+    func apiKey(for reviewer: ReviewerName) -> String? { apiKey(for: .builtIn(reviewer)) }
+
+    func setAPIKey(_ key: String, for reviewer: ReviewerName) throws {
+        try setAPIKey(key, for: .builtIn(reviewer))
+    }
+
+    func removeAPIKey(for reviewer: ReviewerName) throws {
+        try removeAPIKey(for: .builtIn(reviewer))
+    }
 }
 
 enum CredentialStoreError: LocalizedError {
@@ -44,12 +58,19 @@ enum EnvironmentCredentialOverride {
     /// panel report a key as being "in effect" for a reviewer that ignores it. The predicate is
     /// derived from the reviewer's own surface, so a reviewer that later gains a key variable
     /// starts being answered again without a change here.
-    static func apiKey(for reviewer: ReviewerName, in environment: [String: String]) -> String? {
-        guard reviewer.supportsAPIKeyAuth else { return nil }
+    static func apiKey(
+        for reviewer: ReviewerIdentity,
+        in environment: [String: String]
+    ) -> String? {
+        guard reviewer.acceptsAPIKey else { return nil }
         let value = environment[reviewer.apiKeyOverrideEnvironmentVariable]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let value, !value.isEmpty else { return nil }
         return value
+    }
+
+    static func apiKey(for reviewer: ReviewerName, in environment: [String: String]) -> String? {
+        apiKey(for: .builtIn(reviewer), in: environment)
     }
 }
 
@@ -61,19 +82,26 @@ enum EnvironmentCredentialOverride {
 /// handed it, so guarding would hide a mis-wiring rather than prevent one.
 final class InMemoryCredentialStore: CredentialStoring, @unchecked Sendable {
     private let lock = NSLock()
-    private var keys: [ReviewerName: String]
+    private var keys: [ReviewerIdentity: String]
 
-    init(keys: [ReviewerName: String] = [:]) {
+    init(keys: [ReviewerIdentity: String] = [:]) {
         self.keys = keys
     }
 
-    func apiKey(for reviewer: ReviewerName) -> String? {
+    /// Convenience for the common case of seeding built-in reviewers by name.
+    convenience init(keys: [ReviewerName: String]) {
+        self.init(keys: Dictionary(
+            uniqueKeysWithValues: keys.map { (ReviewerIdentity.builtIn($0.key), $0.value) }
+        ))
+    }
+
+    func apiKey(for reviewer: ReviewerIdentity) -> String? {
         lock.lock()
         defer { lock.unlock() }
         return keys[reviewer]
     }
 
-    func setAPIKey(_ key: String, for reviewer: ReviewerName) throws {
+    func setAPIKey(_ key: String, for reviewer: ReviewerIdentity) throws {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock()
         defer { lock.unlock() }
@@ -84,7 +112,7 @@ final class InMemoryCredentialStore: CredentialStoring, @unchecked Sendable {
         }
     }
 
-    func removeAPIKey(for reviewer: ReviewerName) throws {
+    func removeAPIKey(for reviewer: ReviewerIdentity) throws {
         lock.lock()
         defer { lock.unlock() }
         keys.removeValue(forKey: reviewer)
@@ -103,32 +131,47 @@ final class InMemoryCredentialStore: CredentialStoring, @unchecked Sendable {
 /// place that happens to need it. The Windows store never prompts, but it is a synchronous OS
 /// call all the same and goes through here for the same reason.
 struct ResolvedCredentials: Sendable {
-    private let keys: [ReviewerName: String]
+    private let keys: [ReviewerIdentity: String]
 
-    init(keys: [ReviewerName: String] = [:]) {
+    init(keys: [ReviewerIdentity: String] = [:]) {
         self.keys = keys
+    }
+
+    init(keys: [ReviewerName: String]) {
+        self.init(keys: Dictionary(
+            uniqueKeysWithValues: keys.map { (ReviewerIdentity.builtIn($0.key), $0.value) }
+        ))
     }
 
     /// The key to hand this reviewer, or `nil` if none resolved — because none is saved, because
     /// the Keychain read was refused, or because the reviewer was not one this run asked about.
-    func apiKey(for reviewer: ReviewerName) -> String? { keys[reviewer] }
+    func apiKey(for reviewer: ReviewerIdentity) -> String? { keys[reviewer] }
+
+    func apiKey(for reviewer: ReviewerName) -> String? { keys[.builtIn(reviewer)] }
 
     /// The reviewers a key actually resolved for.
-    var reviewersWithKey: Set<ReviewerName> { Set(keys.keys) }
+    var reviewersWithKey: Set<ReviewerIdentity> { Set(keys.keys) }
 
     /// Reads `reviewers`' keys off the calling executor. `await`ing this suspends the caller —
     /// releasing an actor or the main thread — for as long as the store blocks.
     static func resolve(
-        _ reviewers: [ReviewerName],
+        _ reviewers: [ReviewerIdentity],
         from store: any CredentialStoring
     ) async -> ResolvedCredentials {
         guard !reviewers.isEmpty else { return ResolvedCredentials() }
         return await Task.detached(priority: .userInitiated) {
-            var keys: [ReviewerName: String] = [:]
+            var keys: [ReviewerIdentity: String] = [:]
             for reviewer in reviewers {
                 keys[reviewer] = store.apiKey(for: reviewer)
             }
             return ResolvedCredentials(keys: keys)
         }.value
+    }
+
+    static func resolve(
+        _ reviewers: [ReviewerName],
+        from store: any CredentialStoring
+    ) async -> ResolvedCredentials {
+        await resolve(reviewers.map(ReviewerIdentity.builtIn), from: store)
     }
 }
