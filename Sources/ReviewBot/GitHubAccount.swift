@@ -102,6 +102,27 @@ struct AccountScopedRunner: CommandRunning {
         environment: EnvironmentOverrides,
         timeout: Int
     ) async throws -> CommandResult {
+        try await run(
+            executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            stopEarly: nil,
+            timeout: timeout
+        )
+    }
+
+    /// Forwarded explicitly, not left to the protocol's default — that default drops the
+    /// watch, and a reviewer stuck on an exhausted quota would wait out its whole limit again
+    /// whenever an account is configured.
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: EnvironmentOverrides,
+        stopEarly: OutputWatch?,
+        timeout: Int
+    ) async throws -> CommandResult {
         var merged = environment
         if Self.scopedCommands.contains(executable) {
             // The caller's own overrides win, so a deliberate per-command choice is never
@@ -115,6 +136,7 @@ struct AccountScopedRunner: CommandRunning {
             arguments: arguments,
             currentDirectory: currentDirectory,
             environment: merged,
+            stopEarly: stopEarly,
             timeout: timeout
         )
     }

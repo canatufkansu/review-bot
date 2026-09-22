@@ -22,7 +22,8 @@ enum PlatformProcess: PlatformProcessLaunching {
         environment: [String: String],
         stdout: URL,
         stderr: URL,
-        timeout: Int
+        timeout: Int,
+        stopWhen: (() -> Bool)?
     ) throws -> LaunchOutcome {
         let fileManager = FileManager.default
         _ = fileManager.createFile(atPath: stdout.path, contents: nil)
@@ -50,13 +51,40 @@ enum PlatformProcess: PlatformProcessLaunching {
         process.environment = environment
 
         try process.run()
+        var stoppedEarly = false
+        if let stopWhen {
+            // `perl` has `exec`ed the command by now, so the pid is the CLI's own and a
+            // signal reaches it directly. A polite stop first; a CLI that ignores it is
+            // killed a few seconds later.
+            while process.isRunning {
+                Thread.sleep(forTimeInterval: 0.5)
+                if process.isRunning, stopWhen() {
+                    stoppedEarly = true
+                    process.terminate()
+                    var grace = 0
+                    while process.isRunning, grace < 10 {
+                        Thread.sleep(forTimeInterval: 0.5)
+                        grace += 1
+                    }
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
+                    break
+                }
+            }
+        }
         process.waitUntilExit()
         try? stdoutHandle.synchronize()
         try? stderrHandle.synchronize()
 
-        let timedOut = process.terminationReason == .uncaughtSignal
+        let timedOut = !stoppedEarly
+            && process.terminationReason == .uncaughtSignal
             && process.terminationStatus == SIGALRM
-        return LaunchOutcome(exitCode: process.terminationStatus, timedOut: timedOut)
+        return LaunchOutcome(
+            exitCode: stoppedEarly ? max(1, process.terminationStatus) : process.terminationStatus,
+            timedOut: timedOut,
+            stoppedEarly: stoppedEarly
+        )
     }
 
     /// The first directory on the augmented `PATH` holding an executable file of that name.

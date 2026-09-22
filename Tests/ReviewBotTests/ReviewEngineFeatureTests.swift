@@ -81,6 +81,44 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postCount, 1, "a merge marker must not re-open the review")
     }
 
+    /// opencode on an exhausted usage limit logs the error and never exits. With its error log
+    /// printed to stderr the run is stopped in seconds (`ProcessRunnerTests`); what this checks
+    /// is what the engine does with that failure: no second attempt — the limit is a settings
+    /// problem, not a transient — a review posted by the reviewer that finished, and a
+    /// disclosure that quotes the error rather than the whole `key=value` log record.
+    func testAnOpencodeUsageLimitIsNotRetriedAndIsDisclosedReadably() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            opencodeFailureMessage: #"timestamp=2026-09-22T14:38:21.364Z level=ERROR run=66116fcc message="stream error" providerID=opencode-go modelID=muse agent=review-bot error.error="AI_APICallError: Go usage limit exceeded""#
+                + "\nStopped after 4 s: timestamp=2026-09-22T14:38:21.364Z level=ERROR error.error=\"AI_APICallError: Go usage limit exceeded\""
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.opencode.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let opencodeRuns = await runner.opencodeCount()
+        XCTAssertEqual(opencodeRuns, 1, "a usage limit is terminal: the in-review retry must not spend it again")
+        let postCount = await runner.postCount()
+        XCTAssertEqual(postCount, 1, "Claude finished, so the review is posted without opencode")
+        let body = await runner.lastPostedBody()
+        XCTAssertTrue(body.contains("Go usage limit exceeded"), body)
+        XCTAssertFalse(body.contains("timestamp="), "the disclosure should quote the error, not the log record: \(body)")
+        let arguments = await runner.lastOpencodeArguments()
+        XCTAssertTrue(arguments.contains("--print-logs"), "without its log on stderr opencode's failure is invisible: \(arguments)")
+        XCTAssertEqual(arguments.firstIndex(of: "--log-level").map { arguments[$0 + 1] }, "ERROR")
+    }
+
+    func testOpencodeLogRecordsAreReducedToTheirErrorMessage() {
+        XCTAssertEqual(
+            ReviewEngine.opencodeFailure(from: #"timestamp=x level=ERROR message="stream error" error.error="AI_APICallError: Go usage limit exceeded""#),
+            "AI_APICallError: Go usage limit exceeded"
+        )
+        XCTAssertEqual(ReviewEngine.opencodeFailure(from: "plain failure text"), "plain failure text")
+        XCTAssertEqual(ReviewEngine.opencodeFailure(from: #"error.error="""#), #"error.error="""#)
+    }
+
     func testAlreadyReviewedRequestIsNotRunOrPostedAgain() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -2384,6 +2422,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// What the merged-pull-request search answers, settable mid-test so a poll can "see"
     /// a pull request merge after an earlier poll reviewed it.
     private var mergedPullRequests: [Int] = []
+    /// When set, `opencode` exits non-zero with this on stderr instead of reviewing.
+    private let opencodeFailureMessage: String?
+    private var opencodeArguments: [String] = []
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
@@ -2453,9 +2494,11 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// Makes the local `git diff base...head` fallback fail too, so the compound failure can
         /// be distinguished from the API failure the fallback is supposed to absorb.
         localDiffFails: Bool = false,
+        opencodeFailureMessage: String? = nil,
         spawnClock: ReviewerSpawnClock? = nil
     ) {
         self.spawnClock = spawnClock
+        self.opencodeFailureMessage = opencodeFailureMessage
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
@@ -2717,6 +2760,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "opencode" {
             opencodeRuns += 1
+            opencodeArguments = arguments
+            if let opencodeFailureMessage {
+                return result(exitCode: 1, stderr: opencodeFailureMessage)
+            }
             return result(stdout: "## Summary\nopencode result.\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
         }
         if executable == "gh", arguments.starts(with: ["pr", "review", "42"]) {
@@ -2748,6 +2795,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeCount() -> Int { claudeRuns }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
+    func lastOpencodeArguments() -> [String] { opencodeArguments }
     func ghEnvironment() -> EnvironmentOverrides { environmentByExecutable["gh"] ?? [:] }
     func gitEnvironment() -> EnvironmentOverrides { environmentByExecutable["git"] ?? [:] }
     func claudeEnvironment() -> EnvironmentOverrides { environmentByExecutable["claude"] ?? [:] }

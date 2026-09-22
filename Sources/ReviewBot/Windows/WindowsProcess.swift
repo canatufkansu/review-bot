@@ -88,7 +88,8 @@ enum PlatformProcess: PlatformProcessLaunching {
         environment: [String: String],
         stdout: URL,
         stderr: URL,
-        timeout: Int
+        timeout: Int,
+        stopWhen: (() -> Bool)?
     ) throws -> LaunchOutcome {
         let resolved = try resolve(executable)
 
@@ -159,13 +160,26 @@ enum PlatformProcess: PlatformProcessLaunching {
         standardError.close()
 
         var timedOut = false
-        // WAIT_TIMEOUT
-        if WaitForSingleObject(information.hProcess, DWORD(max(1, timeout)) * 1000) == 0x102 {
-            timedOut = true
+        var stoppedEarly = false
+        // Waited in one-second slices so the stop condition can be asked between them; the
+        // whole wait still adds up to the time limit. 0x102 is WAIT_TIMEOUT.
+        var remainingMilliseconds = max(1, timeout) * 1000
+        while true {
+            let slice = min(remainingMilliseconds, 1000)
+            if WaitForSingleObject(information.hProcess, DWORD(slice)) != 0x102 { break }
+            remainingMilliseconds -= slice
+            if remainingMilliseconds <= 0 {
+                timedOut = true
+            } else if let stopWhen, stopWhen() {
+                stoppedEarly = true
+            } else {
+                continue
+            }
             if !job.terminate() {
                 TerminateProcess(information.hProcess, 1)
             }
             WaitForSingleObject(information.hProcess, INFINITE)
+            break
         }
 
         var rawExitCode: DWORD = 0
@@ -176,7 +190,12 @@ enum PlatformProcess: PlatformProcessLaunching {
             // (access violation, missing DLL, stack overflow) — or by a debugger, or by Windows.
             detail = String(format: "process ended abnormally with status 0x%08X", rawExitCode)
         }
-        return LaunchOutcome(exitCode: Int32(bitPattern: rawExitCode), timedOut: timedOut, detail: detail)
+        return LaunchOutcome(
+            exitCode: stoppedEarly ? 1 : Int32(bitPattern: rawExitCode),
+            timedOut: timedOut,
+            stoppedEarly: stoppedEarly,
+            detail: detail
+        )
     }
 
     /// An inheritable file handle for a child's standard stream.
