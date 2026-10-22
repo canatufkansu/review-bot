@@ -61,13 +61,16 @@ final class ReviewEngineFeatureTests: XCTestCase {
 
     func testAMergedPullRequestReviewBotReviewedIsRecordedOnce() async throws {
         let fixture = try FeatureFixture()
+        let clock = TestClock()
         let runner = ReviewWorkflowMock()
-        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
         let recorder = EventRecorder()
 
         await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
         await runner.markMerged([42, 99])
         for _ in 0..<2 {
+            // The merged search runs once an hour.
+            clock.advance(minutes: 60)
             await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
         }
 
@@ -79,6 +82,88 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(merged.first?.message, "Merged after Review Bot's review.")
         let postCount = await runner.postCount()
         XCTAssertEqual(postCount, 1, "a merge marker must not re-open the review")
+    }
+
+    /// GitHub's search API allows 30 requests a minute and answers a burst with a secondary
+    /// rate limit. Ten repositories used to cost twenty searches a poll; repositories of one
+    /// owner now share one search, and the merged search runs once an hour.
+    func testAPollSearchesOncePerOwnerAndTheMergedSearchOnceAnHour() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.repositories += [
+            RepositoryConfiguration(name: "gadget", path: "/mock/gadget", githubSlug: "acme/gadget"),
+            RepositoryConfiguration(name: "sprocket", path: "/mock/sprocket", githubSlug: "ACME/sprocket"),
+        ]
+
+        await engine.poll(configuration: configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        clock.advance(minutes: 15)
+        await engine.poll(configuration: configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+
+        let searches = await runner.searches()
+        let open = searches.filter { !$0.contains("--merged") }
+        let merged = searches.filter { $0.contains("--merged") }
+        XCTAssertEqual(open.count, 2, "one search per poll for the one owner, however it is spelled: \(open)")
+        XCTAssertEqual(open.first.flatMap { $0.firstIndex(of: "--owner") }.map { open[0][$0 + 1] }, "acme")
+        XCTAssertFalse(open.contains { $0.contains("--repo") })
+        XCTAssertEqual(merged.count, 1, "the merged search waits an hour between runs")
+
+        let events = await recorder.snapshot()
+        // #42 is acme/widget's; #7 belongs to a repository nobody watches.
+        XCTAssertEqual(events.compactMap(\.pullRequestNumber), [42, 42, 42])
+        XCTAssertEqual(events.map(\.kind), [.requestDetected, .reviewStarted, .approved])
+    }
+
+    func testARateLimitedSearchHoldsEverySearchUntilTheHoldPasses() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let recorder = EventRecorder()
+        let status = StatusRecorder()
+
+        await runner.setSearchRateLimited(true)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { await status.append($0) })
+        let failed = await recorder.snapshot()
+        XCTAssertEqual(failed.map(\.kind), [.failed], "one failure for the poll, not one per search")
+        XCTAssertTrue(failed.first?.message.contains("secondary rate limit") == true, failed.first?.message ?? "")
+        XCTAssertTrue(failed.first?.message.contains("Searches pause for 5 minutes") == true, failed.first?.message ?? "")
+        let afterLimit = await runner.searches().count
+        XCTAssertEqual(afterLimit, 1, "the merged search must not follow a rate-limited one")
+        let lastStatus = await status.snapshot().last
+        XCTAssertTrue(lastStatus?.contains("rate limit") == true, lastStatus ?? "")
+
+        // Inside the hold nothing searches, even though GitHub would answer by now.
+        await runner.setSearchRateLimited(false)
+        clock.advance(minutes: 3)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        let insideHold = await runner.searches().count
+        XCTAssertEqual(insideHold, 1)
+
+        clock.advance(minutes: 3)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        let events = await recorder.snapshot()
+        XCTAssertEqual(events.map(\.kind), [.failed, .requestDetected, .reviewStarted, .approved])
+    }
+
+    func testRateLimitsInARowHoldSearchesLonger() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let recorder = EventRecorder()
+
+        await runner.setSearchRateLimited(true)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        clock.advance(minutes: 6)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+
+        let messages = await recorder.snapshot().map(\.message)
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertTrue(messages.last?.contains("Searches pause for 10 minutes") == true, messages.last ?? "")
     }
 
     /// opencode on an exhausted usage limit logs the error and never exits. With its error log
@@ -2453,6 +2538,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// What the merged-pull-request search answers, settable mid-test so a poll can "see"
     /// a pull request merge after an earlier poll reviewed it.
     private var mergedPullRequests: [Int] = []
+    /// Every `gh search prs`, so a test can count what a poll spends on GitHub's search API.
+    private var searchInvocations: [[String]] = []
+    /// When set, every `gh search prs` fails the way GitHub answers a burst of searches.
+    private var searchRateLimited = false
     /// When set, `opencode` exits non-zero with this on stderr instead of reviewing.
     private let opencodeFailureMessage: String?
     private var opencodeArguments: [String] = []
@@ -2592,6 +2681,15 @@ private actor ReviewWorkflowMock: CommandRunning {
         if executable == "gh", arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
         }
+        if executable == "gh", arguments.starts(with: ["search", "prs"]) {
+            searchInvocations.append(arguments)
+            if searchRateLimited {
+                return result(
+                    exitCode: 1,
+                    stderr: "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
+                )
+            }
+        }
         if executable == "gh", arguments.starts(with: ["search", "prs"]), arguments.contains("--merged") {
             let entries = mergedPullRequests.map {
                 #"{"number":\#($0),"title":"Improve widgets","url":"https://github.com/acme/widget/pull/\#($0)"}"#
@@ -2599,7 +2697,11 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: "[\(entries.joined(separator: ","))]")
         }
         if executable == "gh", arguments.starts(with: ["search", "prs"]) {
-            return result(stdout: #"[{"number":42,"title":"Improve widgets","url":"https://github.com/acme/widget/pull/42"}]"#)
+            // The search is owner-wide, so it also finds requests in repositories nobody
+            // watches; #7 must never be inspected (it has no `pr view` answer here).
+            return result(
+                stdout: #"[{"number":42,"title":"Improve widgets","url":"https://github.com/acme/widget/pull/42","repository":{"name":"widget","nameWithOwner":"acme/widget"}},{"number":7,"title":"Elsewhere","url":"https://github.com/acme/elsewhere/pull/7","repository":{"name":"elsewhere","nameWithOwner":"acme/elsewhere"}}]"#
+            )
         }
         if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
            arguments.contains("--json") {
@@ -2846,6 +2948,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func localDiffInvocation() -> String? { localDiffRange }
     func timelineCallCount() -> Int { timelineCalls }
     func markMerged(_ numbers: [Int]) { mergedPullRequests = numbers }
+    func searches() -> [[String]] { searchInvocations }
+    func setSearchRateLimited(_ limited: Bool) { searchRateLimited = limited }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
 
     private func result(
