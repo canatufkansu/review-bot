@@ -85,6 +85,553 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertEqual(configuration.reviewScope, .incremental)
     }
 
+    func testConfigurationWithoutAuthModeDefaultsToSessionAndDisabledDeepSeek() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "medium" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.claude.authMode, .session)
+        XCTAssertEqual(configuration.codex.authMode, .session)
+        XCTAssertFalse(configuration.deepseek.enabled)
+        XCTAssertEqual(configuration.deepseek.model, "deepseek-chat")
+        XCTAssertEqual(configuration.enabledReviewers.compactMap(\.name), [.claude])
+    }
+
+    func testOpencodeIsAlwaysSessionAuthEvenIfConfigSaysOtherwise() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "opencode": {
+            "enabled": true, "model": "opencode/deepseek-v4-flash-free", "effort": "max",
+            "authMode": "apiKey"
+          }
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // The mirror image of the DeepSeek rule below. opencode authenticates through its own
+        // config directory and reads no key variable, so `environmentOverrides` would inject
+        // nothing while `meteredUsage` started counting it as billed to the developer's key.
+        XCTAssertEqual(configuration.opencode.authMode, .session)
+        XCTAssertFalse(ReviewerName.opencode.supportsAPIKeyAuth)
+    }
+
+    /// Adding `ReviewerConfiguration.init(from:)` for `authMode` made every other key optional
+    /// too, so a reviewer object that omits `model` now loads instead of throwing the file away
+    /// and falling back to `.default`. That is the right trade — but an empty model is not
+    /// runnable, so it has to be filled in rather than carried into `--model ""`.
+    func testAReviewerWithNoModelFallsBackToTheShippedDefault() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true },
+          "codex": { "enabled": true, "model": "   ", "effort": "high" }
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.claude.model, ReviewBotConfiguration.default.claude.model)
+        XCTAssertEqual(configuration.codex.model, ReviewBotConfiguration.default.codex.model)
+        // The rest of the defensive decoding is unchanged: what was present is kept.
+        XCTAssertTrue(configuration.claude.enabled)
+        XCTAssertEqual(configuration.claude.effort, .high)
+    }
+
+    func testDeepSeekAlwaysUsesAPIKeyAuthEvenIfConfigSaysOtherwise() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": false, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "medium" },
+          "deepseek": { "enabled": true, "model": "deepseek-chat", "effort": "high", "authMode": "session" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // There is no DeepSeek CLI to borrow a session from.
+        XCTAssertEqual(configuration.deepseek.authMode, .apiKey)
+        XCTAssertEqual(configuration.enabledReviewers.compactMap(\.name), [.deepseek])
+    }
+
+    func testAuthModeRoundTripsAndConfigurationNeverCarriesTheKey() throws {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.authMode = .apiKey
+
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(configuration)
+        let json = String(decoding: data, as: UTF8.self)
+
+        // Keys live in the Keychain; the config file must only record which source to use.
+        XCTAssertTrue(json.contains("\"authMode\":\"apiKey\""))
+        XCTAssertFalse(json.lowercased().contains("\"apikey\":\""))
+        XCTAssertFalse(json.lowercased().contains("secret"))
+
+        let decoded = try JSONDecoder().decode(ReviewBotConfiguration.self, from: data)
+        XCTAssertEqual(decoded.claude.authMode, .apiKey)
+        XCTAssertEqual(decoded.codex.authMode, .session)
+    }
+
+    func testEnabledReviewersKeepAStableOrder() {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+        configuration.opencode.enabled = true
+        configuration.deepseek.enabled = true
+
+        // This order is `ReviewerName`'s declaration order, and it is load-bearing twice over: it
+        // fixes the order the panels appear in the posted review, and it is the order
+        // `runReconciliation` walks when picking an adjudicator. DeepSeek is last so the one
+        // reviewer that always bills a key never adjudicates while a CLI is available.
+        XCTAssertEqual(
+            configuration.enabledReviewers.compactMap(\.name),
+            [.claude, .codex, .opencode, .deepseek]
+        )
+        XCTAssertEqual(configuration.enabledReviewers.compactMap(\.name), ReviewerName.allCases)
+
+        // Disabling one reviewer removes it without disturbing the order of the rest.
+        configuration.codex.enabled = false
+        XCTAssertEqual(
+            configuration.enabledReviewers.compactMap(\.name),
+            [.claude, .opencode, .deepseek]
+        )
+    }
+
+    /// The panel's open end. Custom reviewers sit after the built-ins so the posted review reads
+    /// in a stable order, and a half-filled row is skipped rather than run — otherwise every
+    /// review would carry one failed reviewer for as long as someone was still typing.
+    func testCustomReviewersJoinThePanelAfterTheBuiltInsWhenTheyAreRunnable() {
+        var configuration = ReviewBotConfiguration.default
+        configuration.codex.enabled = false
+        configuration.opencode.enabled = false
+        configuration.deepseek.enabled = false
+
+        let ready = CustomReviewerConfiguration(
+            name: "Gemini",
+            baseURL: "https://example.test/v1",
+            model: "gemini-pro"
+        )
+        let noModel = CustomReviewerConfiguration(
+            name: "Half typed",
+            baseURL: "https://example.test/v1",
+            model: "   "
+        )
+        let badURL = CustomReviewerConfiguration(
+            name: "Bad URL",
+            baseURL: "not a url",
+            model: "some-model"
+        )
+        var switchedOff = ready
+        switchedOff.id = UUID()
+        switchedOff.enabled = false
+
+        configuration.customReviewers = [ready, noModel, badURL, switchedOff]
+
+        let panel = configuration.enabledReviewers
+        XCTAssertEqual(panel.compactMap(\.name), [.claude])
+        XCTAssertEqual(panel.map(\.displayName), ["Claude", "Gemini"])
+        XCTAssertEqual(panel.last?.identity, .custom(ready.id))
+        // Uniform settings: the engine must be able to treat it exactly like DeepSeek.
+        XCTAssertEqual(panel.last?.configuration.model, "gemini-pro")
+        XCTAssertEqual(panel.last?.configuration.authMode, .apiKey)
+    }
+
+    /// Nothing stops two rows being given the same name, and two identically labelled panels in
+    /// one review are indistinguishable — to a reader, and to the adjudicator, which is handed
+    /// each review under its reviewer's name.
+    func testTwoReviewersWithTheSameNameAreDistinguishedInThePanel() {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.opencode.enabled = false
+        configuration.deepseek.enabled = false
+        configuration.customReviewers = [
+            CustomReviewerConfiguration(
+                name: "OpenRouter",
+                baseURL: "https://example.test/v1",
+                model: "gemini-pro"
+            ),
+            CustomReviewerConfiguration(
+                name: "OpenRouter",
+                baseURL: "https://example.test/v1",
+                model: "grok-4"
+            ),
+            CustomReviewerConfiguration(
+                name: "OpenRouter",
+                baseURL: "https://example.test/v1",
+                model: "grok-4"
+            ),
+        ]
+
+        XCTAssertEqual(
+            configuration.enabledReviewers.map(\.displayName),
+            ["OpenRouter (gemini-pro)", "OpenRouter (grok-4)", "OpenRouter (grok-4) 2"]
+        )
+        // Disambiguation is display only: the identity a key is filed under is untouched.
+        XCTAssertEqual(
+            configuration.enabledReviewers.map(\.identity),
+            configuration.customReviewers.map(\.identity)
+        )
+        // A name that is already unique is left exactly as it was typed.
+        configuration.claude.enabled = true
+        XCTAssertEqual(configuration.enabledReviewers.first?.displayName, "Claude")
+    }
+
+    /// A custom reviewer's identity is its id, not its name — so renaming one, or pointing it at
+    /// a different model, must not orphan the key saved for it.
+    func testACustomReviewersCredentialIdentitySurvivesRenaming() {
+        var reviewer = CustomReviewerConfiguration(
+            name: "Gemini",
+            baseURL: "https://example.test/v1",
+            model: "gemini-pro"
+        )
+        let account = reviewer.identity.credentialAccount
+        let variable = reviewer.identity.apiKeyOverrideEnvironmentVariable
+
+        reviewer.name = "Something else"
+        reviewer.model = "another-model"
+
+        XCTAssertEqual(reviewer.identity.credentialAccount, account)
+        XCTAssertEqual(reviewer.identity.apiKeyOverrideEnvironmentVariable, variable)
+        // And it cannot collide with a built-in reviewer's account, which is its own name.
+        XCTAssertFalse(ReviewerName.allCases.map(\.rawValue).contains(account))
+    }
+
+    /// A blank name still has to identify something: the posted panel puts every reviewer's name
+    /// in a heading, and an empty one reads as a review from nobody.
+    func testACustomReviewerAlwaysHasADisplayName() {
+        XCTAssertEqual(
+            CustomReviewerConfiguration(name: "  Kimi  ", model: "kimi-k2").displayName,
+            "Kimi"
+        )
+        XCTAssertEqual(
+            CustomReviewerConfiguration(name: "   ", model: "kimi-k2").displayName,
+            "kimi-k2"
+        )
+        XCTAssertEqual(CustomReviewerConfiguration().displayName, "Custom reviewer")
+    }
+
+    /// Only http(s) reaches the network, and the check happens in the model rather than at the
+    /// call site so a row that cannot run is never scheduled in the first place.
+    func testOnlyAnHTTPBaseURLMakesACustomReviewerRunnable() {
+        func reviewer(_ url: String) -> CustomReviewerConfiguration {
+            CustomReviewerConfiguration(baseURL: url, model: "m")
+        }
+        XCTAssertTrue(reviewer("https://openrouter.ai/api/v1").isRunnable)
+        XCTAssertTrue(reviewer("http://127.0.0.1:1234/v1").isRunnable)
+        XCTAssertFalse(reviewer("file:///etc/passwd").isRunnable)
+        XCTAssertFalse(reviewer("openrouter.ai/api/v1").isRunnable)
+        XCTAssertFalse(reviewer("").isRunnable)
+    }
+
+    /// Custom reviewers are stored in `config.json` like everything else, and decode as
+    /// defensively — a row missing every optional field loads rather than taking the whole
+    /// configuration down with it.
+    func testCustomReviewersRoundTripAndDecodeDefensively() throws {
+        var configuration = ReviewBotConfiguration.default
+        configuration.customReviewers = [
+            CustomReviewerConfiguration(
+                name: "Gemini",
+                baseURL: "https://example.test/v1",
+                model: "gemini-pro",
+                pricing: TokenPricing(
+                    inputPerMillion: 1,
+                    cachedInputPerMillion: 0.5,
+                    outputPerMillion: 2
+                ),
+                timeoutMinutes: 20
+            ),
+        ]
+
+        let data = try JSONEncoder().encode(configuration)
+        let decoded = try JSONDecoder().decode(ReviewBotConfiguration.self, from: data)
+        XCTAssertEqual(decoded.customReviewers, configuration.customReviewers)
+        XCTAssertEqual(
+            decoded.settings(for: .custom(configuration.customReviewers[0].id)).model,
+            "gemini-pro"
+        )
+
+        // A configuration written before custom reviewers existed has no such key at all.
+        let legacy = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(#"{"pollIntervalMinutes":15}"#.utf8)
+        )
+        XCTAssertEqual(legacy.customReviewers, [])
+
+        // A row with nothing but a name still loads, and gets an id of its own.
+        let sparse = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(#"{"customReviewers":[{"name":"Half"}]}"#.utf8)
+        )
+        XCTAssertEqual(sparse.customReviewers.count, 1)
+        XCTAssertEqual(sparse.customReviewers[0].displayName, "Half")
+        XCTAssertFalse(sparse.customReviewers[0].isRunnable)
+    }
+
+    /// A custom id that is no longer in the list — a row deleted while a review it was part of
+    /// was still in flight — must resolve rather than trap, and must not look metered.
+    func testSettingsForADeletedCustomReviewerResolveToADisabledPlaceholder() {
+        let configuration = ReviewBotConfiguration.default
+        let settings = configuration.settings(for: .custom(UUID()))
+        XCTAssertFalse(settings.enabled)
+        XCTAssertEqual(settings.authMode, .session)
+    }
+
+    func testSettingsLookupReturnsEachReviewersOwnConfiguration() {
+        // `settings(for:)` is a four-arm switch over identically typed properties, so a
+        // copy-paste there would hand one reviewer another's model, effort, and auth mode with
+        // nothing to catch it. `enabledReviewers` is built on top of it.
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.model = "model-claude"
+        configuration.codex.model = "model-codex"
+        configuration.opencode.model = "model-opencode"
+        configuration.deepseek.model = "model-deepseek"
+
+        for reviewer in ReviewerName.allCases {
+            XCTAssertEqual(
+                configuration.settings(for: reviewer).model,
+                "model-\(reviewer.rawValue.lowercased())",
+                "\(reviewer.rawValue) reads another reviewer's configuration"
+            )
+        }
+    }
+
+    /// The "adding a reviewer" checklist, as assertions. Every one of these is a total switch
+    /// over `ReviewerName`, so a new case compiles only once each has an arm — but nothing makes
+    /// that arm *correct*, and several of them were written when there were two reviewers and
+    /// answered by accident for the third and fourth.
+    func testEveryReviewerDeclaresACoherentCredentialAndUsageSurface() {
+        XCTAssertEqual(ReviewerName.allCases.map(\.commandName), [
+            "claude",
+            "codex",
+            "opencode",
+            nil,
+        ])
+        XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyEnvironmentVariable), [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            nil,
+            nil,
+        ])
+        // Inbound: what Review Bot itself reads a key from, ahead of the Keychain. Total, so it
+        // names one even for opencode, which never consults it.
+        XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable), [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ])
+        let inbound = ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable)
+        XCTAssertEqual(Set(inbound).count, inbound.count, "two reviewers would share a key")
+
+        // Only a CLI can borrow a login; only a reviewer Review Bot can hand a key to may be put
+        // in key mode. opencode is the one reviewer that is neither, which is why it needs both
+        // predicates rather than one.
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true, false])
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false, true])
+        XCTAssertFalse(
+            ReviewerName.allCases.contains { !$0.supportsSessionAuth && !$0.supportsAPIKeyAuth },
+            "a reviewer with neither auth mode could never be credentialed at all"
+        )
+
+        // Claude's CLI prints a usage envelope and DeepSeek's API reports tokens; Codex and
+        // opencode print the review and nothing else, so claiming otherwise would promise the
+        // usage report a figure nothing collects.
+        XCTAssertEqual(ReviewerName.allCases.map(\.reportsTokenUsage), [true, false, false, true])
+        XCTAssertEqual(
+            ReviewerName.allCases.map(\.needsConfiguredPricing),
+            [false, false, false, true],
+            "only a provider that reports tokens but no price needs configured rates"
+        )
+        // The rates belong to the case, not to the settings row: a Reset button written against
+        // a hardcoded `.deepSeekDefault` would hand a second such provider DeepSeek's prices.
+        XCTAssertEqual(
+            ReviewerName.allCases.map(\.defaultPricing),
+            [nil, nil, nil, .deepSeekDefault]
+        )
+        XCTAssertEqual(ReviewerName.allCases.map(\.usesEffortSetting), [true, true, true, false])
+
+        for reviewer in ReviewerName.allCases {
+            XCTAssertEqual(
+                reviewer.efforts.isEmpty,
+                !reviewer.usesEffortSetting,
+                "\(reviewer.rawValue) offers effort levels it does not use, or none it does"
+            )
+            XCTAssertFalse(reviewer.symbolName.isEmpty)
+        }
+    }
+
+    func testTokenSummaryTreatsCachedTokensAsASubsetOfInput() {
+        // `inputTokens` holds the uncached portion, so a summary that printed it as "in" while
+        // listing the cached count beside it understated the real input by the cached amount.
+        let usage = TokenUsage(
+            inputTokens: 28_033,
+            cachedInputTokens: 18_688,
+            outputTokens: 2_898,
+            requests: 12
+        )
+
+        XCTAssertEqual(usage.totalInputTokens, 46_721)
+        XCTAssertEqual(usage.totalTokens, 49_619)
+        XCTAssertEqual(usage.tokenSummary, "46.7k in (18.7k cached) + 2.9k out over 12 calls")
+    }
+
+    func testTokenSummaryOmitsCacheAndCallCountWhenThereIsNothingToSay() {
+        let usage = TokenUsage(inputTokens: 900, outputTokens: 120, requests: 1)
+        XCTAssertEqual(usage.tokenSummary, "900 in + 120 out")
+    }
+
+    func testUsageAddsUpAndKeepsAnUnknownCostUnknown() {
+        let priced = TokenUsage(inputTokens: 10, outputTokens: 5, requests: 1, costUSD: 0.25)
+        let unpriced = TokenUsage(inputTokens: 20, outputTokens: 7, requests: 1)
+
+        let both = priced + unpriced
+        XCTAssertEqual(both.inputTokens, 30)
+        XCTAssertEqual(both.outputTokens, 12)
+        XCTAssertEqual(both.requests, 2)
+        XCTAssertEqual(both.costUSD, 0.25, "a reviewer with no price must not zero out a known cost")
+
+        let neither = unpriced + unpriced
+        XCTAssertNil(neither.costUSD, "two unknowns must stay unknown, not become $0.00")
+    }
+
+    func testPricingChargesCachedInputAtItsOwnRate() {
+        let pricing = TokenPricing(
+            inputPerMillion: 1,
+            cachedInputPerMillion: 0.25,
+            outputPerMillion: 4
+        )
+        let usage = TokenUsage(
+            inputTokens: 1_000_000,
+            cachedInputTokens: 1_000_000,
+            outputTokens: 1_000_000
+        )
+
+        XCTAssertEqual(pricing.cost(for: usage) ?? 0, 5.25, accuracy: 0.0001)
+        XCTAssertNil(
+            TokenPricing(inputPerMillion: 0, cachedInputPerMillion: 0, outputPerMillion: 0)
+                .cost(for: usage),
+            "an unpriced model reports no cost rather than free"
+        )
+    }
+
+    func testCostFormattingKeepsSmallAmountsLegible() {
+        XCTAssertEqual(TokenUsage(costUSD: 0.006453).costSummary, "$0.0065")
+        XCTAssertEqual(TokenUsage(costUSD: 12.5).costSummary, "$12.50")
+        XCTAssertNil(TokenUsage().costSummary)
+    }
+
+    func testUsageSettingDefaultsOnAndSurvivesOlderConfigurations() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "medium" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertTrue(configuration.includeUsageInReview)
+        XCTAssertEqual(configuration.deepseek.pricing, .deepSeekDefault)
+        XCTAssertNil(configuration.claude.pricing, "Claude's CLI reports its own cost")
+    }
+
+    func testDeepSeekPricingIsBackfilledForConfigsWrittenBeforeItExisted() throws {
+        // A real config saved by the build that added DeepSeek but not pricing. Leaving `pricing`
+        // nil meant cost could never be reported, while the settings panel still displayed the
+        // default rates — so it looked configured and silently was not.
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high", "authMode": "session" },
+          "codex": { "enabled": false, "model": "codex", "effort": "high", "authMode": "session" },
+          "deepseek": { "enabled": true, "model": "deepseek-chat", "effort": "high", "authMode": "apiKey" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.deepseek.pricing, .deepSeekDefault)
+        XCTAssertNotNil(
+            configuration.deepseek.pricing?.cost(
+                for: TokenUsage(inputTokens: 1_000_000)
+            )
+        )
+    }
+
+    func testExplicitlyZeroedPricingIsNotOverwrittenByTheBackfill() throws {
+        // Zero rates are a deliberate "tokens only" choice, not a missing value.
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "high" },
+          "deepseek": {
+            "enabled": true, "model": "deepseek-chat", "effort": "high", "authMode": "apiKey",
+            "pricing": { "inputPerMillion": 0, "cachedInputPerMillion": 0, "outputPerMillion": 0 }
+          },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.deepseek.pricing, .unpriced)
+    }
+
+    func testRateParsingAcceptsEitherDecimalSeparator() {
+        // Providers publish `0.27`; a comma-decimal locale would read that pasted value as 27,
+        // overstating spend a hundredfold.
+        XCTAssertEqual(TokenPricing.parseRate("0.27"), 0.27)
+        XCTAssertEqual(TokenPricing.parseRate("0,27"), 0.27)
+        XCTAssertEqual(TokenPricing.parseRate(" 1,1 "), 1.1)
+        XCTAssertEqual(TokenPricing.parseRate("0"), 0)
+
+        XCTAssertNil(TokenPricing.parseRate(""))
+        XCTAssertNil(TokenPricing.parseRate("abc"))
+        XCTAssertNil(TokenPricing.parseRate("-1"), "a negative rate would credit spend")
+    }
+
+    func testRateRenderingAlwaysUsesADot() {
+        XCTAssertEqual(TokenPricing.renderRate(0.27), "0.27")
+        XCTAssertEqual(TokenPricing.renderRate(1.1), "1.1")
+        XCTAssertEqual(TokenPricing.renderRate(0), "0")
+    }
+
     func testLastReviewedStoreRoundTripsHeadPerPullRequest() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ReviewBotLastReviewed-\(UUID().uuidString)", isDirectory: true)
@@ -182,6 +729,46 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(prompt.hasSuffix("--- END REVIEW.md ---"))
     }
 
+    /// `finalReviewRequest` restates the output contract — including a `## Merge gate` section and
+    /// the severity rules — at the moment DeepSeek is asked for its answer. A chat model routinely
+    /// echoes a chunk of that back inside the review it writes, and `InjectionGuard` downgrades an
+    /// approval whose own prose describes a merge blocker. Instruction text that trips that check
+    /// would turn every legitimate DeepSeek approval into a neutral comment, with no reviewer at
+    /// fault and nothing in the logs pointing here.
+    func testTheFinalReviewRequestCannotDowngradeAnApprovalIfTheModelEchoesIt() {
+        let echoed = """
+        ## Summary
+        The change is safe.
+
+        ## Findings
+        Blocking: None. Should-fix: None. Nit: None.
+
+        ## Merge gate
+        Mergeable as-is.
+
+        \(DefaultPrompt.finalReviewRequest)
+
+        VERDICT: CLEAN
+        """
+        let result = ReviewerResult(
+            reviewer: .deepseek,
+            model: "deepseek-chat",
+            output: echoed,
+            verdict: .clean,
+            failure: nil
+        )
+
+        XCTAssertNil(
+            InjectionGuard.flagIfApproveUnsafe(
+                thread: "PR conversation, nothing planted",
+                diff: "diff --git a/a.swift b/a.swift\n+let x = 1\n",
+                results: [result],
+                adjudication: nil
+            ),
+            "the restated contract must not read as the reviewer calling the PR unmergeable"
+        )
+    }
+
     func testReconciliationMakesADowngradeJustifyItself() {
         let prompt = DefaultPrompt.reconciliation(reviews: [
             (reviewer: "Claude", body: "## Findings\nShould-fix: the count is wrong.", verdict: "SHOULD_FIX"),
@@ -230,5 +817,93 @@ final class ConfigurationAndPromptTests: XCTestCase {
         // majority, nor read a name's absence as assent.
         XCTAssertTrue(prompt.contains("do not average them, and do not defer to the strictest by default"))
         XCTAssertTrue(prompt.contains("absence of evidence, not agreement"))
+    }
+
+    // MARK: - Reviewer time limit
+
+    func testTheTimeLimitDefaultsToWhatEveryReviewerUsedBeforeItWasConfigurable() throws {
+        let json = #"{"claude":{"enabled":true,"model":"claude-opus-5","effort":"high"}}"#
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(configuration.claude.timeoutMinutes, 15)
+        XCTAssertEqual(configuration.claude.timeoutSeconds, 900)
+    }
+
+    func testAnOutOfRangeTimeLimitIsClampedRatherThanObeyed() throws {
+        // This one bounds a running process, so a hand-edited `0` would cut every review off
+        // before it began and a stray `100000` would pin a metered reviewer for weeks.
+        let json = #"""
+        {"claude":{"enabled":true,"model":"m","effort":"high","timeoutMinutes":0},
+         "codex":{"enabled":true,"model":"m","effort":"high","timeoutMinutes":100000}}
+        """#
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(configuration.claude.timeoutMinutes, ReviewerConfiguration.timeoutMinutesRange.lowerBound)
+        XCTAssertEqual(configuration.codex.timeoutMinutes, ReviewerConfiguration.timeoutMinutesRange.upperBound)
+        XCTAssertEqual(ReviewerConfiguration(enabled: true, model: "m", effort: .high, timeoutMinutes: -5).timeoutMinutes, 1)
+    }
+
+    func testTheTimeLimitSurvivesARoundTrip() throws {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.timeoutMinutes = 45
+        let restored = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: JSONEncoder().encode(configuration)
+        )
+        XCTAssertEqual(restored.claude.timeoutMinutes, 45)
+    }
+
+    // MARK: - Reviews that assess nothing
+
+    func testAReviewThatSaysItCouldNotAssessIsRecognisedInTheWordingModelsUse() {
+        let saidSo = [
+            "This PR could not be reviewed: the diff is not readable.",
+            "## Merge gate\nUnable to assess.",
+            "I could not review this pull request without the diff.",
+            "I have no basis to certify the PR as mergeable.",
+            "The gate cannot be meaningfully determined from the evidence available.",
+        ]
+        for body in saidSo {
+            XCTAssertTrue(
+                VerdictParser.statesItCouldNotAssess(body),
+                "should have been recognised: \(body)"
+            )
+        }
+    }
+
+    func testOrdinaryReviewProseIsNotMistakenForAnInabilityToAssess() {
+        // The expensive mistake in the other direction: a real review whose findings happen to
+        // use the same verbs would have its verdict thrown away and the pull request left
+        // unreviewed, which is exactly the outcome this check exists to prevent.
+        let ordinaryReviews = [
+            "## Summary\nThe migration could not be verified against production data, so I flagged it.",
+            "This change could not have caused the regression described in the thread.",
+            "I reviewed the diff and found two blocking issues.",
+            "The author could not reproduce the failure, but the added test covers it.",
+            "## Summary\nLooks safe.",
+        ]
+        for body in ordinaryReviews {
+            XCTAssertFalse(
+                VerdictParser.statesItCouldNotAssess(body),
+                "should NOT have been recognised: \(body)"
+            )
+        }
+    }
+
+    func testAWithdrawnVerdictClassifiesAsTerminalSoItIsNotRetried() {
+        let withdrawn = ReviewerResult(
+            reviewer: .deepseek,
+            model: "deepseek-chat",
+            output: "",
+            verdict: nil,
+            failure: "reported that it could not assess this pull request, so its verdict was not counted"
+        )
+        XCTAssertTrue(withdrawn.couldNotAssess)
+        XCTAssertEqual(withdrawn.failureClass, .terminal)
+        XCTAssertFalse(withdrawn.isWorthRetrying)
     }
 }
